@@ -7,6 +7,35 @@ use std::{
 
 const MAX_HTML_BYTES: u64 = 16 * 1024 * 1024;
 
+/// The entry must be HTML-ish text, not an arbitrary blob — but real
+/// Workshop wallpapers routinely ship fragment entries with no `<html>`
+/// root at all (HTML5 makes html/head/body optional; Chromium and
+/// Wallpaper Engine both load them), and some are UTF-16 encoded. Accept
+/// any known top-of-document marker after stripping NULs (the lossy read
+/// of UTF-16 text interleaves them), instead of demanding a literal
+/// `<html` (which refused e.g. Workshop 1103493745 "Colorful Matrix").
+fn looks_like_html(bytes: &[u8]) -> bool {
+    let text: String = String::from_utf8_lossy(bytes)
+        .chars()
+        .filter(|character| *character != '\0')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    [
+        "<!doctype html",
+        "<html",
+        "<head",
+        "<body",
+        "<script",
+        "<style",
+        "<link",
+        "<meta",
+        "<canvas",
+        "<div",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WebPreflight {
     pub path: PathBuf,
@@ -65,13 +94,10 @@ pub fn preflight_web(root: &Path, permissions: &[String]) -> WebPreflight {
             return report;
         }
     };
-    if !String::from_utf8_lossy(&bytes)
-        .to_ascii_lowercase()
-        .contains("<html")
-    {
+    if !looks_like_html(&bytes) {
         report
             .reasons
-            .push("index.html does not contain an HTML root".into());
+            .push("index.html does not look like an HTML document".into());
     }
     report.network_allowed = false;
     report.safe = report.reasons.is_empty();
@@ -91,6 +117,48 @@ mod tests {
         assert!(report.safe);
         assert!(!report.network_allowed);
         assert_eq!(report.permissions, ["network", "pointer"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn accepts_fragment_and_utf16_entries_rejects_non_html() {
+        let root =
+            std::env::temp_dir().join(format!("kwe-web-preflight-fragment-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        // Workshop 1103493745 "Colorful Matrix": a fragment entry with no
+        // <html> root — head + canvas + script only. Must pass.
+        fs::write(
+            root.join("index.html"),
+            "<head>\n<canvas id=\"c\"></canvas>\n<script src=\"./index.js\"></script>\n</head>\n",
+        )
+        .unwrap();
+        assert!(
+            preflight_web(&root, &[]).safe,
+            "a fragment entry without an <html> root must pass"
+        );
+
+        // The same fragment in UTF-16LE (lossy read interleaves NULs).
+        let utf16: Vec<u8> = "<body><script>go()</script></body>"
+            .encode_utf16()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect();
+        fs::write(root.join("index.html"), utf16).unwrap();
+        assert!(
+            preflight_web(&root, &[]).safe,
+            "a UTF-16 encoded entry must pass"
+        );
+
+        // Non-HTML content still fails closed.
+        fs::write(root.join("index.html"), b"\x7fELF not a web page at all").unwrap();
+        let report = preflight_web(&root, &[]);
+        assert!(!report.safe);
+        assert!(
+            report.reasons[0].contains("does not look like an HTML document"),
+            "{:?}",
+            report.reasons
+        );
         let _ = fs::remove_dir_all(root);
     }
 }
