@@ -1,0 +1,14 @@
+/build/
+/target
+/.cache/
+/catalog.json
+/graphify-out/
+*.log
+*.sock
+# makepkg artifacts (packaging/)
+/packaging/pkg/
+/packaging/src/
+/packaging/kde-wallpaper-engine/
+/packaging/*.pkg.tar
+/packaging/*.pkg.tar.zst
+

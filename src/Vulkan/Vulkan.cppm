@@ -632,7 +632,8 @@ public:
 
     void SetVideoDecodeOptions(VideoDecodeOptions);
 
-    Option<ExImageParameters> CreateExTex(u32 witdh, u32 height, VkFormat, VkImageTiling);
+    Option<ExImageParameters> CreateExTex(u32 witdh, u32 height, VkFormat, VkImageTiling,
+                                          bool host_visible = false);
     rstd::Option<rstd::sync::Arc<TextureAllocation>>
     AllocateImportedTexture(const Image&, Option<rstd::sync::Arc<VideoPlaybackState>> playback);
     rstd::Option<rstd::sync::Arc<TextureAllocation>> AllocateTexture(TextureKey);
@@ -1333,10 +1334,12 @@ private:
 
 inline std::shared_ptr<LocalExSwapchain> CreateLocalExSwapchain(const Device& device,
                                                                 TextureCache& textures, unsigned w,
-                                                                unsigned h, VkImageTiling tiling) {
+                                                                unsigned h, VkImageTiling tiling,
+                                                                bool host_visible = false) {
     rstd::array<LocalExHandle, 3> handles;
     for (auto& handle : handles) {
-        if (auto rv = textures.CreateExTex(u32(w), u32(h), VK_FORMAT_R8G8B8A8_UNORM, tiling);
+        if (auto rv = textures.CreateExTex(
+                u32(w), u32(h), VK_FORMAT_R8G8B8A8_UNORM, tiling, host_visible);
             rv.is_some())
             handle.image = rstd::move(rv).unwrap();
         else

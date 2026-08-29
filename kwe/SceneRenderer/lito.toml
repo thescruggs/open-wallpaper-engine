@@ -1,0 +1,39 @@
+[package]
+name = "owe-kwe-scene-renderer"
+version.workspace = true
+
+[[bin]]
+name = "kwe-scene-renderer"
+sources = ["scene_worker.cpp"]
+
+[usage]
+options = [
+  "-Wextra",
+  "-Wno-missing-field-initializers",
+  "-Wno-gnu-zero-variadic-macro-arguments",
+]
+threads = true
+
+[dependencies.owe-kwe-common]
+workspace = true
+visibility = "private"
+
+[dependencies.owe-core]
+workspace = true
+visibility = "private"
+
+[dependencies.owe-scene]
+workspace = true
+visibility = "private"
+
+[dependencies.rstd-std]
+workspace = true
+visibility = "private"
+
+[dependencies.rstd-cppstd]
+workspace = true
+visibility = "private"
+
+[dependencies.rstd-log]
+workspace = true
+visibility = "private"

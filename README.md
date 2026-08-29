@@ -1,6 +1,12 @@
 # Open Wallpaper Engine
 Made this for fun.
 
+## KDE Plasma front end
+The `kde/` tree is a full KDE Plasma 6 front end (supervised renderer
+daemon, Kirigami manager, Plasma wallpaper package) whose scene and web
+wallpapers render through this engine. The worker binaries it spawns are
+built from `kwe/` in this workspace; see `kde/docs/OWE_BACKEND.md`.
+
 ## Scene Renderer
 Open source scene renderer, mostly for linux.  
 

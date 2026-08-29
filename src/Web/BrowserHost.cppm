@@ -22,6 +22,11 @@ public:
         int                   remote_debugging_port { 0 };
         bool                  enable_audio { true };
         bool                  shared_texture_enabled { true };
+        // Launch children directly instead of through the zygote. Needed
+        // when the CEF resources do not sit beside the executable — the
+        // zygote is spawned without the resources-dir switches and then
+        // cannot load ICU.
+        bool                  no_zygote { false };
         std::string           render_node_override;
     };
 
@@ -69,6 +74,17 @@ public:
     bool ShouldExit() const;
     void RequestClose();
     void Shutdown();
+
+    // The bundled CEF's version string, e.g. "139.0.4+g2f1bfd8+chromium-139.0...".
+    static std::string CefVersionString();
+
+    // Locates the CEF resource/locales directories by the runtime path of
+    // the loaded libcef.so (dladdr): the standard bundle layout keeps
+    // icudtl.dat and the .pak files beside libcef.so or in a sibling
+    // Resources/ directory. Returns false when neither is found; hosts use
+    // this as a fallback when their own install layout has no staged copy.
+    static bool LocateCefResources(std::filesystem::path& resources_dir,
+                                   std::filesystem::path& locales_dir);
 
 private:
     struct Impl;

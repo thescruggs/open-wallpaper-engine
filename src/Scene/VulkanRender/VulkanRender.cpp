@@ -509,7 +509,8 @@ bool VulkanRender::Impl::init(RenderInitInfo info, SceneLoadBenchRecorderView lo
                 extent.width,
                 extent.height,
                 (info.offscreen_tiling == TexTiling::OPTIMAL ? VK_IMAGE_TILING_OPTIMAL
-                                                             : VK_IMAGE_TILING_LINEAR));
+                                                             : VK_IMAGE_TILING_LINEAR),
+                info.offscreen_host_visible);
         }
         m_with_surface = false;
     }

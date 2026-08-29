@@ -1,6 +1,12 @@
 module;
 
+#include <dlfcn.h>
+
 #include <cstdio>
+#include <filesystem>
+
+#include "include/cef_api_hash.h"
+#include "include/cef_version.h"
 
 module weweb;
 
@@ -82,6 +88,7 @@ bool BrowserHost::Init(const InitOptions& opts) {
     impl_->app->SetMuteAudio(! opts.enable_audio);
     impl_->app->SetSharedTextureEnabled(opts.shared_texture_enabled);
     impl_->app->SetRenderNodeOverride(opts.render_node_override);
+    impl_->app->SetNoZygote(opts.no_zygote);
 
     if (! CefInitialize(main_args, settings, impl_->app.get(), nullptr)) {
         std::fprintf(stderr, "weweb: CefInitialize failed\n");
@@ -297,6 +304,28 @@ void BrowserHost::PushAudioData(const float* data, std::size_t count) {
 }
 
 bool BrowserHost::ShouldExit() const { return impl_->should_exit.load(); }
+
+std::string BrowserHost::CefVersionString() { return CEF_VERSION; }
+
+bool BrowserHost::LocateCefResources(std::filesystem::path& resources_dir,
+                                     std::filesystem::path& locales_dir) {
+    Dl_info info {};
+    if (! ::dladdr(reinterpret_cast<void*>(&cef_api_hash), &info) || ! info.dli_fname) {
+        return false;
+    }
+    const std::filesystem::path library(info.dli_fname);
+    const auto                  beside  = library.parent_path();
+    const auto                  sibling = beside.parent_path() / "Resources";
+    std::error_code             ec;
+    for (const auto& candidate : { sibling, beside }) {
+        if (std::filesystem::is_regular_file(candidate / "icudtl.dat", ec)) {
+            resources_dir = candidate;
+            locales_dir   = candidate / "locales";
+            return true;
+        }
+    }
+    return false;
+}
 
 void BrowserHost::RequestClose() { impl_->should_exit.store(true); }
 

@@ -15,6 +15,9 @@ members = [
   "waywallen/SceneRenderer",
   "waywallen/WebRenderer",
   "waywallen/plugins/org.waywallen.open-wallpaper-engine",
+  "kwe/Common",
+  "kwe/SceneRenderer",
+  "kwe/WebRenderer",
   "tests",
 ]
 default-members = ["viewer/SceneViewer", "viewer/WebViewer"]
@@ -54,6 +57,15 @@ path = "waywallen/SceneRenderer"
 
 [workspace.dependencies.owe-waywallen-web-renderer]
 path = "waywallen/WebRenderer"
+
+[workspace.dependencies.owe-kwe-common]
+path = "kwe/Common"
+
+[workspace.dependencies.owe-kwe-scene-renderer]
+path = "kwe/SceneRenderer"
+
+[workspace.dependencies.owe-kwe-web-renderer]
+path = "kwe/WebRenderer"
 
 [workspace.dependencies.rstd-std]
 git = "https://github.com/litocpp/rstd.git"

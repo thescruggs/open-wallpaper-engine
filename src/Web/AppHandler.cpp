@@ -83,6 +83,12 @@ void AppHandler::OnBeforeCommandLineProcessing(const CefString&          process
     cmd->AppendSwitch("no-sandbox");
     // cmd->AppendSwitch("disable-gpu-sandbox");
 
+    // The zygote is launched without the resources-dir switches, so a
+    // deployment whose CEF resources live away from the executable (the
+    // KWE worker's dev layout) never gets ICU into the zygote. Direct
+    // child launches carry the full forwarded command line.
+    if (m_no_zygote) cmd->AppendSwitch("no-zygote");
+
     std::string features { "AcceleratedVideoDecodeLinuxZeroCopyGL,AcceleratedVideoDecodeLinuxGL,"
                            "VaapiIgnoreDriverChecks,VaapiOnNvidiaGPUs,VaapiVideoDecodeLinuxGL" };
     std::string dis_features;

@@ -1,0 +1,436 @@
+# Planning ledger. A non-null revision and completed license review are required
+# before code is copied or adapted from an entry.
+schema_version: 1
+entries:
+  - id: rust-ash
+    project: ash
+    url: https://crates.io/crates/ash
+    revision: 0.38.0+1.3.281
+    license_observed: MIT OR Apache-2.0
+    use: dependency
+    approved_for_code_use: true
+    notes: Vulkan FFI bindings used only by the external preflight/renderer worker.
+
+  - id: rust-cli-errors
+    project: clap, anyhow, thiserror
+    url: https://crates.io/
+    revision: clap@4.6.6; anyhow@1.0.104; thiserror@2.0.20
+    license_observed: MIT OR Apache-2.0
+    use: dependency
+    approved_for_code_use: true
+    notes: CLI parsing and bounded error propagation; exact transitive set is pinned in Cargo.lock.
+
+  - id: rust-data
+    project: serde, serde_json, sha2, hex
+    url: https://crates.io/
+    revision: serde@1.0.229; serde_json@1.0.151; sha2@0.10.9; hex@0.4.3
+    license_observed: MIT OR Apache-2.0
+    use: dependency
+    approved_for_code_use: true
+    notes: Protocol/metadata serialization and non-secret metadata fingerprints.
+
+  - id: rust-libc
+    project: libc
+    url: https://crates.io/crates/libc
+    revision: 0.2.189
+    license_observed: MIT OR Apache-2.0
+    use: dependency
+    approved_for_code_use: true
+    notes: Linux O_NOFOLLOW/O_CLOEXEC flags, process groups, parent-death signal, bounded worker termination, and per-renderer setrlimit controls.
+
+  - id: rust-lz4-flex
+    project: lz4_flex
+    url: https://crates.io/crates/lz4_flex
+    revision: 0.14.0
+    license_observed: MIT
+    use: dependency
+    approved_for_code_use: true
+    notes: LZ4 frame decompression for the original scene.pkg reader (crates/kwe-core/src/pkg.rs, M3b). Corpus evidence shows Wallpaper Engine stores pkg payloads raw — no compressed entry was found across 3128 entries of 60 packages — so LZ4 is a defensive path triggered only by the frame magic (04 22 4D 18) at a payload's start, with the output cap enforced during decompression (bounded take(cap+1) read). Compression is used by tests only. Used only by the separate-process kwe-core/kwe-scene-renderer worker; never in plasmashell.
+
+  - id: rust-memmap2
+    project: memmap2
+    url: https://crates.io/crates/memmap2
+    revision: 0.9.11
+    license_observed: MIT OR Apache-2.0
+    use: dependency
+    approved_for_code_use: true
+    notes: Safe ownership wrappers around mmap for the original fallback frame protocol.
+
+  - id: libmpv
+    project: mpv
+    url: https://github.com/mpv-player/mpv
+    revision: 0.41.0
+    license_observed: LGPL-2.1-or-later (with GPL-2.0+ option)
+    use: dependency
+    approved_for_code_use: true
+    notes: Dynamically linked only by the separate-process kwe-video-renderer and kwe-scene-renderer workers; never in plasmashell; release license review tracked per PROVENANCE.md. FFI linkage is explicit in the shared crates/kwe-mpv surface (the render API and `mpv_client_api_version` diagnostic are declared in one local `extern "C"` block with `#[link(name = "mpv")]`). Scene VideoLayers use software rendering (`hwdec=no`, `audio=no`, cache/demux buffers bounded), local-file-only FFmpeg protocol filtering, disabled references/autoload/scripts, ≤2 cores, and a 160 MiB source cap. The `mpv` crate (rust-mpv 0.2.3) remains removed (its builder initializes the mpv core before exposing the handle, which libmpv 0.41 forbids with a render context; docs/BETA_M1.md).
+
+  - id: qt-kirigami
+    project: Qt 6 and KDE Kirigami
+    url: https://invent.kde.org/frameworks/kirigami
+    revision: Qt@6.11.1; Kirigami@6.28.0
+    license_observed: LGPL/GPL/commercial multi-license; LGPL-compatible dynamic use intended
+    use: dependency
+    approved_for_code_use: true
+    notes: Native manager UI, reusable QML module build/deployment, wallpaper fallback UI, and local socket clients; release packaging must retain upstream notices.
+
+  - id: kde-plasma-wallpaper-api
+    project: KDE Plasma WallpaperItem and Plasma/Wallpaper package interface
+    url: https://api.kde.org/qml-org-kde-plasma-plasmoid-wallpaperitem.html
+    revision: Plasma@6.7.4; CachyOS plasma-workspace 6.7.4 package inspected 2026-08-16
+    license_observed: GPL-2.0-or-later implementation; GFDL-1.3 documentation
+    use: idea
+    approved_for_code_use: false
+    local_files:
+      - plasma/wallpapers/org.kde.kwe.wallpaper/metadata.json
+      - plasma/wallpapers/org.kde.kwe.wallpaper/contents/ui/main.qml
+      - docs/adr/0004-thin-plasma-display-bridge.md
+    reviewer: Codex implementation; human release review pending
+    review_date: 2026-08-16
+    notes: Public package shape, import name, and WallpaperItem interface only; the package QML and C++ module are original and no KDE implementation code was copied or adapted.
+
+  - id: waywallen-display
+    project: waywallen/waywallen-display
+    url: https://github.com/waywallen/waywallen-display
+    revision: null
+    license_observed: MIT
+    use: idea
+    approved_for_code_use: false
+    notes: External daemon, DMA-BUF protocol, and thin Plasma surface reference.
+
+  - id: waywallen
+    project: waywallen/waywallen
+    url: https://github.com/waywallen/waywallen
+    revision: null
+    license_observed: MIT
+    use: idea
+    approved_for_code_use: false
+    notes: Manager, daemon, plugin, input, and auto-pause UX reference.
+
+  - id: jagrat7-linux-wallpaper-engine
+    project: jagrat7/linux-wallpaper-engine
+    url: https://github.com/jagrat7/linux-wallpaper-engine
+    revision: null
+    license_observed: MIT
+    use: idea
+    approved_for_code_use: false
+    notes: Gallery, playlist, compatibility scanner, and Steamworks.js workflow reference.
+
+  - id: rainy-pixel-kde-plugin
+    project: RainyPixel/wallpaper-engine-kde-plugin
+    url: https://github.com/RainyPixel/wallpaper-engine-kde-plugin
+    revision: null
+    license_observed: GPL-2.0
+    use: idea
+    approved_for_code_use: false
+    notes: Plasma integration, format support, and documented crash behavior reference.
+
+  - id: open-wallpaper-engine
+    project: waywallen/open-wallpaper-engine
+    url: https://github.com/waywallen/open-wallpaper-engine
+    revision: null
+    license_observed: GPL-2.0
+    use: idea
+    approved_for_code_use: false
+    notes: Behavior, format, and failure-mode concepts only; no code copied and not a runtime backend.
+
+  - id: almamu-linux-wallpaperengine
+    project: Almamu/linux-wallpaperengine
+    url: https://github.com/Almamu/linux-wallpaperengine
+    revision: b016d7d1fdcf4e5fd2f9c9fa420a8aaa07fee02d
+    license_observed: GPL-3.0-only (check upstream LICENSE)
+    use: adapted
+    approved_for_code_use: true
+    notes: >
+      relicensed project to GPL-3.0-or-later 2026-08-22; scene renderer work
+      adapts this project. S1 (scene port, texture container + model/material
+      resolution) adapted files, each carrying a Borrowed-From comment at the
+      adapted function/struct:
+      src/WallpaperEngine/Data/Parsers/TextureParser.cpp (container/header/
+      mipmap/frame-table parsing, format enum) -> crates/kwe-scene-renderer/src/texv.rs;
+      src/WallpaperEngine/Data/Assets/Texture.h (format/flags/container-version
+      enums, Mipmap/Frame/Texture field shapes) -> crates/kwe-scene-renderer/src/texv.rs;
+      src/WallpaperEngine/Render/CTexture.cpp (raw-format-to-GL upload rule:
+      which formats decode via stb_image vs. raw/BC upload, and ARGB8888's
+      untransformed R,G,B,A byte order) -> crates/kwe-scene-renderer/src/texv.rs
+      (re-expressed as a CPU RGBA8 expansion; upstream hands bytes to OpenGL
+      unchanged, this decoder produces pixels instead);
+      src/WallpaperEngine/Data/Parsers/ModelParser.cpp (image -> model.json ->
+      material path walk) -> crates/kwe-core/src/scenemodel.rs;
+      src/WallpaperEngine/Data/Parsers/MaterialParser.cpp (material.json ->
+      passes[0] -> texture-slot walk) -> crates/kwe-core/src/scenemodel.rs;
+      src/WallpaperEngine/Data/Model/Material.h (MaterialPass/Material field
+      shapes) -> crates/kwe-core/src/scenemodel.rs;
+      src/WallpaperEngine/Assets/AssetLocator.cpp (AssetLocator::texture's
+      "materials/<name>.tex" naming rule) -> crates/kwe-core/src/scenemodel.rs.
+      S2 (material shaders) adapted files, each carrying a Borrowed-From
+      comment at the adapted function:
+      src/WallpaperEngine/Render/Shaders/ShaderUnit.cpp (SHADER_HEADER/
+      FRAGMENT_SHADER_DEFINES/VERTEX_SHADER_DEFINES HLSL-compat macro block,
+      #include resolution and gl_FragColor rewrite, #require LightingV1
+      stub, // [COMBO] and commented-uniform metadata scraping) ->
+      crates/kwe-scene-renderer/src/shaderpre.rs (adapted: recursive bounded
+      #include resolution replaces the two-pass one-level scheme; two
+      Vulkan-only #extension pragmas and the fold_declarations pass —
+      layout(location=)/layout(binding=)/MaterialUniforms UBO folding —
+      have no upstream equivalent, since upstream targets OpenGL 330 via a
+      SPIRV-Cross round trip rather than compiling straight to Vulkan
+      SPIR-V);
+      src/WallpaperEngine/Assets/AssetLocator.cpp (AssetLocator::shader's
+      workshop/<id>/<file> -> zcompat/scene/shaders/<id>/<file> compat
+      redirect) -> crates/kwe-scene-renderer/src/main.rs
+      (resolve_shader_reference).
+      S3 (effect passes / FBO chains / _rt_* render targets) adapted files,
+      each carrying a Borrowed-From comment at the adapted function/struct:
+      src/WallpaperEngine/Data/Parsers/EffectParser.cpp (effect .json schema:
+      fbos[]/passes[], material-pass vs command-pass shape) ->
+      crates/kwe-core/src/sceneeffect.rs;
+      src/WallpaperEngine/Data/Parsers/ObjectParser.cpp (parseEffect: an
+      object's effects[] entry id/name/visible/file/passes[] override list)
+      -> crates/kwe-core/src/sceneeffect.rs;
+      src/WallpaperEngine/Render/Objects/Effects/CPass.cpp
+      (setupTextureUniforms's texture-slot resolution priority order:
+      material's own textures < usertextures < override textures < override
+      usertextures < binds, highest priority last) ->
+      crates/kwe-core/src/sceneeffect.rs (resolves references to
+      bytes/sentinels; does not touch a GPU);
+      src/WallpaperEngine/Render/CFBO.cpp (explicit clear-to-transparent-
+      black fix at FBO creation) -> crates/kwe-scene-renderer/src/vulkan.rs
+      (adapted: clears via one throwaway Vulkan render-pass instance instead
+      of glClear against a live GL context);
+      src/WallpaperEngine/Render/CWallpaper.cpp (setupFramebuffers creates
+      _rt_FullFrameBuffer as the wallpaper's own main composite target) ->
+      crates/kwe-core/src/sceneeffect.rs (name only; this renderer takes one
+      whole-frame snapshot per frame rather than tracking incremental
+      per-object paint order);
+      src/WallpaperEngine/Assets/AssetLocator.cpp (AssetLocator::texture's
+      "materials/<name>.tex" naming rule, re-applied to the _rt_/_alias_
+      runtime-target exception) -> crates/kwe-core/src/scenemodel.rs
+      (resolve_model's slot-0 honesty-gate fix) and
+      crates/kwe-scene-renderer/src/main.rs (the pkg-entries -> scene-dir ->
+      assets-root shader lookup chain, extended in S3 so a scene's own
+      bundled custom effect shaders resolve, not just the WE assets tree).
+      `command: swap` is upstream's own unexecuted enum value
+      (CImage.cpp only handles Command_Copy) — this renderer's swap-as-copy
+      behavior is an original completion, not a port of executed upstream
+      behavior. Puppet mesh geometry (CImage.cpp's MDLV0021/0023 binary
+      blob heuristic scan) was researched but NOT ported this slice — zero
+      local corpus usage found; see docs/SCENE_FORMAT_V1.md "Mesh/puppet
+      vertex formats" for the citation and the decision record.
+      S4b (external particle definition files) adapted files, each
+      carrying a Borrowed-From comment at the adapted function/struct:
+      src/WallpaperEngine/Render/Objects/CParticle.cpp (the file's
+      top-level `material` field read, matching a model's `material` field
+      walk) -> crates/kwe-core/src/particlefile.rs (resolution only; no
+      simulation logic);
+      src/WallpaperEngine/Render/Objects/CParticle.cpp
+      (createBoxEmitter/createSphereEmitter's random-position rules,
+      the *RandomInitializer family, and createMovementOperator/
+      createAlphaFadeOperator/createSizeChangeOperator/
+      createColorChangeOperator/createOscillateAlphaOperator/
+      createOscillateSizeOperator/createControlPointAttractOperator/
+      createTurbulenceOperator) -> crates/kwe-scene-renderer/src/particles.rs
+      and crates/kwe-scene-renderer/src/particlefile.rs (adapted, not
+      ported verbatim — every emitter/initializer/operator kind is
+      2D-only, `controlpointattract` anchors at a static system-origin
+      offset rather than a live mouse-linked control point, and
+      `turbulence` is a bounded deterministic sine/cosine approximation,
+      NOT upstream's Perlin curl-noise algorithm; `rotationrandom`/
+      `angularvelocityrandom`/`angularmovement`/`oscillateposition`/
+      `vortex`/`mapsequencearoundcontrolpoint`/the `spritetrail` renderer
+      are not ported — see docs/SCENE_FORMAT_V1.md "External particle
+      definition files (S4b)" for the full documented-scope-cut list).
+      S5 (stacked multi-effect compositing / _rt_FullFrameBuffer paint
+      order / shader preprocessor placement) adapted files, each carrying
+      a Borrowed-From comment at the adapted function:
+      src/WallpaperEngine/Render/Objects/CImage.cpp:729-880 (setupPasses/
+      pinpongFramebuffer/configurePassTarget: the per-object two-target
+      ping-pong FBO pair — `_a`/`_b` — an untargeted pass writes into,
+      alternated after each write, versus a targeted pass which writes
+      into its own named FBO without touching the pair) ->
+      crates/kwe-scene-renderer/src/main.rs (plan_effect_chain,
+      pingpong_target_name — adapted: this renderer has no "draw to an
+      unnamed target" GPU primitive, so an intermediate untargeted pass
+      reuses the SAME named-FBO machinery a targeted pass uses, against a
+      synthesized per-object name instead of a scene-declared one; the
+      object's own base-material pass is not materialized as its own
+      `CPass`/GPU draw the way upstream's colorBlending pass is — it
+      seeds the chain's first "previous" input directly from the base
+      material's own real texture bytes instead, which is
+      pixel-equivalent for this renderer's single-quad-per-layer draw
+      model);
+      src/WallpaperEngine/Render/Wallpapers/CScene.cpp /
+      src/WallpaperEngine/Render/CWallpaper.cpp (per-object paint order:
+      a later object samples the composite of every object drawn before
+      it, same frame) -> crates/kwe-scene-renderer/src/vulkan.rs
+      (LayerRenderer::render's same-frame `_rt_FullFrameBuffer` snapshot,
+      inserted immediately before a registered consumer's own draw —
+      adapted: implemented as a bounded, capped number of render-pass
+      splits plus a full-attachment `vkCmdCopyImage` rather than
+      upstream's true incremental per-object framebuffer tracking; scoped
+      to a layer's own bound MATERIAL only, not to an effect chain's
+      internal `_rt_FullFrameBuffer` references, which remain the
+      pre-S5 one-frame-stale snapshot — see docs/SCENE_FORMAT_V1.md
+      "_rt_FullFrameBuffer paint order (S5)");
+      src/WallpaperEngine/Render/Shaders/ShaderUnit.cpp:136-312
+      (preprocessIncludes: the attribute/varying/uniform-based insertion
+      point and the `#if`/`#endif` stack walk that keeps spliced
+      `#include` text outside any conditionally-compiled region) ->
+      crates/kwe-scene-renderer/src/shaderpre.rs
+      (find_include_insertion_point, move_point_outside_conditionals —
+      widens this file's prior citation, which covered only lines
+      136-171, the plain "splice before main()" placement without the
+      declaration/`#if`-aware search). The comment-aware `main(` token
+      scan itself (find_main_token, skipping `//`/`/* */` comments) has
+      no upstream equivalent — upstream's own `find(" main")` has the
+      same weakness this closes, an original robustness fix, not a port.
+      S6 (bug-fix slice: layer-centering NDC math, the material-constant
+      "material" key vs. GLSL uniform name mismatch, the Wallpaper
+      Engine assets-root library-folder discovery gap, and the material
+      pipeline's straight-vs-premultiplied alpha blend mismatch) adapted
+      files, each carrying a Borrowed-From comment at the adapted
+      function:
+      src/WallpaperEngine/Render/Objects/CImage.cpp:259-262
+      (`updateScenePosition`'s `this->m_pos.x -= scene_width / 2` etc. —
+      recentering an object's absolute-origin quad corners onto the
+      scene's own centre before the camera's `glm::ortho(-width/2,
+      width/2, ...)` projection) -> crates/kwe-scene-renderer/src/
+      vulkan.rs (LayerRenderer::set_world_extent/recenter — adapted:
+      upstream also flips y there to match OpenGL's y-up NDC; this
+      renderer targets Vulkan's native y-down NDC and already documents
+      "no y-flip" (shaders/quad.vert), so only the centre subtraction is
+      ported, not the flip);
+      src/WallpaperEngine/Render/Objects/Effects/CPass.cpp:128-140
+      (`CPass::setupPass`'s blend-func switch: `BlendingMode_Translucent`
+      -> `glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, ...)`,
+      i.e. upstream's fixed-function blend hardware — not the shader —
+      scales a STRAIGHT-alpha fragment's colour by its own alpha before
+      compositing) -> crates/kwe-scene-renderer/src/shaderpre.rs
+      (`preprocess`'s fragment-stage `main`-wrapping fix — adapted, not a
+      code port: this renderer's own material blend state
+      (`vulkan::blend_attachment_for`) uses PREMULTIPLIED-alpha factors
+      (`ONE`, `ONE_MINUS_SRC_ALPHA`) instead of upstream's straight-alpha
+      ones (`GL_SRC_ALPHA`, `GL_ONE_MINUS_SRC_ALPHA`), a renderer-specific
+      choice this slice did not revisit — so instead of matching
+      upstream's blend func, every material fragment shader's real `main`
+      is renamed and wrapped to premultiply its own output once, making
+      its result match what this renderer's EXISTING blend factors
+      require; the citation is upstream's semantics — a straight-alpha
+      shader, alpha-scaled once before compositing — not upstream's
+      mechanism, since GLSL has no equivalent of overriding another
+      function's blend factors at the source level).
+      The material-constant name-mapping fix
+      (crates/kwe-scene-renderer/src/shaderpre.rs, fold_declarations'
+      `uniform_material_keys` lookup) and the Steam library-folder
+      discovery fix (crates/kwe-core/src/scan.rs,
+      default_wallpaper_engine_assets_dir routing through
+      discover_libraries) are original bug fixes with no upstream
+      citation — both close gaps in this renderer's OWN prior S2/S1
+      ports, not new adaptations of upstream code.
+      Verified cross-checked against real Workshop payloads under
+      /media/crushinator/steamapps/workshop/content/431960/*/ and the real
+      Wallpaper Engine asset shaders under
+      /media/crushinator/steamapps/common/wallpaper_engine/assets/shaders
+      (never committed as fixtures; synthetic buffers/shader text only in
+      tests).
+
+  - id: rust-texture2ddecoder
+    project: texture2ddecoder
+    url: https://crates.io/crates/texture2ddecoder
+    revision: 0.1.2
+    license_observed: MIT OR Apache-2.0
+    use: dependency
+    approved_for_code_use: true
+    notes: >
+      Pure-Rust, no_std CPU block decoder for DXT1/DXT3/DXT5/BC7 (S1 TEXV
+      texture decode, crates/kwe-scene-renderer/src/texv.rs). Used only by
+      the separate-process kwe-scene-renderer worker, never in plasmashell.
+      Its block decoders write packed u32 pixels as
+      u32::from_le_bytes([b, g, r, a]) (BGRA in-memory byte order); texv.rs
+      swaps R/B per pixel to produce this project's straight RGBA8
+      convention before handing pixels to the compositor.
+
+  - id: rust-shaderc
+    project: shaderc (Rust bindings)
+    url: https://crates.io/crates/shaderc
+    revision: 0.10.1
+    license_observed: Apache-2.0
+    use: dependency
+    approved_for_code_use: true
+    notes: >
+      GLSL -> SPIR-V compilation for the S2 material-shader pipeline
+      (crates/kwe-scene-renderer/src/materialshader.rs). Built with DEFAULT
+      crate features only (no "build-from-source") so the crate's build
+      script links the SYSTEM libshaderc dynamically via pkg-config
+      (verified against /usr/lib/pkgconfig/shaderc.pc and
+      /usr/lib/libshaderc_shared.so.1 on the development machine) rather
+      than vendoring/building glslang+spirv-tools from source. The system
+      libshaderc itself (Apache-2.0, upstream
+      https://github.com/google/shaderc, packaged as `shaderc` on Arch —
+      the same package provides both the runtime .so and the pkg-config
+      .pc/headers used at build time) is a separate, unbundled runtime
+      dependency; packaging/PKGBUILD adds it under `depends`. Used only by
+      the separate-process kwe-scene-renderer worker, never in plasmashell.
+
+  - id: pipewire-tools
+    project: PipeWire tools (pw-record, pw-dump)
+    url: https://gitlab.freedesktop.org/pipewire/pipewire
+    revision: 1.6.8 (installed package 1:1.6.8-1.1 on the development machine)
+    license_observed: MIT (PipeWire)
+    use: separate-process-backend
+    approved_for_code_use: true
+    notes: kwe-audio-worker spawns pw-record --raw and pw-dump as separate processes and parses their bounded raw f32 output and JSON dump only; it never links libpipewire and no upstream code is copied. Revision pinned to the installed pipewire package; flag/property shapes verified empirically on 1.6.8 (--target accepts a node serial or name; monitor nodes are created on demand and do not appear in pw-dump).
+
+  - id: valve-steamworks
+    project: Valve Steamworks SDK / ISteamUGC
+    url: https://partner.steamgames.com/doc/features/workshop/implementation
+    revision: null
+    license_observed: proprietary-sdk-terms
+    use: separate-process-backend
+    approved_for_code_use: false
+    notes: Optional isolated Workshop bridge after distribution review.
+
+  - id: chromium
+    project: The Chromium Project (headless Chromium)
+    url: https://www.chromium.org/
+    revision: 151.0.7922.137 (installed package 151.0.7922.137-1.1 on the development machine)
+    license_observed: BSD-3-Clause
+    use: separate-process-backend
+    approved_for_code_use: true
+    notes: kwe-web-renderer spawns one headless Chromium per web wallpaper inside a bwrap sandbox (crates/kwe-core/src/websandbox.rs) and drives it exclusively over a DevTools pipe (CDP screencast -> BGRA frames); no upstream code is copied and chromium is never linked, only exec'd. The V8 sandbox reserves ~53 GiB of virtual address space per process, which is why the daemon's web-kind RLIMIT_AS default is 128 GiB (docs/BETA_M2.md M2b open risks). Revision pinned to the installed package; flag/behavior shapes verified empirically on 151.
+
+  - id: bubblewrap
+    project: bubblewrap (bwrap)
+    url: https://github.com/containers/bubblewrap
+    revision: 0.11.2-1.1 (installed package on the development machine)
+    license_observed: LGPL-2.0-or-later
+    use: separate-process-backend
+    approved_for_code_use: true
+    notes: kwe-web-renderer execs bwrap to build the read-only rootfs and user namespaces for the sandboxed chromium (crates/kwe-core/src/websandbox.rs); never linked, no upstream code copied. Spawning the bwrap fork is what RLIMIT_NPROC governs, hence the web kind's 32768 process ceiling (docs/BETA_M2.md M2b). Revision pinned to the installed package.
+
+  - id: rust-image
+    project: image
+    url: https://crates.io/crates/image
+    revision: 0.25.10
+    license_observed: MIT OR Apache-2.0
+    use: dependency
+    approved_for_code_use: true
+    notes: Two consumers. (1) M2a: decodes the BGRA frames the web renderer publishes from chromium CDP screencast events. (2) M3c: bounded PNG/JPEG/WebP decoding for SceneScript image layers (crates/kwe-scene-renderer/src/textures.rs) — default-features off, only the png/jpeg/webp features enabled; decoded RGBA8 is uploaded as R8G8B8A8_UNORM (identity). Bounds: dimension 8192, pixel count 16_777_216, source and decoded allocation 64 MiB each, 256 MiB total across layers. Used only by the separate-process web/scene workers; never in plasmashell. Exact transitive set pinned in Cargo.lock.
+
+  - id: quickjs-rquickjs
+    project: QuickJS JavaScript engine via rquickjs (rquickjs/rquickjs-sys)
+    url: https://crates.io/crates/rquickjs
+    revision: 0.12.2 (rquickjs 0.12.2; rquickjs-sys 0.12.2 vendored quickjs-ng 0.15.1 — QJS_VERSION 0.15.1 in vendored quickjs/quickjs.h, license MIT per upstream)
+    license_observed: MIT
+    use: dependency
+    approved_for_code_use: true
+    notes: JS engine for the original SceneScript implementation (ADR 0001; docs/SCENE_FORMAT_V1.md). Used only by the separate-process kwe-scene-renderer worker; never in plasmashell. Bounded execution is enforced with Runtime::set_memory_limit (64 MiB heap) and set_interrupt_handler (per-update wall-clock soft/hard budget, M3a) — no WE code is copied or linked; the engine just evaluates the wallpaper's script. Exact transitive set pinned in Cargo.lock (rquickjs-core, rquickjs-sys, cc build of vendored QuickJS C).
+
+  - id: stb-truetype
+    project: stb_truetype (nothings/stb single-file library)
+    url: https://github.com/nothings/stb
+    revision: vendored header at commit 6e9f34d5429cf16790ec43c9bac3f1ee4ad1f760 (2024-07-15); redox-os/stb_truetype crate 0.3.1 researched but NOT used (its surface is C API re-exports only — it has no pixel rasterizer of its own, so it was dropped in favor of the vendored header)
+    license_observed: public domain OR MIT (dual license per upstream: "This software is dual-licensed to the public domain and under the MIT license... choose whichever you prefer"; the vendored header carries the public-domain notice and ALTERNATIVE A — the MIT text; the crate is MIT OR Apache-2.0, research only)
+    use: vendored-source
+    approved_for_code_use: true
+    notes: M3e text-layer glyph rasterization (crates/kwe-scene-renderer/vendor/stb/stb_truetype.h, unmodified, STB_TRUETYPE_IMPLEMENTATION compiled once in the original C shim vendor/stb/stb_shim.c via a cc build.rs; never linked into plasmashell — separate-process kwe-scene-renderer worker only). The shim bounds everything the Rust side sees: ttc collection offset lookup, GetGlyphBitmapBoxSubpixel (no subpixel shift), shape vertex count capped at 65536 before rasterization, flatness 0.35. Public domain per upstream license header; vendored file is bit-exact with the pinned upstream commit. One ledger entry covers the vendored header and the researched-but-unused crate.

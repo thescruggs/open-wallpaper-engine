@@ -1,0 +1,181 @@
+# Maintainer: KDE Wallpaper Engine developers
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# AUR package for KDE Wallpaper Engine, open-wallpaper-engine backend.
+#
+# The KDE stack (daemon, manager, CLI, Plasma package) lives in kde/ of the
+# open-wallpaper-engine monorepo; the scene and web renderer workers are C++
+# binaries built from the same monorepo's lito workspace (kwe/SceneRenderer,
+# kwe/WebRenderer) on top of the OWE engine, and are installed under the
+# `kwe-scene-renderer` / `kwe-web-renderer` names the daemon spawns.
+#
+# Source selection: when this PKGBUILD is built from inside the monorepo
+# checkout (kde/packaging/ under the repository root), the source is the
+# local git repository at its current committed HEAD, so `makepkg -si`
+# needs no network access for the repo itself. Anywhere else (AUR builders,
+# CI) the published GitHub repository is used instead.
+#
+# The lito builder is bootstrapped from its official release archive when it
+# is not already on PATH; set LITO_BIN to use a specific binary.
+
+if [[ -z "${KWE_FORCE_AUR_SOURCE:-}" && -f "../../lito.toml" ]]; then
+    _source="git+file://$(cd ../.. && pwd -P)#commit=$(git -C ../.. rev-parse --short HEAD)"
+else
+    _source="git+https://github.com/waywallen/open-wallpaper-engine.git"
+fi
+source=("open-wallpaper-engine::${_source}")
+sha256sums=('SKIP')
+install=kde-wallpaper-engine.install
+
+pkgname=kde-wallpaper-engine
+pkgver=0.2.0.alpha.1
+pkgrel=1
+pkgdesc="Experimental Plasma 6 app to browse, install, and safely run Wallpaper Engine Workshop wallpapers via a supervised renderer daemon rendering through open-wallpaper-engine"
+arch=('x86_64')
+url="https://github.com/waywallen/open-wallpaper-engine"
+license=('GPL-3.0-or-later')
+depends=(
+    'qt6-base'
+    'qt6-declarative'
+    'kirigami'
+    'vulkan-icd-loader'
+    'vulkan-driver'
+    # The apply lane shells out to both of these for its read-only output
+    # enumeration (kde/crates/kwe-daemon/src/apply.rs): kscreen-doctor is
+    # authoritative for which outputs exist, and qdbus6 (qt6-tools) carries
+    # the Plasma shell probe and the wallpaper switch.
+    'kscreen'
+    'qt6-tools'
+    # OWE scene worker runtime: .pkg decompression, text layers, and the
+    # engine's PipeWire audio output.
+    'lz4'
+    'freetype2'
+    'fontconfig'
+    'libpipewire'
+    # CEF (kwe-web-renderer) runtime libraries.
+    'nss'
+    'nspr'
+    'alsa-lib'
+    'libxkbcommon'
+    'libcups'
+    'at-spi2-core'
+    'libdrm'
+    'mesa'
+)
+makedepends=(
+    'rust'
+    'cmake'
+    'ninja'
+    'git'
+    'clang'
+    'lld'
+    'llvm'
+    'pkg-config'
+    'curl'
+    'qt6-base'
+    'qt6-declarative'
+    'kirigami'
+)
+
+_lito() {
+    if [[ -n "${LITO_BIN:-}" ]]; then
+        "${LITO_BIN}" "$@"
+    elif command -v lito >/dev/null 2>&1; then
+        lito "$@"
+    else
+        "${srcdir}/lito-bootstrap/lito" "$@"
+    fi
+}
+
+prepare() {
+    # Bootstrap the lito builder from its official release archive unless a
+    # usable binary is already available.
+    if [[ -z "${LITO_BIN:-}" ]] && ! command -v lito >/dev/null 2>&1; then
+        # The official installer only targets ~/.local/bin; run it with a
+        # scratch HOME and move the binary into the build tree.
+        mkdir -p "${srcdir}/lito-bootstrap/home"
+        curl -fsSL https://raw.githubusercontent.com/litocpp/lito/main/install.sh |
+            HOME="${srcdir}/lito-bootstrap/home" bash ||
+            {
+                echo "lito bootstrap failed; install lito (https://github.com/litocpp/lito)" >&2
+                return 1
+            }
+        mv "${srcdir}/lito-bootstrap/home/.local/bin/lito" "${srcdir}/lito-bootstrap/lito"
+    fi
+}
+
+build() {
+    cd "${srcdir}/open-wallpaper-engine"
+
+    # OWE renderer workers (scene + web) from the lito workspace.
+    _lito build --profile release \
+        -p owe-kwe-scene-renderer \
+        -p owe-kwe-web-renderer
+
+    # KDE stack.
+    cd kde
+    export CARGO_TARGET_DIR="${srcdir}/cargo-target"
+    # CachyOS/Arch toolchain envs carry -flto=auto; the cc-built C archives
+    # compile as GCC-LTO objects and rust-lld cannot LTO-link them.
+    export CFLAGS="${CFLAGS//-flto=auto/}"
+    export CXXFLAGS="${CXXFLAGS//-flto=auto/}"
+    export LDFLAGS="${LDFLAGS//-flto=auto/}"
+    cargo build --release --workspace
+    cmake -S . -B build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DBUILD_TESTING=OFF
+    cmake --build build
+}
+
+check() {
+    cd "${srcdir}/open-wallpaper-engine/kde"
+    export CARGO_TARGET_DIR="${srcdir}/cargo-target"
+    export CFLAGS="${CFLAGS//-flto=auto/}"
+    export CXXFLAGS="${CXXFLAGS//-flto=auto/}"
+    export LDFLAGS="${LDFLAGS//-flto=auto/}"
+    # kwe-vulkan exercises real Vulkan instances and is excluded so the test
+    # run also works in GPU-less build environments.
+    cargo test --release --workspace --exclude kwe-vulkan
+}
+
+package() {
+    cd "${srcdir}/open-wallpaper-engine"
+
+    # OWE scene worker: a self-contained binary the daemon resolves as
+    # `kwe-scene-renderer` beside its own executable (/usr/bin).
+    install -Dm755 "build/release/bin/owe-kwe-scene-renderer/kwe-scene-renderer" \
+        "${pkgdir}/usr/bin/kwe-scene-renderer"
+
+    # OWE web worker: the CEF runtime must sit beside the real binary, so it
+    # installs under /usr/lib and /usr/bin carries a symlink (the worker
+    # resolves its resources through /proc/self/exe, which follows it).
+    # No --no-build: lito's install plan needs its own build pass, which
+    # fully reuses the build() artifacts.
+    _lito install --profile release -p owe-kwe-web-renderer \
+        --prefix "${pkgdir}/usr"
+    ln -sf "/usr/lib/kde-wallpaper-engine/weweb/kwe-web-renderer" \
+        "${pkgdir}/usr/bin/kwe-web-renderer"
+
+    cd kde
+    export CARGO_TARGET_DIR="${srcdir}/cargo-target"
+
+    # Rust binaries. The daemon resolves its default renderers next to its
+    # own executable, so they land in /usr/bin.
+    install -Dm755 "${CARGO_TARGET_DIR}/release/kwe-daemon" "${pkgdir}/usr/bin/kwe-daemon"
+    install -Dm755 "${CARGO_TARGET_DIR}/release/kwe-test-renderer" "${pkgdir}/usr/bin/kwe-test-renderer"
+    install -Dm755 "${CARGO_TARGET_DIR}/release/kwe-vulkan" "${pkgdir}/usr/bin/kwe-vulkan"
+    install -Dm755 "${CARGO_TARGET_DIR}/release/kwe" "${pkgdir}/usr/bin/kwe"
+    install -Dm755 "${CARGO_TARGET_DIR}/release/kwe-video-renderer" "${pkgdir}/usr/bin/kwe-video-renderer"
+    install -Dm755 "${CARGO_TARGET_DIR}/release/kwe-audio-worker" "${pkgdir}/usr/bin/kwe-audio-worker"
+    # SR-0b: one-shot bounded scene inventory inspector, resolved by the
+    # daemon next to its own executable like every other worker binary.
+    install -Dm755 "${CARGO_TARGET_DIR}/release/kwe-scene-inspector" "${pkgdir}/usr/bin/kwe-scene-inspector"
+
+    # Qt/Kirigami manager, frame preview, org.kde.kwe.display QML module, and
+    # the staged org.kde.kwe.wallpaper Plasma wallpaper package.
+    DESTDIR="${pkgdir}" cmake --install build
+
+    install -Dm644 packaging/org.kde.kwe.desktop "${pkgdir}/usr/share/applications/org.kde.kwe.desktop"
+    install -Dm644 packaging/systemd/kwe-daemon.service "${pkgdir}/usr/lib/systemd/user/kwe-daemon.service"
+}

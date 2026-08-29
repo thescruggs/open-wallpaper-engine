@@ -582,9 +582,10 @@ public:
             (**physical).allocation.deref(), atlas, atlas_width, x, y, width, height);
     }
     auto CreateLocalSwapchain(const vulkan::Device& device, unsigned width, unsigned height,
-                              VkImageTiling tiling) -> std::shared_ptr<vulkan::LocalExSwapchain> {
+                              VkImageTiling tiling, bool host_visible = false)
+        -> std::shared_ptr<vulkan::LocalExSwapchain> {
         return vulkan::CreateLocalExSwapchain(
-            device, m_registries.Textures(), width, height, tiling);
+            device, m_registries.Textures(), width, height, tiling, host_visible);
     }
     void ClearTextures() {
         m_prepare_rollback = None();

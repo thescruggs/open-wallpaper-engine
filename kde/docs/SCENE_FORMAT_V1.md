@@ -1,0 +1,1724 @@
+# Scene format v1 and SceneScript API
+
+Status: **implemented (M3a)** for the items marked below, with the
+**scene.pkg archive reader (M3b)** added for the items marked M3b;
+everything else in the table is planned and reserved, not implemented. This
+document describes what the worker (`kwe-scene-renderer`, the daemon's
+`scene` kind) accepts and what script surface it runs. The scene entry
+format is the foundation slice of the original SceneScript engine per ADR
+0001.
+
+## Provenance
+
+The scene.json parser, the QuickJS engine wrapper, and the Vulkan
+compositor are an original implementation: the scene format and script API
+are inspired by the behavior of open-wallpaper-engine and
+linux-wallpaperengine (and through them, the original wallpaper engine
+scene format), consulted **as behavior references only** — for the shape
+of `scene.json` and the script entry points `init` / `update` / `resized`
+— through M3g.
+
+**S1 changes this for the TEXV texture container and model/material
+resolution specifically.** The project relicensed to GPL-3.0-or-later
+(2026-08-22, docs/PROVENANCE.md) to permit adapting GPL-3.0 code from
+`Almamu/linux-wallpaperengine`, and the TEXV decoder
+(`crates/kwe-scene-renderer/src/texv.rs`) and model/material resolver
+(`crates/kwe-core/src/scenemodel.rs`) do exactly that: they are adapted
+from that project's `TextureParser.cpp`/`Texture.h`,
+`ModelParser.cpp`/`MaterialParser.cpp`/`Material.h`, and
+`AssetLocator.cpp`, each function carrying a `Borrowed-From:` comment with
+the upstream path, line range, and commit (`b016d7d1`) per
+docs/PROVENANCE.md. See THIRD_PARTY.yml for the linked upstream commit,
+the license review, and the `texture2ddecoder` crate this decode also
+depends on. Every other section of this document (scene.json, image
+layers, blend modes, text, particles, scene.pkg, script API) remains the
+original implementation described above.
+
+## scene.json
+
+A UTF-8 JSON file, at most **16 MiB** (`MAX_SCENE_JSON_BYTES`). The root
+must be an object. Parse failures — unreadable file, invalid JSON, wrong
+shape, out-of-range values, or a `script` reference that is missing,
+non-string, escapes the content root, is not a `.js` file, or exceeds the
+2 MiB cap — are backend rejections: a bounded stderr diagnostic
+(`event=renderer.scene.backend_reject kind=... detail=...`) and **exit 73**
+before the canary, so the supervisor records `exit_code_73` and rolls back.
+
+```json
+{
+  "general": {
+    "clearcolor": [0.1, 0.1, 0.1, 1.0],
+    "resolution": [1920, 1080],
+    "fps": 30,
+    "script": "script.js"
+  }
+}
+```
+
+| Field | Type | Default | Meaning in M3a |
+|---|---|---|---|
+| `general` | object (optional) | `{}` | Scene-wide settings. Must be an object when present. |
+| `general.clearcolor` | `[r, g, b, a]` of finite floats in `0.0..=1.0`, exactly 4 entries, **or** the string form `"r g b"` (three space-separated finite floats in `0.0..=1.0`, alpha implied `1.0`) | `[0, 0, 0, 1]` | The color the worker clears every frame — unless the script writes `Engine.clearcolor`, which is read back after every `update()`. The string form is what Wallpaper Engine actually writes: **59 of 60** corpus scene.json entries use it (e.g. `"clearcolor": "0.7 0.7 0.7"`, one with five-digit precision); the property-wrapped object form `{"user": ..., "value": ...}` (1 of 60) stays rejected until user properties arrive in M3c+. |
+| `general.resolution` | `[w, h]` of integers in `1..=8192`, exactly 2 entries (optional) | none | Parsed and validated, but **non-binding in M3a**: the worker always renders at the daemon-requested `--width`/`--height`. A mismatch is logged once (`event=renderer.scene.resolution scene=... requested=...`), not an error. S7: when absent, real Wallpaper Engine's `general.orthogonalprojection {"width","height"}` is accepted as the same value (lenient — a malformed projection just leaves this field `None`, never a reject). |
+| `general.fps` | finite float in `(0.0, 240.0]` (optional) | none | Same: parsed and validated, non-binding hint; a mismatch is logged (`event=renderer.scene.fps`), not an error. The pacing always comes from the daemon's `--fps`. |
+| `general.script` | string (optional) | none | A path **relative to the scene.json's directory** (file scenes) or **an entry path inside the package** (pkg scenes, M3b). File scenes: resolved against the canonicalized content root so symlinks cannot escape it; must end in `.js` (a `.pkg` reference is rejected — the archive itself is only consumable through the M3b reader), must exist, be a regular file, and be at most **2 MiB** (`MAX_SCRIPT_BYTES`). Pkg scenes: see "scene.pkg" below. |
+
+Anything else in `general` or at the root is ignored (future slices:
+effects, properties — image layers are M3c). Unknown top-level structure
+never fails the parse.
+
+## Image layers (M3c)
+
+`objects` is an array of layer objects drawn in **scene.json order** — the
+compositor's draw order: the layer listed last draws on top, src-over
+blending by default with per-layer blend modes (M3d). An object is an image layer exactly when
+it carries an `image` field; everything else (particles, audio, text —
+M3d+) is ignored. A reference ending in `.json` is a model instance under
+the WE solid-model architecture — **620 of the 685 corpus image
+references point at model `.json` files, the other 65 carry a null image
+value; none point at a real texture** — so no corpus wallpaper yet
+exercises the decoded-texture path. Model references are skipped BEFORE
+any validation (a malformed model layer can never reject the scene),
+without a diagnostic, and are not counted toward the layer cap, until
+models arrive (M3h). At most **256 image layers** (`MAX_LAYERS`); a scene
+with 257 is a Shape rejection (exit 73, "over the 256 layer cap").
+
+```json
+{
+  "general": {"clearcolor": [0, 0, 0, 1], "resolution": [160, 90], "fps": 30},
+  "objects": [
+    {"name": "bg", "image": "textures/red.png",
+     "origin": [80, 45], "size": [160, 90], "alpha": 1.0, "visible": true},
+    {"name": "mark", "image": "textures/blue.png",
+     "origin": [140, 79], "size": [40, 22]}
+  ]
+}
+```
+
+| Field | Type | Default | Meaning in M3c |
+|---|---|---|---|
+| `name` | string, **required** | — | the layer's name for `Scene.getLayer(name)`; a missing or non-string name rejects the layer entry |
+| `image` | string | none | the image reference (see "Image sources" below); a non-string value makes the object inert (skipped, not rejected) |
+| `origin` | `[x, y]` (2 or 3 entries) | `[0, 0]` | the layer's **center**, in ABSOLUTE scene-pixel units, top-left origin, +y down — matching upstream's own convention (`CImage.cpp`'s `origin.x - scaledSize.x/2` etc. builds a layer's corners directly from this absolute value; a full-screen layer's `origin` is `[declared resolution / 2, declared resolution / 2]`, e.g. `[80, 45]` above for a 160x90 scene, NOT `[0, 0]`). The compositor recenters this absolute value onto the visible rectangle's own centre before the NDC divide (S6 fix, `vulkan::LayerRenderer::set_world_extent`/`recenter`, `crates/kwe-scene-renderer/src/vulkan.rs`); the default `[0, 0]` therefore places an object at the scene's own TOP-LEFT corner when its `origin` is omitted, not at the frame centre. z is unused by 2D rendering |
+| `angles` | `[rx, ry, rz]` (2 or 3 entries) | `[0, 0, 0]` | **radians in the file**, converted to degrees at parse (the script API speaks degrees); corpus-verified: exact π, none at 90/180 |
+| `scale` | `[sx, sy]` (2 or 3 entries) | `[1, 1]` | relative scale about the origin; negative values mirror |
+| `size` | `[w, h]` (exactly 2 entries) | `[0, 0]` | the size in scene units the texture is drawn at; `[0, 0]` (absent) takes the decoded texture's own dimensions at load |
+| `alpha` | float in `0.0..=1.0` | `1.0` | straight layer alpha; out-of-range or non-finite rejects the scene (like clearcolor) |
+| `visible` | boolean | `true` | an invisible layer draws nothing |
+| `colorBlendMode` | integer (alias `blendMode`) | `0` | the corpus key; a per-layer blend mode from the researched table in "Blend modes and color effects (M3d)" below. Corpus (re-scan): 432 of 685 image-bearing objects carry it — 410×0, 6×11, 6×30, 4×6, 2×24, 1×1, 1×7, 1×9, 1×12 (sums to 432) — the rest omit it (normal). A non-numeric value is tolerated (normal), never a rejection; an undecodable but numeric value clamps to normal with a bounded one-time diagnostic |
+| `brightness` | float or numeric string | `1.0` | multiplies the sampled RGB before blending (see M3d); the default 1.0 is the identity (WE-verified), the clamp range 0..=10 is a design decision; out-of-range and non-finite values clamp, never a rejection; a non-numeric type is a Shape rejection |
+| `tint` | `[r, g, b]` or `[r, g, b, a]` of floats in `0.0..=1.0` (alias `color` — the WE file key, vec3 or vec4; `tint` takes precedence when both are present) | `[1, 1, 1, 1]` | multiplied onto the sampled RGBA before blending (see M3d); a 3-component value implies alpha 1; per-component clamped (non-finite → 1.0), never a rejection |
+
+Property-wrapped values (`{"user": ..., "value": ...}` — how the editor
+serializes user-bindable fields; corpus re-scan: **70% (315/447) of image
+layers carrying `alpha` and 49% (276/568) of those carrying `visible`**
+are wrapped) are unwrapped to their initial `value`; the wrapper's user
+binding is M3j, and a wrapped scalar without a `value` rejects like any
+malformed scalar.
+
+The transform model: a layer is a rectangle of `size` scene units centered
+on `origin`, drawn as two fan-ordered triangles (one unit quad, 6
+vertices of pos+uv — `TRIANGLE_LIST` primitives (v0,v1,v2) and (v0,v2,v3)
+tile the full quad). Per layer:
+`world = R(θz)·diag(scale·size)·pos + origin` for `pos ∈ [-0.5, 0.5]²` —
+rotation and scale happen about the origin, in that order; the z-angle
+rotates 2D layers (radians in the file, degrees in the API). The
+compositor pushes 64 bytes per layer (M3d grew the block from 48 to 64):
+m0 = (a, c, tx, 0), m1 = (b, d, ty, alpha·tint.a), viewport = (w, h, 0, 0),
+effects = (brightness, tint.r, tint.g, tint.b). The first 48 bytes are
+byte-identical to the M3c layout, so the vertex shader reads the same
+offsets; `world = mat2(m0.xy, m1.xy)·pos + (m0.z, m1.z)`, and the fragment
+shader multiplies the texture's alpha by m1.w (the layer alpha folded with
+the tint alpha host-side) and the sampled RGB by the effects vector,
+**before** blending. `(m0.z, m1.z)` is NOT `origin` verbatim: it is
+`origin` minus the scene's own centre (S6 fix, `vulkan::recenter`), so
+that this `world` space's `(0,0)` lands on the visible rectangle's centre
+— matching `viewport`, which is the F1 visible world extent
+(`world_extent`, `crates/kwe-scene-renderer/src/main.rs`), not the raw
+canvas size, whenever the declared `resolution` and canvas aspect ratio
+differ.
+
+Blending is src-over by default (the Normal variant): color
+ONE / ONE_MINUS_SRC_ALPHA, alpha ONE / ONE_MINUS_SRC_ALPHA — the fragment
+shader outputs straight color, so the attachment stores the straight
+composite and the readback's premultiplication is applied exactly once, at
+the protocol boundary (see Output); the source alpha is never scaled by
+itself (a 191/255 layer over an opaque destination stays 191/255, not
+143/255, and a translucent layer is not darkened by a second alpha
+multiply). Blend oracle, byte-exact on both drivers: opaque texel
+(64,103,142,255) at layer alpha 191/255 over a zero clear is delivered as
+premultiplied BGRA (106,77,48,191). A non-default `colorBlendMode` selects
+one of the fixed-function variants in "Blend modes and color effects
+(M3d)" below. The model math is byte-tested: identity exact, quarter-turn
+axis mapping, corner positions for known inputs.
+
+## Blend modes and color effects (M3d)
+
+Per-layer color blending in the Wallpaper Engine sense: a `colorBlendMode`
+enum rendered through fixed-function Vulkan blending, two color-effect
+fields, and a fixed ordering — **the effects apply to the sampled texel in
+the fragment shader; the blend mode combines the result with the frame in
+the pipeline's blend state** (the shader never blends; the blend state
+never scales colors).
+
+### The researched colorBlendMode table
+
+WE serializes `colorBlendMode` as an integer. The editor dropdown exposes
+exactly {Normal, Multiply, Add, Screen, Subtract} (wpdoc UI strings; Steam
+patch note: "standard Photoshop blend modes"; rendered by the proprietary
+`ApplyBlending` shader, type `imageblending`), which pins the five-mode
+FAMILY — it says nothing about the integers behind them. No public WE
+shader source exists, so the value→name mapping below is a corpus-histogram
+HYPOTHESIS: 0 dominates (410 of 432 occurrences) and is the editor's
+default for new objects (verified); 1/6/7/9 are assigned to the remaining
+four dropdown names as the best fit — the histogram's non-zero values that
+round out the dropdown family (the five decoded values cover 17 of the 22
+non-zero occurrences). The other 15 occurrences — 11, 30, 24, 12 — sit
+OUTSIDE the dropdown family, so the original evidently tolerates integers
+its own editor cannot produce (ours clamp to Normal with a diagnostic).
+The formulas below are the oracle ground truth, byte-validated on the
+llvmpipe lane.
+
+Evidence grades: **verified** = a public source pins the value (0 only);
+**decoded** = the best-fit corpus-histogram hypothesis, consistent with
+the dropdown family but not independently confirmable; **undecoded** = no
+credible hypothesis and not expressible in fixed-function Vulkan blending
+(kept for corpus tolerance).
+
+| Value | Name | Implemented? | Vulkan blend state (color / alpha) | Evidence |
+|---|---|---|---|---|
+| 0 | Normal | yes | (ONE, ONE_MINUS_SRC_ALPHA) / (ONE, ONE_MINUS_SRC_ALPHA), ADD | verified — the corpus-dominant value, the editor default |
+| 1 | Multiply | yes | (DST_COLOR, ZERO) / (ONE, ONE_MINUS_SRC_ALPHA), ADD | decoded |
+| 6 | Add | yes | (ONE, ONE) / (ONE, ONE), ADD | decoded |
+| 7 | Screen | yes | (ONE_MINUS_DST_COLOR, ONE) / (ONE, ONE_MINUS_SRC_ALPHA), ADD | decoded |
+| 9 | Subtract | yes | (ONE, ONE) REVERSE_SUBTRACT / (ONE, ONE_MINUS_SRC_ALPHA), ADD | decoded |
+| 11, 12, 24, 30 | — | **no** | clamped to Normal + one bounded diagnostic per scene (`event=renderer.scene.blend_mode_clamped layer=... mode=...`) | undecoded — outside the dropdown family, not fixed-function |
+| any other | — | no | silently Normal (unknown values tolerated, like the original evidently tolerates 11/30/24/12) | — |
+
+Semantics (the formulas the oracles hand-compute; `t` = texel,
+`b` = background, per channel in 0..255):
+- **Normal** = src-over: `t·a + b·(1−a)`.
+- **Multiply** = `t·b / 255`.
+- **Add** = `min(255, t + b)`.
+- **Screen** = `255 − (255−t)(255−b) / 255` = `t·(1−b) + b`.
+- **Subtract** = `max(0, b − t)` — the background minus the texel: WE's
+  "Photoshop blend modes" family and the Vulkan REVERSE_SUBTRACT algebra
+  (dst − src) agree; a reversed direction would fail the oracle.
+- **Alpha policy** (deliberate, pinned by oracles): the mode acts on the
+  COLOR; the alpha channel always composites src-over (ONE,
+  ONE_MINUS_SRC_ALPHA) — the layer's own opacity still matters under every
+  mode — except **Add**, whose semantic is additive on both channels
+  (ONE, ONE). This fixes the review finding that Multiply's original
+  (ZERO, ONE) discarded the layer's alpha entirely (a translucent multiply
+  over a transparent backdrop vanished; over an opaque one the delivered
+  alpha ignored the layer's opacity): the translucent-multiply oracle
+  (11,20,20,192) pins the src-over alpha byte-exact.
+
+The Screen factors were corrected during oracle validation: the first
+draft used (ONE, ONE_MINUS_DST_COLOR), which computes `t + b·(1−b)` — not
+the screen formula — and the device byte oracle caught the mismatch
+([165,151,125] produced vs [154,141,140] hand-computed). The shipped
+(ONE_MINUS_DST_COLOR, ONE) computes `t·(1−b) + b`, the screen formula.
+
+The renderer prebuilds one pipeline variant per implemented mode (five;
+N ≤ 16) sharing the layout, and binds the layer's variant per draw. The
+`Scene.getLayer` proxy's read/write `blendMode` maps through this table:
+writing 0/1/6/7/9 selects the mode; writing 11/12/24/30 clamps to Normal
+with the same bounded diagnostic; any other value clamps silently.
+
+### brightness and tint
+
+| Field | File key | Default | Effect |
+|---|---|---|---|
+| `brightness` | `brightness` | `1.0` | multiplies the sampled RGB. The default 1.0 is the identity — a WE-verified fact (the OWE WPImageObject default); the clamp range `0.0..=10.0` is a design decision (dimming to black, up to a 10x boost), not a documented WE bound. Out-of-range values clamp, non-finite → 1.0 |
+| `tint` | `tint` (alias `color` — the WE file key, vec3 or vec4; `tint` wins when both are present) | `[1,1,1,1]` | multiplies the sampled RGBA; per-component clamped to `0.0..=1.0`, non-finite → 1.0; a vec3 implies alpha 1.0 |
+
+Both parse property-wrapped (the corpus editor form) and both clamp
+out-of-range VALUES instead of rejecting — a too-bright effect darkens or
+boosts a layer, never fails the scene. Wrong-TYPED values do reject like
+alpha, with one corpus-honest exception: `brightness` accepts a JSON
+number or a numeric string (the corpus editor serializes scalars as
+strings); `tint` components must be numbers inside an array or
+space-separated string. The tint alpha is folded into the pushed `m1.w`
+host-side, so the shader's single multiply `a · layer_alpha · tint.a`
+covers both.
+
+Byte-exact oracle (llvmpipe, `scripts/smoke-scene.sh`): fullscreen texel
+(64,103,142) over opaque clear (102,64,26) at the frame center (80,45) —
+normal (142,103,64,255); multiply (14,26,26,255); add (168,167,166,255);
+screen (154,141,140,255); subtract (0,0,38,255); effects (brightness 2.0,
+tint (1, 0.4, 0.5)) (142,82,128,255); and add at layer alpha 0.5 over a
+transparent clear pins the single premultiplication: the attachment stores
+the straight composite (64,103,142,128) — alpha 0.5·255 = 127.5 rounds to
+128 — and the readback premultiplies exactly once (71,52,32,128). The
+translucent-multiply pin: multiply at layer alpha 0.5 over a 0.5-alpha
+clear — the hard multiply stores (14,26,26) and the src-over alpha
+0.5 + (128/255)·0.5 = 191.5 rounds to 192 — delivered (11,20,20,192): the
+layer's own opacity survives, and the readback premultiplies exactly once.
+
+## Text layers (M3e)
+
+Text is a WE scene object family on par with images (the WE `Text`
+objects; the OWE reference renders them through a dynamic glyph atlas of
+quads — the architecture mirrored here). **Corpus reality**: the corpus
+carries zero textures and zero known text layers — no real wallpaper
+exercises text — so the implementation is validated with synthetic
+fixtures (the `scripts/smoke-scene.sh` M3e lanes) and unit tests over
+synthetic font directories via `--font-dir` / `KWE_FONT_DIRS`, never with
+byte-pinned real-content renders.
+
+### Researched reference facts
+
+- `pointsize` is the WE file key for the font size, in points; **`fontsize`
+  is not a WE key** (tolerated as an unknown key, never parsed). OWE's
+  `TextPointSizeToPx` multiplies by `kPointsizeToPx = 4.0` and clamps to
+  1..=1024 px. We multiply by the same 4.0 and clamp to **4..=512 px**
+  (documented deviation: `MIN_FONT_PX`/`MAX_FONT_PX` — stricter bounds keep
+  a single glyph comfortably inside the atlas).
+- Alignment defaults to **center/center** in the original (OWE resolves
+  `horizontalalign` → `alignment` → center); our parse mirrors the
+  defaults.
+- WE system fonts are addressed as `systemfont_<Family>` in scenes; the
+  prefix is stripped before resolution.
+- `text` and `font` are property-wrapped in the corpus editor form
+  (`{user, value}`).
+- WE text objects carry a `color` (vec3 or vec4), `alpha` and `brightness`
+  like image objects; the color tints the glyphs.
+- `font` accepts a family name, a `systemfont_` alias, or a path
+  (absolute, or a basename matched against the scanned files).
+
+### Font resolution order
+
+One resolver per worker, cached per normalized family (alphanumerics
+lowercased). Font sources: explicit `--font-dir` / `KWE_FONT_DIRS`
+entries first, then `/usr/share/fonts`, `/usr/local/share/fonts`,
+`~/.local/share/fonts`, `~/.fonts` — bounded (16 dirs, depth 4, 4096
+files per dir, 16384 resolved files, 64 MiB per file) and sorted for
+determinism. Resolution:
+
+1. **Exact** — among basename candidates, the first whose name-table
+   family matches. Verified via the vendored stb_truetype name records
+   (decoded by the C shim: Windows/Unicode records are UTF-16BE, Mac
+   records single-byte), bounded to 32 opens (`MAX_FAMILY_VERIFY`).
+
+stb_truetype does no range checking of its own, so every candidate file
+is **sfnt pre-flight validated by the shim before any stb call**: the
+offset table (tag, table count) and each table record's `offset+length`
+must lie inside the file (u64 math), ttc collection offsets must
+resolve inside the buffer, and where cheap (`maxp`/`loca`/`glyf`) the
+glyph ranges are checked before outline rasterization — hostile or
+truncated fonts are rejected at open (`Font::open` → None), never
+parsed. (Because the directory collection stops at a per-directory cap
+before opening anything, a pathological font directory cannot force a
+huge allocation either.)
+2. **Basename** — the first unverified basename-prefix candidate in
+   sorted order (WE-style basename matching; may be a CJK or condensed
+   variant).
+3. **Fallback chain** — ["Noto Sans", "DejaVu Sans", "Liberation Sans",
+   "FreeSans"], each through steps 1–2; the resolution is reported as a
+   fallback so the load-time diagnostic records the order.
+4. **Any** — the first file that parses, in scan order.
+5. **None** — the layer renders nothing; one bounded diagnostic per layer
+   (`event=renderer.scene.text_font_none layer=... requested=...`).
+
+A `font` written as a path resolves directly when it exists, else by
+basename against the scanned files. Daemon-spawned workers carry fixed
+args, so daemon lanes resolve real system fonts only; the synthetic-font
+lanes (`--font-dir`, unit tests) drive the order above end-to-end.
+
+### Implemented subset (M3e)
+
+- **scene.json keys**: `text` (required to classify the object as a text
+  layer; an object with `image` is an image layer — a `.json` image ref
+  stays a model, M3h — and one with `text` *and* `image` is an image
+  layer with the text counted), `font`, `pointsize`, `horizontalalign` /
+  `verticalalign` (with `alignment` accepted for the horizontal, like the
+  OWE chain), `color` (RGB/RGBA, property-wrapped or plain). Missing or
+  blank `text` renders nothing. A scene-written `size` on a text layer is
+  **ignored** (counted, one-time diagnostic): text renders at its
+  automatic layout size with `size` pinned to (1,1), so layout pixels map
+  1:1 to scene units; resizing happens through `scale` like every other
+  layer.
+- **Common properties** (origin, angles, scale, alpha, visible,
+  blendMode, brightness, tint) inherit the M3c/M3d path unchanged,
+  including the M3d alpha policy: the text color's alpha is folded into
+  the layer alpha (`m1.w`) exactly like a tint.
+- **Rendering**: one 2048×2048 RGBA8 glyph atlas per text layer
+  (16 MiB), shelf-packed, white glyphs (RGB=255, coverage in alpha) with
+  the text color riding the draw's tint slot — **zero shader changes**:
+  the M3d fragment shader multiplies the sampled RGB by the tint and the
+  alpha by the layer alpha, so glyph interiors land exactly in the text
+  color and antialiased edges blend toward the background. Glyph quads
+  span the unpadded metric box while their UVs are inset by the 1 px
+  atlas pad, so glyph texels map 1:1 onto the quad. An overflow
+  triggers a clear+repack, rate-limited to 2/s
+  (`event=renderer.scene.text_atlas_rebuild_rate_limited`); font and
+  pointsize changes run the same clear+repack **through the same
+  budget** — a change that lands inside the 2/s window applies on the
+  next sync with the previous atlas and geometry kept consistent
+  meanwhile, so a 60 fps pointsize toggle cannot force a full repack
+  per frame (only the initial load bypasses the budget); a glyph
+  larger than 520 px is skipped
+  (`event=renderer.scene.text_glyph_too_large`). Each text layer draws as
+  one `DrawKind::Text` — `vertex_count` vertices (6 per glyph quad), one
+  TRIANGLE_LIST draw — through a per-layer host-visible vertex buffer
+  (created or grown, max 393 216 bytes). The atlas uploads through the
+  existing image upload path and is **counted in the shared 256 MiB
+  texture budget** at upload (16 MiB per layer; 16 text layers = the
+  cap, first-come-first-served with image textures; one bounded
+  `text_atlas_budget_skip` when the budget is already exhausted, with a
+  byte refund if the upload fails); dirty state is synced before the
+  initial render and each NewFrame, regenerating geometry only on text /
+  alignment / font-size change.
+- **JS surface** (`Scene.getLayer` on a text layer): read/write `text`
+  (string; a write truncates to 4096 chars with
+  `event=renderer.scene.text_truncated` and rebuilds the geometry),
+  `pointsize` (clamped 4..=512 px; non-finite/≤0 → the default 12 pt →
+  48 px), `horizontalAlign` / `verticalAlign` (0/1/2 = left|top /
+  center / right|bottom, clamped), `color` (read/write `{r,g,b,a}`
+  0..=1 per component — the scene.json color, writable through
+  `layer.color.r = x` style sub-property writes, clamped per component
+  like every other write path and tinting the glyphs; alpha folds into
+  the layer alpha), plus all common layer properties. Text-only
+  properties are only defined on text layers: on image layers they read
+  `undefined` and writes reach no renderer state — never shared state.
+- **Diagnostics** (one per layer, bounded): `text_font_fallback`,
+  `text_font_none`, `text_truncated`, `text_atlas_rebuild_rate_limited`
+  and `text_glyph_too_large` (each printed once per layer), and
+  `text_atlas_budget_skip` (once per worker when the shared texture
+  budget is exhausted at upload time).
+
+### Bounds
+
+| Bound | Value | Behavior |
+|---|---|---|
+| text layers per scene | 16 (`MAX_TEXT_LAYERS`) | further text objects are skipped (counted), never a rejection |
+| text length | 4096 chars (`MAX_TEXT_CHARS`) | script writes truncate; scene.json longer strings truncate with the same diagnostic |
+| font size | 4..=512 px (`MIN_FONT_PX`..`MAX_FONT_PX`), default 12 pt × 4 = 48 px | out-of-range and non-finite clamp to the default at the parse |
+| point→px | × 4.0 (`POINT_TO_PX`, the researched WE multiplier) | rounded, then clamped |
+| atlas | 2048² RGBA8 per layer, shelf-packed; each 16 MiB counts in the shared 256 MiB texture budget (first-come-first-served with image textures) | clear+repack rate-limited to 2/s — overflow and font/pointsize changes alike; one bounded `text_atlas_budget_skip` when the shared budget is exhausted |
+| glyph bitmap | ≤ 520×520 px | larger glyphs are skipped per layer, never fatal |
+| font file | 64 MiB | over-budget files are skipped by the resolver |
+| font scan | 16 dirs, depth 4, 4096 files/dir, 16384 files | deterministic (sorted); directory entries are collected with an early stop at the per-dir cap, before any file is opened |
+| family verify | 32 opens (`MAX_FAMILY_VERIFY`) | the Exact step never walks the whole corpus; past it, the Basename step returns the first candidate **unverified** — a family served by many files (CJK or condensed variants) can win over the regular face when the regular face sorts late |
+| sfnt pre-flight | offset table, table records, ttc offsets, and (where cheap) maxp/loca/glyf ranges validated in the shim before any stb call | hostile or truncated fonts are rejected at open (`Font::open` → None), never parsed |
+| atlas rebuild budget | 2/s (`ATLAS_REBUILDS_PER_SECOND`), 1 s window | overflow and font/pointsize changes all ride the budget; the initial load is the only unbounded path |
+
+## Particle systems (M3f)
+
+Particle systems are a WE scene object family on par with images and
+text (the OWE reference renders emitters as point-quad instanced draws
+with per-particle color/size interpolation over life; the architecture
+mirrored here, with the instancing flattened into one batched vertex
+buffer per system). M3f implements the **flat emitter model**: every
+property is a scene.json key or a script-visible scalar, the simulation
+advances on a fixed 1/60 s timestep, and each system draws through a
+per-mode blend pipeline — the M3d semantics unchanged. **Corpus
+reality**: the corpus carries zero particle systems (and zero textures —
+an emitter needs one), so the implementation is validated with synthetic
+fixtures (the `scripts/smoke-scene.sh` M3f lanes) and unit tests, never
+with byte-pinned real-content renders.
+
+### Researched reference facts
+
+- WE emitters are configured in the file through a nested `particle`
+  object; `maxcount` is the WE key for the live-particle cap, default
+  **100** (we default to 1000 and clamp 1..=4096 — documented deviation:
+  a 100 default starves every smoke fixture and hides over-spawn bugs).
+- WE emitters carry **no `direction`/`spread` fields**: launch velocity
+  comes from the velocity-random initializer (`Initializer.VELOCITY`),
+  which is not file-configurable. The flat `direction` (radians from +x,
+  y down) + `spread` (0..=2π cone) model is the M3f extension the
+  deterministic smoke oracles need (documented deviation).
+- The WE script surface is `IParticleSystem` (object accessors, plus
+  `play()` = resume emission, `pause()` = emission off with live
+  particles still simulating, `stop()` = clear immediately, `isPlaying()`
+  = emitting or alive, `emitParticles(count)`, default count 1, works
+  while stopped) and `IParticleSystemInstance` with the factors
+  `count`, `speed`, `lifetime`, `size`, `alpha`, `rate`, `colorn` (the
+  intentional WE spelling), each defaulting to 1.0; non-finite values
+  clamp to 1.0 and the range clamps to [0, 1e6] (alpha/colorn to [0, 1]).
+- WE emitter texture field is `material` (the brief's `texture` wins when
+  both are present), resolved through the M3c image-source chain
+  including the package table.
+- WE blend modes map 0/1/6/7/9 = Normal/Multiply/Add/Screen/Subtract
+  (the M3d table); `blendMode` and `colorBlendMode` are both accepted.
+- WE randomness is per-frame and non-deterministic; M3f replaces it with
+  one splitmix64 stream per system, seeded by the system index — a
+  documented deviation. The stream itself is deterministic (the same
+  spawn sequence repeats in the same order), BUT the fixed-step schedule
+  derives from wall-clock dt, so the scene's live population depends on
+  real time, not on the scene alone. Spread-0 systems never touch the
+  stream at all (their trajectories are exact — what the range oracles
+  rely on).
+
+### scene.json keys (the `particle` object)
+
+All keys in the table below live **inside** the `"particle"` dict
+(`objects[i].particle.*`) except the shared-props row (`blendMode`,
+`alpha`, `brightness`, `visible`), which sit on the object **beside**
+`particle` like every WE object (`objects[i].blendMode` — the M3c/M3d
+common path, corpus: `colorBlendMode` on image objects; `material` is
+inside the dict per the WE texture field).
+
+Missing keys take the defaults; scalar fields clamp (out-of-range →
+clamp bound, non-finite → default); vector fields (`gravity`,
+`colorStart`, `colorEnd`) reject non-vector shapes like every WE vector.
+`speedMin`/`speedMax` win over a bare `speed`; a missing `speedMax`
+falls back to the resolved minimum, and a reversed pair normalizes
+(min ≤ max) — the runtime picks launch speeds uniformly in [min, max].
+
+| Key | Range | Default | Notes |
+|---|---|---|---|
+| `spawnRate` | 0..=4096 /s | 10 | integer or numeric string |
+| `life` | 0.1..=60 s | 1.0 | |
+| `speed` / `speedMin` / `speedMax` | 0..=1e6 px/s | 0 | the pair supersedes `speed`; reversed pairs normalize |
+| `direction` | ±1e6 | 0 | radians from +x, y down (M3f extension, see research notes); clamped in f64 BEFORE the f32 cast — a huge finite value like 1e300 must never overflow to f32::INFINITY (sin/cos of infinity is NaN, permanently poisoning the system) |
+| `spread` | 0..=2π | 0 | all particles take the exact direction at 0 |
+| `gravity` | ±1e6 px/s², 1..=3 components | [0, 0] | `[g]` → `[0, g]` (y down); extra components dropped |
+| `sizeStart` / `sizeEnd` | 1..=512 px | 8 | interpolated over life |
+| `colorStart` / `colorEnd` | RGBA 0..=1 each | white | vec3 implies alpha 1; interpolated over life |
+| `alphaStart` / `alphaEnd` | 0..=1 | 1 → 0 | particles fade out by default |
+| `maxCount` | 1..=4096 | 1000 | the WE key; integer or numeric string (floats reject like every integer key); excess spawns **drop**, never evict live particles (documented deviation from WE's 100) |
+| `texture` / `material` | M3c image source | none | `texture` wins when both present; a non-string is None — the system registers and simulates but draws nothing |
+| `blendMode` / `colorBlendMode` | M3d enum | Normal | pre-clamp; the runtime clamps to the implemented set like every layer |
+| `alpha` / `brightness` / `visible` | M3c/M3d common | 1 / 1 / true | drawn effects; read-only through the script surface in M3f (the instance factors are the script knobs) |
+
+Shared properties (`origin`, `angles`, `scale`, `alpha`, `visible`,
+`blendMode`, `brightness`, `tint`) parse through the M3c/M3d path, but
+`angles`/`scale` are **not applied** in M3f — particle systems render
+world-space with `origin` only (documented deviation; the system
+transform is planned).
+
+### Simulation model
+
+One `ParticleSystemState` per registered system, stepped every frame
+with the frame's dt (`sync_particles`; also seeded with one pacing
+interval at load so the first published frame already shows particles):
+
+1. **accumulate** — `rate`-scaled dt (the WE simulation-rate factor),
+   capped at 1.0 s (60 steps) per frame, `MAX_FRAME_DT` 1.0 s wall per
+   frame; a stalled frame never unstretches.
+2. **spawn** — only while emitting or a burst is pending (`play()` /
+   `pause()` / `stop()` / `emitParticles(count)`, WE semantics); the
+   per-step due count is `spawnRate × count × h`, floored, excess
+   **dropped** (never evicted, one bounded
+   `event=renderer.scene.particles_capped` per system), accumulator
+   capped at 65536.
+3. **integrate** — explicit Euler: `v += g·h; x += v·h; age += h`.
+4. **retain** — particles with `age ≥ life` die (step 3's birth step
+   order makes a particle born at step s sit at `(n−s+1) × speed × h`
+   after n steps).
+
+Size, color and alpha interpolate over normalized age
+(`age / life`, clamped), so a `sizeStart 8, sizeEnd 4, alphaStart 1,
+alphaEnd 0` particle shrinks and fades linearly. Determinism: every op
+is f32 fixed-step; spread-0 trajectories are exact (no RNG), spread
+systems use the per-system splitmix64 stream seeded by system index.
+
+### Rendering
+
+Each system owns one host-visible vertex buffer — **create-or-grow**:
+uploaded on the first draw, grown when the vertex count exceeds the
+current capacity, never shrunk. The buffer CONTENTS are rebuilt AND
+re-uploaded every frame a fixed step ran (that is how often the live
+particles can have changed — the sim's step order; a frame without a
+step leaves the buffer untouched). The rebuild writes 6 vertices per
+particle (an axis-aligned quad expanded around the center,
+`tr/tl/bl/br` UVs covering the full texture), 40-byte stride with
+per-particle color and size folded into the vertex attributes
+(`shaders/particle.vert` / `particle.frag` — the M3f shader pair), via
+one scratch Vec the worker reuses across systems and frames (no
+per-frame allocation churn). Blend modes reuse the M3d per-mode pipeline
+variants (≤ 16 pipelines, one per mode); the texture rides slot
+`MAX_LAYERS + system_index` (272 slots total). A missing, over-budget or
+undecodable material skips the system's draw at load (`particle_skip`,
+never fatal — the system still simulates), and a vertex-upload failure
+is contained the same way.
+
+### Bounds
+
+| Bound | Value | Behavior |
+|---|---|---|
+| particle systems per scene | 16 (`MAX_PARTICLE_SYSTEMS`) | further `particle` objects are skipped (counted, `event=renderer.scene.particle_system_skip count=...`), never a rejection |
+| live particles per system | 4096 (`MAX_PARTICLES`) | `maxCount` clamps to it; excess spawns drop, never evict; one bounded `particles_capped` per system |
+| timestep | 1/60 s (`FIXED_STEP`) | fixed-step accumulator for oracle determinism |
+| sim time per frame | ≤ 1.0 s (`MAX_ACCUMULATED_SIM_SECONDS` = 60 steps) | hostile `rate` factors can never stall the frame |
+| wall dt per frame | ≤ 1.0 s (`MAX_FRAME_DT`) | a stalled frame is dropped, not stretched |
+| spawn accumulator | 65536 due particles/step (`MAX_SPAWN_ACCUMULATOR`) | excess dropped, bounded |
+| vertex buffer | 4096 × 6 verts × 40 B ≈ 983 KiB per system | one host-visible buffer, create-or-grow; contents rebuilt + re-uploaded every frame a fixed step ran |
+| texture slots | `MAX_LAYERS` (256) + 16 particle slots = 272 | the M3c texture budget still applies per upload |
+
+### External particle definition files (S4b)
+
+**Implemented (S4b)**, replacing M3f's "the definition is never read" gap:
+a `particle` object whose value is a STRING (a `.json` particle file
+reference — pkg entry, scene directory, or `<assets>/particles/`) is now
+resolved and parsed into a **component model** (emitter/initializer/
+operator arrays, the real WE particle format), instead of always
+registering with the flat model's all-default fixture.
+
+**Resolution** (`crates/kwe-core/src/particlefile.rs`, shared by preflight
+and the worker, mirroring the S1 model-resolution split): the file itself
+(bounded 1 MiB JSON) → its own `material` field (a `.json` material path,
+resolved exactly like a model layer's `material` via
+`crates/kwe-core/src/scenemodel.rs`'s `resolve_material`) → `passes[0]` →
+the first texture slot → `materials/<name>.tex`. The B2 honesty gate
+(`SceneObjectSummary::particle_files_resolved`) counts a particle-file
+system as drawable only when this whole chain resolves a real texture —
+the same split S1 established for models; a reference that fails at any
+step (missing file, invalid JSON, no `material` field, unresolvable
+material/texture) keeps the M3f flat-model defaults, the pre-S4b honest
+fallback, never a scene rejection.
+
+**Component-model parse** (`crates/kwe-scene-renderer/src/particlefile.rs`,
+worker-only — preflight never needs the simulation detail): every field is
+read tolerantly (missing/malformed/out-of-range → a documented default or
+clamp; an unrecognized emitter/initializer/operator `name` is skipped and
+counted, never fatal, matching upstream's own "Unknown ... type" +
+continue behavior). Implemented kinds (Borrowed-From:
+`Almamu/linux-wallpaperengine`'s `Render/Objects/CParticle.cpp`,
+GPL-3.0-or-later, adapted — see THIRD_PARTY.yml):
+
+- **Emitters**: `boxrandom` (a per-axis random offset in
+  `[distancemin, distancemax]`, sign randomized, scaled by `directions`,
+  from `origin`) and `sphererandom` (a uniform-by-area point in the 2D
+  annulus between `distancemin`/`distancemax`, scaled by `directions`; a
+  declared `speedmin`/`speedmax` launches radially outward, otherwise an
+  initializer sets velocity).
+- **Initializers**: `lifetimerandom`, `sizerandom` (with `exponent` bias),
+  `alpharandom`, `velocityrandom` (adds to the emitter's velocity),
+  `colorrandom` (WE's 0..=255 range normalized to 0..=1).
+- **Operators**: `movement` (gravity + drag, upstream's exact
+  position-then-velocity order), `alphafade`, `sizechange`, `colorchange`
+  (life-fraction-gated linear ramps against the particle's spawn-time
+  values), `oscillatealpha`/`oscillatesize` (a per-particle cosine wave,
+  frequency/phase drawn once at spawn), `controlpointattract` (a
+  constant-force pull toward an anchor within a threshold radius), and
+  `turbulence` (see the scope cut below).
+- **Renderer**: the file's top-level `material` (not a per-renderer
+  field) supplies the texture, drawn through the EXISTING M3f particle
+  vertex/texture pipeline — no separate material-shader pipeline for
+  particles.
+
+**Documented scope cuts** (`crates/kwe-scene-renderer/src/particles.rs`'s
+module doc has the full reasoning):
+
+- **2D only**: every vector field's z component is parsed (bounds-checked)
+  and dropped — matches every other scene2d object in this renderer; the
+  sphere emitter always takes upstream's 2D-disk branch, never the 3D
+  spherical-shell one.
+- **No live control-point tracking**: `controlpointattract` anchors at the
+  system's own spawn origin plus the operator's own `origin` offset,
+  never a live mouse/audio-reactive control point (the `controlpoint`/
+  `children`/audio-processing fields are tolerated, not read).
+- **`turbulence` is a bounded deterministic APPROXIMATION** — a
+  sine/cosine directional field sampled at each particle's own position
+  plus a time term, NOT upstream's Perlin curl-noise algorithm. The
+  per-operator `phase`/`speed` are still drawn once from the system's
+  seeded PRNG (matching upstream's "once per operator instance" contract)
+  so the approximation stays deterministic across identical runs.
+- **Unimplemented, tolerated as unknown**: `rotationrandom`,
+  `angularvelocityrandom`, `angularmovement` (this renderer's particle
+  quads are always axis-aligned — no rotation attribute exists to drive),
+  `oscillateposition`, `vortex`, `mapsequencearoundcontrolpoint`, and the
+  `spritetrail` renderer (drawn as a plain sprite, not a trail).
+- **`sizerandom`'s scale convention deliberately differs from upstream**:
+  upstream halves the authored min/max before storing `p.size` because
+  ITS renderer consumes that field as a half-extent directly; this
+  renderer's single shared `build_vertex_bytes` already halves once
+  (`half = size * 0.5`, the SAME convention the flat model's
+  `sizeStart`/`sizeEnd` use), so `sizerandom` here feeds the authored
+  value straight through — replicating upstream's extra `/2` would halve
+  twice and render every authored size at a quarter scale.
+
+**Bounds**: `MAX_PARTICLE_FILE_BYTES` (1 MiB, kwe-core); up to
+`particles::MAX_COMPONENT_ITEMS` (16) emitters/initializers/operators each
+(excess entries are dropped, not an error); every numeric field clamps to
+a documented finite range at parse time (an emitter `rate` up to
+100,000/s is allowed through uncapped — the actual per-frame spawn work
+stays bounded by the existing `MAX_SPAWN_ACCUMULATOR`/`MAX_PARTICLES`
+caps regardless); the system's own `max_count` and per-emitter `rate`
+reuse the SAME `MAX_PARTICLES`/spawn-accumulator bounds the flat model
+already enforces — a component-model system can never exceed the
+existing per-system particle cap or do unbounded per-frame work, even
+under a hostile/malformed file. `event=renderer.scene.particle_file_skip`
+(one bounded line per scene load) reports how many file references failed
+to resolve/decode; `event=renderer.scene.particle_file_unsupported_items`
+reports unrecognized emitter/initializer/operator kinds seen.
+
+## Image sources (M3c)
+
+- **File scenes**: the reference is resolved against the canonicalized
+  scene directory (symlink-escape-validated, exactly like scripts):
+  relative with no `..`/absolute components, a regular file, at most
+  `MAX_TEXTURE_SOURCE_BYTES` (64 MiB).
+- **Pkg scenes**: the reference names a package entry (`kwe_core::image_entry`,
+  case-insensitive — the literal path or the entry's tail after a `/`,
+  exactly one match), read through the bounded reader; the host file
+  system is never touched.
+
+A missing, escaping, unreadable, or over-budget image **skips its layer**
+with a bounded one-time diagnostic (`event=renderer.scene.layer_skip
+layer=...`) — never the scene: the renderer stays healthy and the other
+layers render. The same skip covers undecodable files and the total
+texture budget.
+
+Decoding (the `image` crate — see THIRD_PARTY.yml): PNG and JPEG always,
+WebP when the crate builds with its webp feature. Bounds (textures.rs):
+dimension ≤ 8192, pixels ≤ 16,777,216, decoded ≤ 64 MiB per texture,
+source ≤ 64 MiB per texture, ≤ 256 MiB total across layers. Decoded
+textures are RGBA8, uploaded as R8G8B8A8_UNORM (identity channel order —
+the M3a readback lesson) with a shared linear clamp-to-edge sampler and a
+per-layer descriptor set (pool capped at 256 sets).
+
+## TEXV texture container (S1)
+
+**Implemented (S1)** in `crates/kwe-scene-renderer/src/texv.rs`. Wallpaper
+Engine ships raw textures (`.tex` files, always referenced under
+`materials/`) in a container format distinct from PNG/JPEG: the TEXV
+container. This decoder is adapted from linux-wallpaperengine's
+`TextureParser.cpp`/`Texture.h` (GPL-3.0-or-later, see
+docs/PROVENANCE.md and THIRD_PARTY.yml) and verified byte-for-byte against
+real Workshop `.tex` payloads.
+
+**Layout** (`TEXV0005` + `TEXI0001` header, then a `TEXB000{1..4}`
+sub-container):
+
+- Header: format enum, flags (`NoInterpolation`, `ClampUVs`, `IsGif`, ...),
+  in-memory (power-of-2) width/height, and the "real" (unpadded) width/
+  height.
+- Format enum: `ARGB8888`, `RGB888`, `RGB565`, `DXT5`, `DXT3`, `DXT1`,
+  `RG88`, `R8`, `RG1616f`, `R16f`, `BC7`, `RGBa1010102`, `RGBA16161616f`,
+  `RGB161616f`. This decoder implements pixel decode for `ARGB8888`, `R8`,
+  `RG88` (raw/expanded), `DXT1`/`DXT3`/`DXT5`/`BC7` (CPU block decode via
+  the `texture2ddecoder` crate, MIT/Apache-2.0 — see THIRD_PARTY.yml); the
+  others parse structurally but return an error on decode (not implemented,
+  not a panic).
+- **FIF-tagged payloads** (`TEXB0003`/`TEXB0004` with a `freeImageFormat`
+  other than `FIF_UNKNOWN`, e.g. `FIF_PNG`, `FIF_JPEG`): the mip-0 payload
+  is itself an encoded image file, decoded through the existing
+  `textures::decode_texture` (the `image` crate) rather than the raw/BC
+  path — no new decode logic needed for these, only the container
+  envelope.
+- Mipmap chain: per-image, per-mip width/height, an optional compression
+  flag (`TEXB0002`+), and a declared uncompressed size. `compression == 1`
+  means the payload is an **LZ4 block** (not a frame — `lz4_flex::block`
+  with the declared size), decompressed with the declared size as the
+  target buffer; only mip 0 of image 0 is decoded this slice.
+- Animated textures (`TEXS0001`/`0002`/`0003`, gated by the `IsGif` flag):
+  a per-frame timing/UV-rect table is parsed and kept
+  (`DecodedTexv::frames`) but frame 0 — the same static mip-0 pixels — is
+  what this slice draws.
+
+**Output**: RGBA8 pixels, cropped to the top-left "real" width×height
+region of the decoded mip (S1's simplification — no UV-scaling shader
+stage exists yet, so the padded/pow2 buffer is physically cropped instead
+of sampled with a UV offset). `ARGB8888`'s in-memory byte order is
+already R,G,B,A (verified against upstream `CTexture.cpp`, which uploads
+the raw bytes as `GL_RGBA`/`GL_UNSIGNED_BYTE` unchanged despite the
+format's name) — no channel swizzle needed; `R8`/`RG88` expand to
+grayscale/red-green RGBA with full alpha.
+
+**Bounds**: per-edge dimension ≤ 8192 (in-memory, real, and every mip's
+own declared size), mip count ≤ 16, image count ≤ 16, animation frame
+count ≤ 8192, a `TEXB0004` mip's embedded editor-JSON string ≤ 64 KiB, and
+— the decompression-bomb defense — a mip's declared uncompressed size
+must equal exactly what its format+dimensions require (or, for a
+BC-format mip, the block-count-derived size) before any LZ4 decompression
+or block-decode allocation runs; a lying declared size is refused, never
+trusted for allocation. Every failure path returns a value
+(`Result`/`Option`), never panics, including on truncated or garbage
+input (see `texv.rs`'s test module for the fuzz-ish truncation sweep).
+
+## Model layers and material resolution (S1)
+
+**Implemented (S1)** in `crates/kwe-core/src/scenemodel.rs`, shared by
+preflight and the worker. In scene.json, `image` most commonly references
+not a texture directly but a `.json` **model** file (620 of the 685
+corpus image references in the researched sample): Wallpaper Engine
+stores every visual, 2D included, as a model instance. Before S1 these
+were skipped outright ("scene3d, this build does not render yet" — 46 of
+60 local Workshop scenes were refused with no drawable content at all).
+
+**S1 scope**: a model is drawn as a textured quad through the existing
+image-layer pipeline — the same geometry fields (origin/angles/scale/
+size/alpha/visible/blend/brightness/tint) an image layer uses, with a
+resolved material texture as its pixel source. Mesh/puppet geometry,
+custom material shaders, effect passes, and combos are **out of scope**
+this slice; the resolver still parses and records them
+(`ResolvedModel::shader/combos/blending/cullmode/depthtest/extra_textures`)
+for the slice that implements them.
+
+**Resolution walk** (adapted from linux-wallpaperengine's
+`ModelParser.cpp`/`MaterialParser.cpp`/`Material.h` and
+`AssetLocator::texture`, GPL-3.0-or-later — see THIRD_PARTY.yml):
+`image` (a `.json` model path) → the model's `material` field (a `.json`
+material path) → the material's `passes[0]` → the first non-null entry in
+`passes[0].textures[]` → `materials/<name>.tex` (the texture-name-to-
+asset-path rule every material texture reference follows, whether or not
+the name itself carries subdirectories, e.g. `masks/foo` →
+`materials/masks/foo.tex`).
+
+**Lookup order** (caller-composed, `scenemodel::AssetLookup`): scene.pkg
+entries first (pkg scenes), then the scene's own directory, then the
+configured Wallpaper Engine assets root (`--assets-dir` on the worker,
+`--wallpaper-engine-assets` on the daemon, `--assets-dir` on `kwe
+preflight`; default: the first existing
+`<steam root>/steamapps/common/wallpaper_engine/assets` over the
+discovered Steam roots). Both `model.json` and `material.json` are bounded
+to 1 MiB each and rejected as invalid JSON, not merely oversized-but-
+parsed, past that cap; the resolver performs no file I/O itself — every
+read goes through the caller's closure, so it never leaves kwe-core's
+dependency-free boundary (the decoder that turns the resolved `.tex`
+bytes into pixels, `texv.rs`, lives in kwe-scene-renderer, since
+preflight only needs to know a texture's bytes exist, never decode them).
+
+**Honesty (B2 contract)**: a model layer counts as **drawable** only when
+its texture actually resolves through the lookup chain — unlike a direct
+image reference, which counts as drawable statically even before its
+bytes are known to decode, a model has no rendering pipeline at all
+without a resolved texture. An unresolvable model's reason text is `N
+model layer(s) whose material textures could not be resolved (missing
+Wallpaper Engine assets?)`, replacing the old blanket "need scene3d"
+message. Worker-side, a model whose texture fails to resolve or decode is
+a degraded layer (skip-never-reject, like every other texture path) with
+a bounded one-time diagnostic:
+`event=renderer.scene.model_texture_skip count=N`.
+
+## Material shaders (S2)
+
+**Implemented (S2)**, replacing S1's "custom material shaders... are out
+of scope" note: a model/image layer whose material pass shader
+preprocesses, compiles, and binds draws through that MATERIAL PASS
+SHADER — the WE look (tint/alpha/uv transforms, per-material combos, up
+to 8 texture slots) — instead of S1's flat base-texture quad. Any
+failure at any step falls back honestly to the S1 quad; a layer never
+stops drawing because its material shader could not be used.
+
+**Scope**: image/model layers only, quad geometry only (mesh/puppet
+attribute layouts — bone weights, tangents, per-vertex color — are
+**partially implemented as of S3**; see "Mesh/puppet" below for exactly
+which shapes). Effect passes and FBO render-target chains (`_rt_*`
+textures) are **implemented as of S3** — see "Effects and render
+targets" below; the S2-era `render_target_reference` fallback (reject
+any material whose live shader text mentioned `_rt_` at all) is gone,
+since a `_rt_`/`Previous` texture slot now resolves to a live render
+target or the shared dummy texture instead. Lighting objects remain
+**out of scope**: `#require LightingV1` still resolves to a
+zero-contribution stub.
+
+**Preprocessor** (`crates/kwe-scene-renderer/src/shaderpre.rs`, adapted
+from `ShaderUnit::preprocess`/`compile`, GPL-3.0-or-later — see
+THIRD_PARTY.yml): `#include` resolution against
+`<assets>/shaders/<name>.{vert,frag,h}`, with the `workshop/<id>/<file>`
+→ `zcompat/scene/shaders/<id>/<file>` compat redirect
+(`AssetLocator::shader`); the verbatim HLSL-compat header shim
+(`mul`/`lerp`/`frac`/`float2`/`saturate`/`texSample2D`/... macros) plus
+two Vulkan-only `#extension` pragmas upstream never needs (it targets
+OpenGL 330 via a SPIRV-Cross round trip, not Vulkan SPIR-V directly);
+`#require LightingV1` resolves to a stub (lighting objects are not
+implemented — always zero contribution); `// [COMBO] {json}` combo
+scraping and `uniform TYPE name; // {json}` parameter-metadata scraping;
+combos as `#define NAME value` (a material's own `combos` map always
+overrides a shader's scraped default). Bounded: include depth ≤ 8, total
+preprocessed text ≤ 1 MiB, includes confined to the assets root
+(`kwe_core::confined_read` — no traversal/symlink escape).
+
+A second, Vulkan-specific pass (`fold_declarations`, no upstream
+equivalent) rewrites every recognized `attribute`/`varying`/non-sampler-
+`uniform` declaration into what Vulkan GLSL requires: explicit
+`layout(location=)` on stage-interface variables (shared between the
+vertex and fragment stages of one material so the two link correctly)
+and `layout(set=0, binding=N)` on each `uniform sampler2D g_Texture<N>`.
+Non-sampler uniforms fold into one fixed `MaterialUniforms` UBO
+(`set=0, binding=8`) via `#define`: the WE standard set
+(`g_ModelViewProjectionMatrix`, `g_Time`, `g_Texture<N>Resolution` —
+doubling as texel size in `.zw` — `g_Texture<N>Rotation` (S4: identity
+`vec4(1.0, 0.0, 0.0, 1.0)`, not zero — see "Vertex attribute shapes
+(S4)" below), `g_UserAlpha`, `g_Brightness`, `g_Color`, `g_Color4` (S4:
+the same per-draw brightness/alpha as `g_Brightness`/`g_UserAlpha`,
+packed into one vec4 — the `VERSION`-combo-gated replacement for that
+pair in every `genericimage*` fragment shader), `g_ParallaxPosition`,
+`g_Point0..7`, `g_PointerPosition`, `g_TexelSize`,
+`g_EffectTextureProjectionMatrix`, and (S4a) `g_ModelMatrix`/
+`g_ViewProjectionMatrix`/`g_NormalModelMatrix` plus their `Alt` siblings
+— folded to `mat4(1.0)`/`mat3(1.0)` identity, not zero, since these feed
+vertex POSITION (see "Vertex attribute shapes (S4)" below) — plus up to
+16 of the material's own `constantshadervalues`, by name. Any other
+uniform gets a local zero-valued declaration and a one-time diagnostic
+(`event=renderer.scene.shader_unsupported_uniform`) — the shader still
+compiles, that one value is just inert. This still includes genuinely
+lighting-only uniforms such as `g_EyePosition`/`g_LightsPosition`,
+matching `#require LightingV1`'s existing "always zero contribution"
+scope limit — a material that genuinely needs real LIGHT/SHADING math
+still draws, just without lighting; that is now a materially narrower
+gap than before S4a, which also zero-defaulted the matrices feeding the
+object's own screen POSITION.
+
+**S4**: `fold_declarations`' scraping is now conditional-compilation-
+AWARE — a bounded `#if`/`#ifdef`/`#ifndef`/`#elif`/`#else`/`#endif`
+tracker (`shaderpre::evaluate_if_expr`, supporting `||`/`&&`/`==`/`!=`/
+`!`/parens/`defined()`/bare identifiers, with an unparseable expression
+falling back to "always live" rather than risk dropping a real
+declaration) only scrapes/folds a declaration while every enclosing
+`#if` branch is the one actually taken for the material's resolved
+combos — matching what `shaderc`'s real GLSL preprocessor sees. Before
+S4, the scraper picked up EVERY branch's declarations unconditionally
+(dead and live alike), which both mis-shaped `AttributeDecl.location`
+assignment (a dead branch's attribute could "steal" location 0, pushing
+a live `a_TexCoord` to a location the compiled SPIR-V never actually
+uses there) and made the vertex-format check see attribute NAMES from
+the wrong branch entirely (`genericimage3.vert`'s `#if MORPHING
+{ a_PositionVec4 } #else { a_Position }` scraped as attributes[0]=
+`a_PositionVec4`, attributes[1]=`a_Position` even with `MORPHING`
+off, since `a_TexCoord` landed at index 2). The `_rt_` render-target
+check already asked `shaderc`'s own preprocessor for the LIVE text
+before deciding (unaffected by this fix); `fold_declarations`'
+attribute/varying/uniform scraping now gets the same treatment.
+
+**Compilation** (`crates/kwe-scene-renderer/src/materialshader.rs`): the
+`shaderc` crate against the SYSTEM `libshaderc` (default features — no
+vendored glslang/spirv-tools build; `packaging/PKGBUILD` adds `shaderc`
+as a dependency), target `Vulkan1_2`. Bounded: preprocessed text ≤
+256 KiB, ≤ 64 distinct pipelines per scene (a scene with more distinct
+materials keeps the S1 quad for the overflow); a `shaderc` failure comes
+back as a value (`CompileError::Failed`), never a panic.
+
+**Vulkan** (`crates/kwe-scene-renderer/src/vulkan.rs`): one compiled
+`vk::Pipeline` per distinct `(shader, resolved combos, blend variant)`
+key, cached and shared across every layer using the same material. A
+material's descriptor set always declares 8 combined-image-samplers (an
+unfilled slot samples a shared 1x1 transparent dummy texture — Vulkan
+requires every statically-referenced descriptor to be valid) plus the
+`MaterialUniforms` UBO. `g_ModelViewProjectionMatrix` is built directly
+from the same 2D affine transform (`R(θ)·S(scale)·diag(size)`, world
+units → NDC against `world_width`/`world_height`) the S1 push-constant
+quad path already applies — a material draw and an S1 quad draw of the
+same untinted, unbrightened layer land on IDENTICAL pixels (bit-exact:
+`color.rgb *= g_Brightness` with the default 1.0 is an IEEE-754 no-op).
+`g_Time` is a monotonic frame counter over an assumed 60 fps (not real
+elapsed time — a documented simplification); `g_ParallaxPosition`/
+`g_PointerPosition`/`g_Point0..7` default to zero (not wired to live
+input this slice). `blending` maps onto the existing blend-attachment
+table: `additive` → Add, everything else (`normal`, `translucent`,
+unknown) → the same alpha-blended src-over every other layer uses.
+
+**Diagnostics**: `event=renderer.scene.shader_fallback reason=... count=N`
+once per distinct reason after load (`no_shader_name`,
+`shader_source_missing`, `preprocess_failed`, `unsupported_vertex_format`,
+`pipeline_cap`, `compile_failed`, `pipeline_creation_failed`,
+`bind_failed`, and S3's `render_target_only_without_effects` — see
+"Effects and render targets"), then
+`event=renderer.scene.shaders compiled=N fallback=M` once. A material
+that falls back stays covered by S1's `texture_ok`/base-texture path —
+this step only ever ADDS a material draw on top, never removes one.
+
+### `compile_failed` root causes fixed (S4b)
+
+Priority item 4 of the S4b slice: the S4a change-log's 13 pkg-bundled
+`compile_failed` shaders were traced to their actual root causes (not
+just their `shaderc` error text) and four distinct preprocessor bugs
+fixed — all four are `crates/kwe-scene-renderer/src/shaderpre.rs` changes,
+none touch the material pipeline or Vulkan layer.
+
+1. **`#include` placement** (`resolve_includes`): this module previously
+   inlined an `#include`'s resolved text at its EXACT source position —
+   documented at the time as equivalent to upstream's real behavior
+   (`ShaderUnit::preprocessIncludes` collects every include's text and
+   splices it in just before `main()`) because "every `#include` in the
+   corpus sits at file scope above any function definition." That premise
+   was false for three real corpus shaders — `shine_gaussian.frag`,
+   `godrays_gaussian.frag`, `blur_precise_gaussian.frag` — which all
+   `#include "common_blur.h"` as their FIRST line, before the
+   `uniform sampler2D g_Texture0;` `common_blur.h`'s own `blur13`/`blur7`/
+   `blur3` functions read. In-place inlining put those functions
+   textually ahead of the declaration they depend on — `shaderc` reported
+   `'g_Texture0' : undeclared identifier`. Fixed to match upstream's real
+   placement: every `#include`'s resolved text is now collected into one
+   accumulator (flattened across nesting, in encounter order) and spliced
+   in just before the file's own `main(` definition, so every top-level
+   declaration in the file — regardless of whether it sits before or
+   after the `#include` line — is visible to whatever the included text
+   defines. (S5 update: this S4b description of "just before `main(`"
+   and "a combo-gated `main(` is not handled" is now the PRE-S5 behavior
+   — see "Shader preprocessor: comment-aware `main` finder and
+   declaration-aware include placement (S5)" below for the current,
+   upstream-matching placement rule and the `#if`-stack search this
+   paragraph originally deferred.)
+2. **`g_Point<N>` type narrowing** (`standard_uniform_expr`): the shared
+   `MaterialUniforms` UBO backs every `g_Point<N>` with a `vec4` slot, but
+   `effects/perspective.vert` (used by the large majority of the local
+   corpus's effect chains — `common_perspective.h`'s `squareToQuad`
+   helper) declares it locally as `uniform vec2 g_Point0;` and calls
+   `squareToQuad(vec2, vec2, vec2, vec2)`. Folding to the bare `vec4`
+   expression changed the CALL-SITE type — `shaderc` reported
+   `'squareToQuad' : no matching overloaded function found` (a function
+   that exists, called with the wrong argument type) and a cascading
+   `'inverse' : no matching overloaded function found` plus a `'=' :
+   cannot convert from const float to 3x3 matrix` on the very same line.
+   Fixed: the folded expression now carries a narrowing swizzle (`.xy`
+   for a `vec2` declaration, `.xyz` for `vec3`, none for `vec4` — the
+   common case, byte-identical to the pre-fix output) matching the
+   shader's OWN declared type, scraped by the same `parse_decl` call that
+   already reads the type for every other declaration path.
+3. **Array uniforms left as loose declarations** (`fold_declarations`):
+   an array-typed uniform (e.g. `uniform float g_AudioSpectrum16Left
+   [16];`, an audio-visualizer material's spectrum-band uniform — this
+   renderer does not feed live spectrum data into any shader) was
+   explicitly excluded from every folding path (the standard-uniform,
+   material-constant, and zero-default branches all guard on `!name.
+   contains('[')`) and fell through to the generic per-line pass-through,
+   leaving the ORIGINAL `uniform TYPE NAME[N];` line in the compiled
+   text. Vulkan's GLSL profile requires every non-opaque uniform to live
+   inside a named block — `shaderc` reported `'non-opaque uniforms
+   outside a block' : not allowed when using GLSL for Vulkan`. Fixed: an
+   array uniform of a recognized element type now gets the same "still
+   compiles, just inert" zero-default treatment as a scalar/vector
+   uniform — a NON-`uniform`, explicitly zero-initialized array
+   (`TYPE NAME[N] = TYPE[N](zero, zero, ...)`, GLSL has no broadcast
+   shorthand for array initializers) the rest of the shader can still
+   read by the same name. Bounded: `MAX_ZERO_ARRAY_LEN` (1024 elements,
+   generous over the local corpus's largest real array, 64) — a
+   declaration past that bound is left on the pre-existing pass-through
+   path (still `compile_failed`, never an unbounded initializer-list
+   string).
+4. **`max()` argument order** (`SHADER_HEADER`): `#define max(x, y)
+   max(y, x)` is upstream's OWN header macro, dropped from this
+   module's port on the theory that GLSL already defines `max` the same
+   way HLSL does. That theory missed the actual corpus shape: HLSL's
+   `max(scalar, vecN)` broadcasts regardless of argument position, but
+   GLSL's overload set only has `genType max(genType x, float y)` — the
+   scalar must be SECOND, and an integer literal like the bare `0` in
+   `max(0, albedo.rgb)` (`workshop/2423477561/effects/nitro.frag`,
+   `workshop/2988515046/effects/nitro.frag` — both pkg-bundled) needs
+   GLSL's int→float implicit conversion on that second-position argument
+   to resolve at all. `shaderc` reported `'max' : no matching overloaded
+   function found` for the un-swapped call. Restored upstream's macro
+   verbatim; safe as a blanket swap because `max` is mathematically
+   commutative for any call that already resolves correctly — swapping a
+   currently-working `max(vector, scalar)` call changes nothing but
+   argument ORDER in the generated text, not the computed value, and the
+   full local-corpus sweep (below) found no case where the corpus itself
+   relies on the un-swapped order.
+
+Pinned by `shaderpre.rs` unit tests for each fix
+(`include_content_lands_before_main_not_at_its_own_line_position`,
+`point_uniform_narrows_to_the_shaders_own_declared_type`,
+`array_uniform_zero_fills_instead_of_leaving_a_loose_declaration`,
+`max_macro_swaps_arguments_matching_upstreams_header`, plus bounds/
+hostile-input siblings for each). See the S4b change-log entry in
+`AI-Skills/BETA_PLAN.md` for the before/after corpus `compile_failed`
+count and the byte-identity sweep result.
+
+### Shader preprocessor: comment-aware `main` finder and declaration-aware include placement (S5)
+
+Two adversarial-review follow-ups on the S4b `#include`-placement fix
+above, both `crates/kwe-scene-renderer/src/shaderpre.rs` only:
+
+1. **Comment-aware `main` finder** (`find_main_token`): the pre-S5 scan
+   matched a bare `main` token anywhere in the preprocessed text — a
+   shader with `main` mentioned inside a `//` line comment or a `/* */`
+   block comment ABOVE its real `main(` definition (e.g. `// see main()
+   above` or a commented-out old entry point) would be mistaken for the
+   real one, splicing included text into the wrong place. `find_main_
+   token` now tracks comment state as it scans (a single linear pass) so
+   both comment styles are skipped; an unterminated block comment runs
+   to end-of-file, matching how a real GLSL compiler would treat the
+   same malformed input. This is an original robustness fix, not a port
+   — upstream's own `find(" main")` has the identical weakness.
+2. **Declaration/`#if`-aware include placement** (`find_include_
+   insertion_point`, `move_point_outside_conditionals`): the S4b fix
+   spliced every `#include`'s resolved text unconditionally right before
+   `main(`, documented at the time as "equivalent for every shader this
+   renderer has been measured against" because none of the then-covered
+   corpus shaders needed the real, upstream-matching search
+   (`ShaderUnit::preprocessIncludes`, `ShaderUnit.cpp:136-312`): insert
+   immediately after the LAST top-level `attribute`/`varying`/`uniform`
+   declaration before `main` (not merely before `main` itself), then walk
+   that point back outside any `#if`/`#ifdef`/`#ifndef` ... `#endif`
+   region it would otherwise land inside. This closes a REAL bug the old
+   rule would have hit on `blur_precise_gaussian.frag` (one of the S4b
+   fix targets itself) if its last declaration before `main` were ever
+   inside a conditional block — `blur_precise_gaussian.frag` declares
+   `varying vec2 v_TexCoordMask;` behind `#if MASK`, AFTER its last
+   unconditional `uniform`; splicing `common_blur.h`'s `blur13a`/`blur7a`/
+   `blur3a` function definitions inside that `#if MASK` block would leave
+   them undefined whenever a material has `MASK` off — the `#if`-stack
+   walk moves the insertion point back to right after the last
+   UNCONDITIONAL declaration instead, avoiding it entirely. All three
+   S4b fix-target shaders (`shine_gaussian.frag`, `godrays_gaussian.frag`,
+   `blur_precise_gaussian.frag`) still preprocess and compile to SPIR-V
+   after this rewrite — verified directly against the real WE asset tree
+   by `shaderpre::tests::s4b_fix_target_shaders_still_compile_after_
+   the_placement_rewrite` (skipped, not failed, when the assets tree is
+   not mounted — a local-verification test over real, un-committed
+   assets, matching this module's other asset-path-gated tests).
+
+Pinned by `shaderpre.rs` unit tests: `find_main_token_skips_line_and_
+block_comments`, `find_main_token_returns_none_when_main_only_appears_
+in_comments`, `find_main_token_handles_an_unterminated_block_comment`,
+`include_splices_after_the_last_top_level_declaration_before_main`,
+`include_splice_point_is_moved_outside_an_enclosing_if_block`,
+`include_splice_point_handles_nested_if_blocks`.
+
+## Effects and render targets (S3)
+
+**Implemented (S3)**: an object's `effects[]` array — an ordered list of
+effect-chain references, each naming an effect `.json` file
+(`effects/<name>/effect.json` in the real corpus) plus per-object pass
+overrides (combos/textures/usertextures/constantshadervalues, matched
+positionally to the effect file's own MATERIAL passes only — command
+passes consume no override). An effect file declares `fbos[]` (name/
+format/scale/`unique`, sized to the OWNING OBJECT's own pixel size ÷
+`scale` — not the scene's) and an ordered `passes[]`, each either a
+material pass (`material`, optional `bind` list, optional `target` FBO
+name) or a `command` (`copy`/`swap`, `source`/`target` names).
+
+**Resolution** (`crates/kwe-core/src/sceneeffect.rs`, adapted from
+`EffectParser.cpp`/`ObjectParser::parseEffect`/`CPass::
+setupTextureUniforms`'s texture-slot priority order, GPL-3.0-or-later —
+see THIRD_PARTY.yml): every texture-slot name is classified once, no
+GPU/render-time knowledge needed — a `_rt_`/`_alias_`-prefixed name is a
+live render target (`is_runtime_target_name`), the literal string
+`"previous"` is the chain-local "reuse the input this slot would
+otherwise have used" sentinel, anything else is a normal `.tex` asset
+resolved and TEXV-header-checked exactly like a base material's texture
+slot. **Honesty rule**: resolving an object's `effects[]` NEVER fails
+the object — a malformed or unresolvable effect entry (missing file,
+unresolvable declared texture, malformed JSON) is simply omitted from
+the resolved list; the object keeps drawing through its base material
+(or nothing, if that was already unresolvable) exactly as if it had no
+`effects[]` at all. Bounded: ≤ 32 effects/object, ≤ 16 passes/effect,
+≤ 16 fbos/effect, effect JSON ≤ 1 MiB.
+
+**`_rt_` runtime-target honesty fix**: before S3, a material's texture
+slot naming `_rt_FullFrameBuffer` (the corpus's `models/util/
+fullscreenlayer.json` `copybackground` utility material's ONLY texture)
+unconditionally tried `materials/_rt_FullFrameBuffer.tex` on disk — a
+path that can never exist — failing model resolution outright. This was
+the exact defect keeping Workshop scene `1652229298` refused after S1/S2
+(BETA_PLAN.md). `scenemodel::resolve_model` now recognizes a
+`_rt_`/`_alias_`-prefixed slot-0 name as resolved-but-render-target
+(empty bytes, `is_render_target: true`) instead of a filesystem lookup —
+the B2 honesty gate passes, and the object's real pixel content is
+decided by the renderer's effect chain at draw time.
+
+**Render pipeline mapping** (`crates/kwe-scene-renderer/src/vulkan.rs`):
+upstream draws every material pass as its OWN draw call, either into a
+named FBO (`target: Some(name)`) or, with no target, directly onto the
+compositor. This renderer maps that onto its existing single-composite-
+pass architecture: **the chain's LAST pass with no target REPLACES the
+layer's own base material** for compile/bind purposes (a layer with a
+resolved effect chain draws through the effect's own final shader, not
+its base material). Every OTHER pass — one with a `target`, PLUS (S5)
+any untargeted pass that is NOT the chain's last one — gets its own
+compiled pipeline (`compile_effect_pass` — a separate, uncached pipeline
+object per pass, since its viewport is the TARGET's own pixel size, not
+the canvas: this renderer's pipelines bake a static, non-dynamic
+viewport) and is RE-RENDERED into its FBO every frame
+(`render_effect_chains`, called before the main composite pass each
+frame) so later passes and the layer's own final draw sample fresh
+content. A targeted pass's FBO is the scene-declared `fbos[]` name
+(scoped, see below); an intermediate untargeted pass's FBO is this
+OBJECT's own reused ping-pong pair — see "Stacked multi-effect
+compositing (S5)" below. `command: copy` executes as a direct
+`vkCmdCopyImage` between two named FBOs; `command: swap` — upstream
+itself never executes `swap` (`CImage.cpp` only handles `Command_Copy`)
+— executes identically to `copy` in this renderer, since a true pointer
+swap would require re-resolving every LATER pass's already-baked
+descriptor-set view bindings each frame, which this renderer's
+load-time-only binding design does not support.
+
+**`"previous"` seeding**: for the FIRST pass in an object's whole effect
+chain, `"previous"` resolves to the object's OWN base material's slot-0
+content — its real photo texture if it has one, or `_rt_FullFrameBuffer`
+if its base material's slot 0 is itself empty or already a render target
+(the `copybackground` pattern). Getting this right matters: seeding it
+to `_rt_FullFrameBuffer` unconditionally would make an ordinary photo
+layer's colour-grade effect sample the (one-frame-stale, initially
+transparent) scene composite instead of its own photo — a real
+corpus-observed failure mode caught and fixed during this slice (see the
+"safety guard" note below and `main.rs::plan_effect_chain`'s doc
+comment).
+
+**`_rt_FullFrameBuffer`**: a copy of the composited scene so far — see
+"Stacked multi-effect compositing / `_rt_FullFrameBuffer` paint order
+(S5)" below for the full, current semantics (a genuine same-frame
+snapshot for a layer's own bound material; still one-frame-stale for an
+effect chain's internal references, as S3 originally shipped it).
+
+**Safety guard — bare `_rt_` passthrough without an effect chain**: a
+layer whose EFFECTIVE material (its own base material, since it has no
+resolved `effects[]`) has NOTHING but `_rt_`/render-target texture slots
+— no real `.tex` bytes anywhere — never draws
+(`render_target_only_without_effects` fallback reason), UNLESS (S5) its
+only render-target reference is `_rt_FullFrameBuffer` specifically —
+that case is now safe (see S5 below) and draws. This is exactly the
+corpus's bare `models/util/fullscreenlayer.json` pattern used WITHOUT an
+attached effect (several real scenes place one at a fixed point in
+their object stack purely as a `copybackground` utility, with no
+`effects[]` of its own): before S3 its unresolvable `_rt_
+FullFrameBuffer` slot meant the whole object silently never drew — a
+true no-op. S3 kept refusing it even once the slot resolved, because
+`_rt_FullFrameBuffer` was only ever the one-frame-stale, transparent-
+on-frame-1 whole-scene snapshot — drawing it at any point in the object
+stack could paint stale/black content over real same-frame content. S5
+makes `_rt_FullFrameBuffer` a genuine same-frame snapshot for exactly
+this pattern (a layer's own bound material sampling it directly), so it
+is now safe to draw; any OTHER bare render-target reference (a name
+this layer's own effects never wrote, which should not occur in a
+well-formed scene) still has nothing real to show and stays refused.
+This guard was found and fixed via the corpus regression sweep
+documented in `AI-Skills/BETA_PLAN.md`'s S3 entry, not by inspection
+alone — real Workshop content exercises it.
+
+**Per-object render-target namespace** (adversarial review RECOMMENDED
+#5): every effect-declared FBO name — a `fbos[]` entry, a pass's own
+`target`, a `bind`/texture-slot reference, a `command`'s literal
+`source`/`target` — is scoped to the declaring LAYER
+(`main.rs::scoped_target_name`, suffixing `#obj<layer_index>`) before it
+ever reaches the renderer's `effect_targets` map, EXCEPT the one
+deliberately scene-wide name, `_rt_FullFrameBuffer`, which stays global.
+Two different objects declaring the same raw `fbos[]` name can no
+longer alias — an object whose chain runs but whose final pass is not
+applied (the scope boundary below) cannot silently feed a different
+object's same-named target, because the two objects' declared names
+never collide in the first place.
+
+**Feedback-loop guard** (adversarial review MUST-FIX #3): a targeted
+material pass whose own resolved texture slots (via `bind`,
+`usertextures`, `textures`, or the base material) name the SAME `_rt_*`
+FBO the pass itself renders into is rejected before compilation
+(`effect_self_reference` fallback reason) — sampling an image through a
+descriptor set while it is bound as the color attachment being written
+in the same render-pass instance is an unguarded Vulkan feedback loop
+(undefined per spec absent `VK_EXT_attachment_feedback_loop_layout`),
+mirroring `copy_effect_target`'s existing `source == target` guard for
+the analogous command-pass case.
+
+**Bounds**: `MAX_EFFECT_TARGETS_PER_SCENE` = 64 live FBOs/scene,
+`MAX_EFFECT_TARGET_BYTES` = 256 MiB cumulative, `MAX_EFFECT_TARGET_
+DIMENSION` = 4096 px/side, `MAX_EFFECT_PASS_BINDINGS` = 256 compiled
+effect-pass pipelines/scene (its own dedicated `effect_descriptor_pool`
+as of the adversarial review's MUST-FIX #1 — previously shared with
+`material_descriptor_pool`'s `MAX_LAYERS` budget with no combined
+accounting), `MAX_EFFECT_FRAME_ACTIONS` = 512 queued per-frame
+`command`/render actions per scene (MUST-FIX #2 — a `command` pass
+needs neither a shader nor a texture asset to parse, so nothing else
+bounded how many a hostile `effects[]`/`effect.json` pair could queue
+before this fix), `MAX_EFFECT_ASSET_READ_BYTES` = 256 MiB cumulative
+across every effect-triggered asset read per scene load (RECOMMENDED
+#4) — all enforced in `vulkan.rs`/`main.rs`, independent of the
+parse-time caps in `kwe-core::sceneeffect`.
+
+**Diagnostics**: `event=renderer.scene.effect_fallback reason=...
+count=N` per distinct reason (`compile_failed`, `effect_self_reference`,
+`effect_frame_action_cap`), then `event=renderer.scene.effects
+objects=N passes=M fallback=K targets=T swap_used=S` once per scene
+load — only emitted when at least one layer has a resolved effect
+chain. `swap_used` (adversarial review NIT #7) counts how many resolved
+`command: swap` entries executed as a one-directional copy (see
+"Render pipeline mapping" above) — distinguishing that simplification's
+real-world exposure from `command: copy`, where it is a no-op
+difference. A separate `event=renderer.scene.effect_asset_budget_exceeded
+bytes=... cap=...` line (RECOMMENDED #4) fires once if the aggregate
+effect-asset read budget is hit during scene load.
+
+## Stacked multi-effect compositing / `_rt_FullFrameBuffer` paint order (S5)
+
+S3 shipped two deliberate, documented boundaries: an effect chain's own
+output only ever replaced a bare-passthrough base material (real photos
+with attached effects kept drawing their unmodified base texture, since
+the chain model had nowhere to put an intermediate untargeted pass), and
+`_rt_FullFrameBuffer` was a whole-scene, one-frame-stale snapshot. S5
+closes both.
+
+**Effect compositing rule**: every pass in an object's resolved chain
+(every visible `effects[]` entry's `passes[]`, concatenated in file
+order — `main.rs::plan_effect_chain`) is now real:
+
+- A **targeted** pass (`target: Some(name)`) renders into that
+  scene-declared `fbos[]` name, scoped to the object
+  (`scoped_target_name`) — unchanged from S3.
+- An **untargeted, non-last** pass — the new S5 case — renders into this
+  OBJECT's own PRIVATE, reused ping-pong pair (`pingpong_target_name`,
+  upstream's `_rt_imageLayerComposite_<id>_a`/`_b`,
+  `CImage.cpp:729-880`): AT MOST 2 targets per object regardless of how
+  many intermediate passes it has, alternating after each write. Pass 1
+  of a chain samples the object's OWN base material's real texture
+  directly (no FBO needed for that — the seed `plan_effect_chain`
+  already used since S3); every later pass samples whatever the
+  previous pass just wrote.
+- The **untargeted, last** pass in the whole chain becomes
+  `final_material` — this layer's own bound material, exactly as S3 —
+  now unconditionally, regardless of whether the base material had a
+  real texture of its own.
+
+The S3-era `base_is_passthrough` gate (restricting the override to
+bare-passthrough objects only) is removed: it existed purely because the
+old chain model had no real GPU target for an intermediate untargeted
+pass, so letting the chain's last pass win for a real-photo object with
+multiple stacked effects (the corpus's own worked example, Workshop
+`1131061888`'s "trigun" — a real photo with FOUR attached effects:
+waterripple/waterflow/godrays/waterwaves) discarded the photo outright.
+With a real per-object ping-pong pair, pass 1 still samples the real
+photo, so nothing is discarded. Bounds: ≤ 2 ping-pong targets per object
+(within the existing `MAX_EFFECT_TARGETS_PER_SCENE`/`MAX_EFFECT_TARGET_
+BYTES` scene-wide caps), ≤ 16 passes/effect (unchanged, parse-time cap).
+Pinned by `main.rs::tests::plan_effect_chain_ping_pongs_multiple_
+untargeted_passes_reusing_two_targets`,
+`plan_effect_chain_ping_pong_targets_stay_bounded_to_two`, and
+`plan_effect_chain_targeted_passes_do_not_consume_ping_pong_slots`.
+
+**`_rt_FullFrameBuffer` same-frame paint order**: a layer whose OWN
+bound material (its base material, or an effect chain's `final_material`
+— the thing actually drawn through the normal per-layer quad) samples
+`_rt_FullFrameBuffer` now sees the scene composited so far THIS SAME
+FRAME — every layer drawn earlier in object order — not last frame's
+whole-scene snapshot. Implemented in
+`vulkan::LayerRenderer::render`: `main.rs::compile_material_layers`
+collects the layer indices whose final bound material references
+`_rt_FullFrameBuffer` by name (`ffb_consumer_layers`, capped at
+`MAX_FULL_FRAME_BUFFER_SNAPSHOTS_PER_FRAME` = 8, one bounded diagnostic
+— `event=renderer.scene.full_frame_buffer_snapshot_cap` — if truncated)
+and hands it to `render`, which, immediately before each registered
+layer's draw, ENDS the current render-pass instance, copies
+`self.image`'s current content into `_rt_FullFrameBuffer`
+(`vkCmdCopyImage` with the same barrier pattern the pre-existing
+`copy_effect_target`/`snapshot_full_frame_buffer` already use), then
+RESUMES drawing in a new render-pass instance (`render_pass_resume`,
+`LOAD_OP_LOAD`) — all within the SAME command buffer/submit as the rest
+of the frame, no extra fence wait. A consumer past the 8-cap is not
+refused; it simply is not given its own snapshot point, so it samples
+whatever `_rt_FullFrameBuffer` last held (the most recent snapshot
+inserted earlier this frame, or the previous frame's whole-scene content
+if none was — a documented, bounded degrade). This directly unblocks
+the "safety guard" case above: a bare `copybackground` passthrough with
+no effect chain, sampling `_rt_FullFrameBuffer` as its only texture,
+now draws correctly instead of being refused. Pinned by
+`vulkan::tests::full_frame_buffer_snapshot_sees_layers_drawn_earlier_
+this_same_frame` (a two-renderer, treatment-vs-control device test:
+layer 1 mirrors layer 0's red WITH the snapshot registered, and mirrors
+opaque black WITHOUT it — proving the mechanism, not a coincidence),
+verified on both an NVIDIA RTX 3070 and llvmpipe.
+
+**Scope boundary — the same-frame fix covers a layer's OWN bound
+material only**: an effect chain's INTERNAL references to
+`_rt_FullFrameBuffer` (a pass's own texture slot naming it directly, or
+`plan_effect_chain`'s "previous" seed falling back to it when the base
+material has no real texture) are NOT covered — `render_effect_chains`
+still runs once, in one batch, before ANY layer's on-screen draw this
+frame, so an effect pass reading `_rt_FullFrameBuffer` still sees the
+PREVIOUS frame's whole-scene snapshot (`main.rs`'s post-`render` call to
+`snapshot_full_frame_buffer`, unchanged from S3). Interleaving effect-
+chain execution into true per-object paint order — running each
+object's own chain actions at its own position in the draw loop, rather
+than as one bulk pre-pass — would close this remaining gap; it was
+judged out of scope for this slice (a bigger architectural change to
+`render_effect_chains`'s per-frame replay model, not a bounded addition
+like the render-pass-split mechanism above) and is a real, scoped
+follow-up.
+
+**Design note — why a render-pass split, not a second subpass**: a
+subpass-local dependency can transition an attachment's LAYOUT between
+subpasses of the SAME render-pass instance, but `_rt_FullFrameBuffer` is
+a separate image/framebuffer entirely, and the copy into it is a
+TRANSFER command (`vkCmdCopyImage`), which is illegal inside a
+render-pass instance regardless of subpass count. Ending the instance is
+therefore the only construct that admits this at all, not an
+optimization traded away — see `vulkan::LayerRenderer::render`'s own doc
+comment for the full barrier/layout proof (both `render_pass` and the
+new `render_pass_resume` share the exact `final_layout`/`initial_layout`
+the snapshot's copy step needs, so no manual image-layout barrier on
+`self.image` itself is needed at any split point).
+
+## Vertex attribute shapes (S4) / mesh/puppet vertex formats
+
+**Implemented (S4)**: the material pipeline's shared quad buffer
+(`vulkan::MATERIAL_UNIT_QUAD`) now carries constant per-vertex data for
+SIX attribute names instead of two — `a_Position`(vec2/vec3) and
+`a_TexCoord`(vec2) as before, plus `a_Normal`(vec3, always `+Z` — the
+quad is flat), `a_Color`(vec4, always opaque white), `a_PositionVec4`
+(vec4, mirrors `a_Position` with z=0/w=1), and `a_TexCoordVec4`(vec4,
+mirrors `a_TexCoord` with z=0/w=1) — see `vulkan::material_attribute_layout`.
+`main.rs::material_vertex_format_supported` accepts any subset of these
+six names (each with its matching declared GLSL type, no duplicates)
+that includes at least one position-like and one texcoord-like
+attribute; `vulkan::material_vertex_attributes` builds each pipeline's
+`VertexInputAttributeDescription` list dynamically from the material's
+OWN scraped, live-only attribute set (see the S4 conditional-compilation
+scraping fix above) instead of a hardcoded 2-attribute array. This is
+squarely the `genericimage3`/`genericimage4`-family shape upstream's
+`CImage`/`CPass` feed a flat 2D image object — mesh/puppet geometry
+(bone indices/weights, tangents, the multi-UV-channel `C1`/`C2`/...
+variants used only by rope/mesh particle shaders) stays out of this
+slice, per the survey below.
+
+**A second, load-bearing S4 fix**: two WE "standard" uniforms this
+pipeline previously zero-defaulted turned out to be genuinely LIVE (not
+dead behind an off-by-default combo) for a `VERSION`-tagged
+`genericimage*` material, and a zero default for either one visibly
+BREAKS the draw — found via the 60-scene corpus byte-identity sweep
+(`scripts/scene-corpus-byte-identity-sweep.sh`), which flagged 8
+real regressions the first time this slice widened the vertex-format
+acceptance without also fixing these:
+- `g_Texture<N>Rotation` (vec4): the UV transform every
+  `genericimage*.vert` applies unconditionally
+  (`v_TexCoord.xy = g_Texture<N>Translation + a_TexCoord.x *
+  g_Texture<N>Rotation.xy + a_TexCoord.y * g_Texture<N>Rotation.zw`) —
+  a zero ROTATION matrix collapses every sampled UV to one point. Fixed
+  to the identity `vec4(1.0, 0.0, 0.0, 1.0)`. (`g_Texture<N>Translation`
+  needed no change: `vec2(0.0)` already IS the correct identity
+  translation for the same formula.)
+- `g_Color4` (vec4): the `VERSION`-combo-gated replacement for the
+  `g_Brightness`/`g_UserAlpha` pair every `genericimage*.frag` otherwise
+  uses (`#ifndef VERSION { ...g_Brightness/g_UserAlpha... } #else {
+  uniform vec4 g_Color4; ... color *= g_Color4; }`) — a zero `g_Color4`
+  multiplies the sampled colour to fully transparent black for every
+  `VERSION`-tagged material. Fixed to fold to the SAME per-draw
+  brightness/alpha values already threaded through
+  `u_Std.g_TimeAlphaBrightness_` (`vec4(...zzz, ...y)`), matching what
+  the `g_Brightness`/`g_UserAlpha` branch already does.
+
+Both are pinned by direct unit tests
+(`shaderpre::tests::texture_rotation_uniform_folds_to_identity_not_zero`,
+`shaderpre::tests::color4_uniform_folds_to_brightness_alpha_not_zero`)
+and confirmed against the real corpus scene that surfaced them (Workshop
+3100709479, a `genericimage3` material): after both fixes, its render
+output is byte-identical to the pre-S4 baseline's own (already-correct)
+S1 fallback, while now drawing through the REAL material pipeline
+instead of a flat textured quad.
+
+**S4a adversarial review, MUST-FIX #3**: a third, related "zero should be
+identity" gap survived the original S4 pass and the 60-scene sweep —
+`g_ModelMatrix`/`g_ViewProjectionMatrix`/`g_NormalModelMatrix` (+ `Alt`
+siblings) also fell through to the generic zero-default. Unlike
+`g_EyePosition`/lighting math (genuinely out of scope — `#require
+LightingV1` still resolves to a zero-contribution stub), these three feed
+vertex **POSITION**, not just shading: `genericimage3.vert:163`'s
+`worldPos = mul(vec4(localPos, 1.0), g_ModelMatrix)` runs
+UNCONDITIONALLY on every draw of this shader family, and once a material
+sets `LIGHTING=1` (a legitimate combo override on the very same
+`a_Normal`/`a_Color` attribute family S4 widened acceptance to),
+`gl_Position` itself is computed from `worldPos * g_ViewProjectionMatrix`
+— two zero matrices collapsing the object's on-screen geometry to a
+single degenerate point, not "missing lighting." None of the 60 local
+corpus scenes happen to set `LIGHTING`/`REFLECTION`/`VERTEXCOLOR` on a
+`genericimage2/3/4`-family material, so the sweep could not have caught
+this the way it caught the two fixes above — found by adversarial review
+instead. Fixed the same way: `g_ModelMatrix`/`g_AltModelMatrix`/
+`g_ViewProjectionMatrix`/`g_AltViewProjectionMatrix` fold to `mat4(1.0)`;
+`g_NormalModelMatrix`/`g_AltNormalModelMatrix` fold to `mat3(1.0)` —
+pinned by `shaderpre::tests::model_and_view_projection_matrices_fold_to_identity_not_zero`.
+This is still not real lighting/reflection support (a material whose live
+combo state needs `g_EyePosition` for real, non-zero shading still draws
+without it, unchanged), and two more unconditional-declaration `mat4`
+uniforms were found by the same grep but left unfixed as out of this
+finding's specific scope (`g_EffectModelMatrix`, read unconditionally in
+`volumetricsfront.frag`'s raymarch; `g_EffectModelViewProjectionMatrix`,
+read unconditionally in `effectcomposebackground.vert`'s screen-coord
+compute — both single-shader-file, effect-pass-only names, not the
+widely-used image-object family this review targeted) — recorded here as
+a known residual gap, not silently dropped.
+
+**Residual sweep findings, not further chased this slice**: after both
+fixes, the 60-scene sweep's flagged count is higher than the 8 found
+before the fix (most scenes newly draw REAL content where they
+previously drew nothing at all — `unsupported_vertex_format` no longer
+refuses them — which the pixel-stat sweep reports as "flagged" even
+though it is the intended, desired effect of this deliverable, not a
+regression; every scene that already drew a real photo through its
+material pre-S4 remains byte-identical post-S4). One scene (Workshop
+3765081478, a heavily custom "cloud"-style shader with 59 distinct
+non-standard `u_`-prefixed uniform names, only 46 of 53 materials
+compiling even after this fix) draws visibly different, near-uniform-
+white content post-S4 and is flagged here as a known, out-of-scope
+residual gap for a future slice to look at with real screenshots, not
+silently accepted as correct.
+
+**Deliberately left out** (documented, not silently dropped): a survey
+of the WE asset shader corpus (`assets/shaders/*.vert`) found the
+attribute shapes this renderer still does NOT implement, all involving
+at least one attribute outside the six-name known set: `a_Position(vec3)
++ a_Normal(vec3)` alone, no UV (7 shaders — lighting-only positions;
+these need `#require LightingV1`'s real implementation, out of scope),
+bone/skinning attributes (`a_BlendIndices`/`a_BlendWeights`, live only
+when a material explicitly sets `SKINNING=1`, not observed in the local
+corpus), tangents (`a_Tangent4`, live with `NORMALMAP`/`REFLECTION`),
+and the rope/mesh-particle multi-UV-channel variants
+(`a_TexCoordVec4C1`/`C2`/`C3`, `a_TexCoordVec3C2`, `a_PositionC1`,
+`a_TexCoordC2`/`C3`/`C4` — `genericropeparticle.vert`,
+`puppettexturechannels.vert`'s remaining non-standard channels). Adding
+support for any of these is a real, scoped follow-up (extending
+`vulkan::KNOWN_MATERIAL_ATTRIBUTES`/`material_attribute_layout` and
+`main.rs::material_vertex_format_supported`'s matcher to a wider known
+set, plus deciding what constant per-vertex data — if any — a flat quad
+can meaningfully supply for a bone-weighted or multi-channel attribute).
+
+**Puppet MESH geometry (custom triangle lists, not just attribute
+shape)**: upstream's only mesh-beyond-the-quad path is a `model.json`
+`puppet` field naming a binary blob (magic `MDLV0021`/`MDLV0023`, a
+heuristically-scanned vertex/index block — stride-80 vertices,
+position(vec3) at offset 0 + uv(vec2) at offset 72, u16 index triples;
+CImage.cpp's own comment gives no name to the 64 bytes between offset
+12 and 72, and no other code path reads them). Critically, upstream's
+puppet vertex SHADER uses the SAME two attributes (`a_Position`+
+`a_TexCoord`) as the flat quad — puppet is a GEOMETRY change (many
+triangles instead of 6 quad vertices), not a vertex-FORMAT change. **Not
+ported this slice**: a full grep of this machine's local `assets/
+models/*.json` (6 files) found zero `"puppet"` keys, and the local
+60-scene Workshop corpus's packed `scene.pkg` model.json entries were
+not exhaustively re-checked for `puppet` fields given the time budget —
+treat puppet mesh support as implemented-nowhere, not
+implemented-but-unexercised, until a real fixture is found. Given zero
+observed local usage, this is left out with the reason recorded here
+rather than built against a synthetic-only fixture with no real-corpus
+signal to validate it against.
+
+## scene.pkg
+
+**Implemented (M3b)** in `kwe-core` (`crates/kwe-core/src/pkg.rs`) and wired
+into the worker's `--content` path: a `.pkg` content is opened by
+`PkgReader`, its unique `scene.json` entry is parsed in memory, and — when
+`general.script` names a package entry — that entry is extracted into a
+private `kwe-scene-script-<pid>` directory under the worker's HOME (mode
+0700) and loaded like a file scene's script. Model, material, and texture
+references resolve against the package entry table too (S1,
+`scenemodel::resolve_model`'s pkg-lane lookup, `kwe_core::asset_entry`) —
+`materials`/`models` subtrees are not bulk-extracted, only the specific
+entries a resolved model layer needs; the renderer logs
+`event=renderer.scene.pkg entries=N script_entry=...`.
+
+The **extension selects the reader**: `--content` ending in `.json` takes
+the file-based parse, `.pkg` takes the archive reader — and mislabeled
+content fails *as its labeled format* (a pkg renamed `.json` is parsed as
+JSON and rejected, and vice versa).
+
+The extracted script directory is the worker's own: it is removed on the
+worker's graceful exit path, and a stale directory left by a hard kill is
+replaced by the pid-recycle retry on the next start (never a brick).
+
+### Verified layout
+
+Triple-confirmed against byte-level inspection of ~60 real Workshop scene
+packages (20 distinct `PKGV` versions, 3128 entries), the public QuickBMS
+extractor script (0.1a), and the BSD-3-licensed RePKG implementation
+(behavior references only per ADR 0001 — no code copied):
+
+```text
+u32 LE  magic-string length in bytes (8 on the corpus)
+bytes   magic string: b"PKGV" + 4 ASCII digits, e.g. "PKGV0001"
+u32 LE  entry count
+  per entry:
+    u32 LE  path length in bytes
+    bytes   UTF-8 path, e.g. "scene.json"
+    u32 LE  payload offset, relative to the start of the data section
+    u32 LE  payload size in bytes
+data section: raw concatenated payloads
+```
+
+Offsets are relative to the data section (right after the table), and
+payloads are stored **raw**: the corpus contains no compressed entry
+(JSON descriptors, TEXV0005 textures, and raw pixel data only — verified
+with an independent pure-Python LZ4 block decoder), and none of the
+reference implementations decompresses anything. The QuickBMS script notes
+"PKGV0001, PKGV0006 and so on are all the same format"; the layout is
+version-independent, so any `PKGV` + 4 digits is accepted.
+
+### The LZ4 question (honest variant note)
+
+The M3b brief described "LZ4-compressed payloads in the commonly documented
+format". The evidence above **disproves that premise** for every package we
+can see, so raw is the primary path. To cover the possibility that some
+publisher-side tool produced frame-compressed packages, the reader
+additionally recognizes the LZ4 frame magic (`04 22 4D 18`) at a payload's
+start and decompresses it — with the output cap (64 MiB per entry)
+enforced **during** decompression (the frame decoder is wrapped in
+`take(cap + 1)`; a declared content size or a bomb can never allocate past
+the cap). A payload whose first four bytes are not the frame magic is
+returned verbatim. **Raw fallback policy**: a payload that *does* begin
+with the frame magic but does not decode as a frame is treated as raw
+instead of failing the read (raw is the corpus-proven primary) — one
+bounded diagnostic line per fallback; an over-cap decompression is never
+downgraded, so a bomb stays a `bounds` error. The `compressed` flag on
+`PkgEntry` reports which path a given entry takes.
+
+### Bounds and validation
+
+| Bound | Value |
+|---|---|
+| package size | 512 MiB |
+| entry count | 65 536 |
+| entry path | 512 bytes |
+| entry payload | 64 MiB (read-time cap, before and during decompression) |
+| total payload | 512 MiB (checked while parsing the table) |
+
+The whole table is validated **at open**, before any payload is touched:
+magic/version shape (structured `unsupported version` error for a
+PKGV-prefixed magic that is not 4 digits), entry count, per-path length and
+UTF-8, ranges (`offset + size` inside the data section, checked overflow),
+total payload sum, and path safety. The open is TOCTOU-safe like every
+other read in kwe-core: lstat (reject symlinks), `O_NOFOLLOW` open, fstat
+re-check on the fd, parse from the fd, size re-check after parsing. All
+reads stay pinned to the fd.
+
+### Path-traversal policy (documented decision)
+
+M3b ships `read_entry` only — no extract-to-disk API — so a hostile entry
+path cannot write outside the package on this slice. The table is still
+validated at open: **empty paths, NUL bytes, backslashes, absolute paths,
+and `..` components are rejected** (`PathTraversal`), so a future
+extractor cannot inherit a hostile table. Callers that resolve entry paths
+(the worker's script extraction) additionally confine resolution: the
+script reference must be relative, `.js`, and match exactly one entry
+(case-insensitive, literal or `/<name>`-suffixed); the extracted file is
+always written as `script.js` under a pid-unique 0700 directory the worker
+owns. Nothing from a package is ever resolved against the host file
+system.
+
+### Worker behavior
+
+* `--content` ending in `.pkg` (case-insensitive) selects the archive path.
+* Exactly one entry named exactly `scene.json` (case-insensitive) is
+  required, with at most one leading directory component (`scene.json`,
+  `dir/scene.json` — `myscene.json` and `a/b/scene.json` do not count):
+  zero matches with a `scene.pkg` entry present (same name rule) means a
+  **nested archive** (`event=renderer.scene.backend_reject kind=Pkg
+  detail="nested scene.pkg inside the package is not supported (M3b)") —
+  nested packages are refused, not recursed; zero matches otherwise, or
+  several matches, are likewise exit 73. The rule lives in
+  `kwe_core::scene_json_entry`, shared with preflight.
+* The scene.json entry is read bounded to 16 MiB and parsed by the same
+  core as file scenes (unknown keys tolerated, `general` rules identical).
+* `general.script` resolves against the package table (same rule as the
+  file lane: relative, `.js`, no `..`/backslash/NUL, exactly one match —
+  `kwe_core::script_entry`); the entry is read bounded to 2 MiB, extracted,
+  and loaded by the script engine. A script reference that is empty, `.pkg`,
+  non-`.js`, absolute, traversing, missing from the table, or ambiguous is
+  a backend rejection (exit 73).
+* Archive failures (corrupt magic/table, truncated data, bounds, traversal
+  entries) are backend rejections: `kind=Pkg`, exit 73 before the canary,
+  so the supervisor records `exit_code_73` and rolls back. Preflight
+  (kwe-core `preflight_scene`) runs the same structural validation for a
+  `.pkg` content and rejects a corrupt archive before the worker spawns
+  (this closes M1 finding G12, which previously let any `.pkg` through).
+  Preflight also checks the renderer's per-entry caps **statically**, with
+  the same resolution rules: the scene.json entry must be ≤ 16 MiB and the
+  referenced script entry ≤ 2 MiB, so an oversized entry is refused as
+  `invalid_params` instead of bouncing workers (exit 73). The script check
+  reads the descriptor's stored bytes (never decompressed — preflight
+  stays structural; a compressed descriptor skips the check and the
+  renderer's bounded decode still enforces the cap).
+
+## Script execution model
+
+One QuickJS runtime + context per worker (rquickjs 0.12.2, MIT, vendored
+quickjs-ng 0.15.1 — THIRD_PARTY.yml). Bounds:
+
+| Bound | Value | Behavior |
+|---|---|---|
+| heap | 64 MiB (`Runtime::set_memory_limit`) | JS "Out of memory" exception → bounded `memory_limit` diag → **exit 71** (the renderer never survives an OOM; it cannot render meaningfully) |
+| stack | 4 MiB (`Runtime::set_max_stack_size`) | runaway recursion → contained exception, renderer keeps the last state |
+| per-update budget | 8 ms soft / 33 ms hard (wall clock in the interrupt callback — rquickjs exposes no step counts; docs/BETA_M3.md risk 1) | soft: frame skipped, bounded `event=renderer.scene.script_timeout kind=soft`; hard: uncatchable exception, counted as `hard_timeout`; the renderer always keeps publishing the last good frame |
+| `dt` | clamped to `[0.0, 1.0]` | a hung producer cannot feed a huge dt downstream |
+| console | 30 lines per 10 s window, 512 bytes per line | `event=renderer.scene.console`, `console_dropped` on overflow |
+
+Script exceptions are contained: caught, counted (`script_errors` in
+`event=renderer.complete`), logged at most once per error class per 30 s
+window, and never kill the renderer. `Engine.clearcolor` reads that fall
+back on the current color keep a throwing `update()` from corrupting state.
+
+## SceneScript API coverage matrix
+
+Status key: **implemented (M3a)** — in this slice and covered by tests;
+*planned* — reserved for M3b–M3k; **not in scope** — explicitly out of the
+beta scope. API items follow the behavior of the reference implementations
+(see Provenance), restricted to what a worker can do with no window and no
+image compositing in M3a.
+
+### Globals
+
+| API | Status | Notes |
+|---|---|---|
+| `Engine.frametime` | **implemented (M3a)** | seconds since the previous update, per update (number) |
+| `Engine.fps` | **implemented (M3a)** | the pacing the daemon asked for, fixed (number) |
+| `Engine.resolution` | **implemented (M3a)** | `{x, y}` — the pixel size the worker renders at, fixed (read-only object) |
+| `Engine.clearcolor` | **implemented (M3a)** | `{r, g, b, a}` (0..1 floats). **M3a-only bridge, not a wallpaper-engine API**: the worker reads it back after every `update()` and clears the frame to it. Planned to move to `thisScene.clearcolor` once scene objects arrive. Read-back falls back to the current color on non-finite/missing values. |
+| `console.log / info / warn / error` | **implemented (M3a)** | rate-bounded, truncated to 512 bytes, surfaced on the worker's stderr ring |
+| `thisScene` | *planned* | with scene objects (M3c–M3k) |
+| wallpaper-engine globals beyond `Engine.*` | *planned* / **not in scope** | nothing else exists in M3a; each API joins via the coverage matrix here when implemented |
+
+### Entry points
+
+| API | Status | Notes |
+|---|---|---|
+| `init()` | **implemented (M3a)** | called once at script load, after evaluation; exceptions are contained (the script is still driven) |
+| `update(dt)` | **implemented (M3a)** | called once per paced step, `dt` in seconds, clamped to `[0.0, 1.0]`; the return value is ignored (the renderer reads `Engine.clearcolor` back); a missing `update` renders the current color forever |
+| `resized(w, h)` | **implemented (M3a)** | called once at script load with the daemon-provided size; dimensions are fixed in M3a — there is no live-resize path (docs/BETA_M3.md risk 7) |
+
+### Scene objects and render model
+
+| API | Status | Notes |
+|---|---|---|
+| `Scene.getLayer(name \| index)` | **implemented (M3c)** | returns the `Layer` proxy for a registered layer (image or text), or `null` for an unknown name/index (never throws); layers are registered in `objects` order |
+| `Scene.getLayerCount()` | **implemented (M3c)** | the number of registered layers (image and text) |
+| `SceneLayer` (`Layer`) | **implemented (M3c, M3d)** | read+write proxy: `name` (read-only string, matching the reference behavior), `alpha` (0..1), `visible` (boolean), `angles` `{x, y, z}` (degrees), `origin` `{x, y}` (scene units, layer center), `scale` `{x, y}`, `size` `{x, y}` (scene units; an absent size is the decoded texture's dimensions, so init() sees the real size). M3d adds `blendMode` (0/1/6/7/9 select the researched modes; 11/12/24/30 clamp to Normal with a bounded diagnostic; anything else clamps silently), `brightness` (0..=10), and `tint` `{r, g, b, a}` (0..=1 each). Writes are clamped like `Engine.clearcolor`: non-finite → 0 (effects → their default 1.0), alpha to 0..=1, scalars to ±1e6, size to ≥ 0 (scale carries the mirror). Changing `image` at runtime is *planned* (M3d+) — an image-less layer registered via `Scene.getLayer` is fully readable/writable except for its texture |
+| color effects (`brightness`, `tint`) | **implemented (M3d)** | the effects apply to the sampled texel before blending; clamps absorb any out-of-range write |
+| text layers | **implemented (M3e)** | see the Text layers table below |
+| particles | **implemented (M3f)** | see the Particles table below |
+| `VideoLayer` objects | **implemented (M3g, partial)** | an object with a `video` reference and no `image` is decoded by a supervised libmpv software core; at most two cores are open, native decoded size fills an absent `size`, `loop` and bounded `rate` are accepted, and bad/capped sources skip only that layer. Local file/package containment, protocol whitelist, 160 MiB source cap, `audio=no`, and no scripts/network are intentional semantics. SceneScript per-layer video controls remain planned. |
+| 3D models, user properties | *planned* (M3h–M3k) | the parse tolerates extra keys but renders none of them |
+
+### Text layers (M3e)
+
+| API | Status | Notes |
+|---|---|---|
+| `Layer.text` | **implemented (M3e)** | read/write string; a write truncates to 4096 chars (one bounded `text_truncated` diagnostic per layer) and rebuilds the geometry |
+| `Layer.pointsize` | **implemented (M3e)** | points ×4 → px (the researched WE multiplier), clamped 4..=512; non-finite/≤0 → the default 12 pt (48 px) |
+| `Layer.horizontalAlign` / `verticalAlign` | **implemented (M3e)** | 0/1/2 = left\|top / center / right\|bottom, clamped; the parse defaults to center/center (the OWE `horizontalalign` → `alignment` → center chain) |
+| `Layer.color` | **implemented (M3e)** | read/write `{r, g, b, a}` 0..=1 per component (clamped at the parse and on every script write; RGB implies alpha 1); the alpha folds into the layer alpha (M3d policy), the RGB rides the draw's tint slot |
+| font resolution | **implemented (M3e)** | the Exact → Basename → fallback chain → Any → None order documented in "Text layers (M3e)" above; fallback/none reported once per layer (`text_font_fallback`, `text_font_none`) |
+| glyph atlas | **implemented (M3e)** | 2048² per layer, white glyphs with coverage in alpha — zero shader changes; overflow clear+repack rate-limited to 2/s |
+| `Layer.size` on a text layer | ignored | text size is automatic (layout pixels map 1:1 to scene units); the write is counted (`text_size_ignored`), resizing goes through `scale` |
+| text-bearing wallpapers | *planned* | the corpus carries **zero** text layers and zero textures — nothing real to validate against; M3e is exercised with synthetic fixtures only |
+### Particles (M3f)
+
+| API | Status | Notes |
+|---|---|---|
+| `Scene.getParticleSystem(name \| index)` | **implemented (M3f)** | returns the `ParticleSystem` proxy for a registered `particle` object, or `null` for an unknown name/index (never throws); the WE-compatible `Scene.getLayer` path reaches particle systems by name too |
+| `Scene.getParticleSystemCount()` | **implemented (M3f)** | the number of registered particle systems |
+| `ParticleSystem.spawnRate` / `life` / `speedMin` / `speedMax` / `direction` / `spread` / `sizeStart` / `sizeEnd` / `alphaStart` / `alphaEnd` / `maxCount` / `blendMode` | **implemented (M3f)** | read/write scalars, clamped on the Rust side like every proxy write (the scene.json ranges above; non-finite → default, out-of-range → the clamp bound) |
+| `ParticleSystem.instance` | **implemented (M3f)** | the WE `IParticleSystemInstance`: `count`, `speed`, `lifetime`, `size`, `alpha`, `rate`, `colorn` — multiplicative factors, default 1.0, non-finite → 1.0, clamped [0, 1e6] (alpha/colorn [0, 1]); `count` scales the spawn rate (the smoke-d lane pins it), `lifetime` scales life, `rate` scales the sim time |
+| `ParticleSystem.play()` / `pause()` / `stop()` / `isPlaying()` / `emitParticles(count)` | **implemented (M3f)** | WE semantics: play resumes emission, pause stops emission with live particles still simulating, stop clears immediately, `isPlaying()` = emitting or alive, `emitParticles` (default count 1) bursts even while stopped |
+| `ParticleSystem.alpha` / `brightness` | **implemented (M3f)** | read/write like every layer (0..=1 / 0..=10); the drawn effects (read-only in M3f only in the sense that the instance factors are the documented knobs) |
+| `particle`-object shared props | **implemented (M3f)** | `origin` positions the emitter; `angles`/`scale` parse but are **not applied** (documented deviation — systems render world-space; the transform is planned) |
+| `texture` / `material` | **implemented (M3f)** | M3c image-source resolution (content root or pkg table); `texture` wins over `material`; missing/undecodable → the system simulates but draws nothing (`particle_skip`, never fatal) |
+| emitter `direction`/`spread` | **implemented (M3f)** | the M3f extension (WE emitters have neither — launch velocity comes from the velocity-random initializer); radians from +x, spread 0..=2π cone |
+| `maxCount` > 4096 / spawn excess | **implemented (M3f)** | excess spawns drop (never evict), one bounded `particles_capped` per system |
+| particle-bearing wallpapers | *planned* | the corpus carries **zero** particle systems and zero textures — M3f is exercised with synthetic fixtures only |
+
+| `.pkg` archives | **implemented (M3b)** | scene.json entry parsed in memory; script entry extracted to a private HOME dir; nested archives refused; **image entries resolve against the package table (M3c)** |
+| image assets | **implemented (M3c)** | PNG/JPEG (+WebP) decoded from the content root (file scenes) or the package entry table (pkg scenes); a missing/undecodable/over-budget image skips its layer with a bounded diagnostic, never the scene |
+| audio/pointer input in script | *planned* | the worker receives and acks the wire inputs but exposes none of them to the script until M3i |
+| media input | **implemented (M3g transport only)** | latest-wins `playing`/`paused`/`stopped` fans out to open VideoLayers (stop pauses and seeks to zero); metadata is acknowledged but not exposed to SceneScript |
+
+## Output
+
+Frames are premultiplied BGRA8888 through the shared frame mapping
+(docs/FRAME_PROTOCOL_V1.md): a 64-byte `KWEFRM1` header, two BGRA8888
+slots, generation-toggle publishing, keepalive re-publish so a script that
+never changes the color cannot trip the supervisor's frame timeout. The
+Vulkan attachment is `B8G8R8A8_UNORM` when supported (both validated
+drivers) with an `R8G8B8A8_UNORM` fallback; the channel conversion is
+identity for `B8G8R8A8` readback (bytes are already B,G,R,A) and a
+[2,1,0] permutation for `R8G8B8A8`, both premultiplied with
+`(v*a+127)/255` rounding — byte-exact per unit test.
+
+## See also
+
+- docs/BETA_M3.md — the M3a..M3d slices: goal, acceptance evidence, exit
+  codes, open risks (interrupt-budget deviation, llvmpipe determinism,
+  reader staleness, loader lifetime).
+- docs/adr/0001-original-vulkan-renderer.md — the architecture this slice
+  implements (ADR 0001 is binding).

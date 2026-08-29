@@ -1,0 +1,36 @@
+[package]
+name = "owe-kwe-common"
+version.workspace = true
+
+[lib]
+name = "owe-kwe-common"
+module = "kwe.worker_common"
+archive = "owe-kwe-common"
+sources = [
+  "FrameProtocol.cppm",
+  "InputWire.cppm",
+  "WorkerCommon.cppm",
+]
+
+[usage]
+options = [
+  "-Wextra",
+  "-Wno-missing-field-initializers",
+  "-Wno-gnu-zero-variadic-macro-arguments",
+]
+
+[dependencies.owe-core]
+workspace = true
+visibility = "public"
+
+[dependencies.rstd-std]
+workspace = true
+visibility = "public"
+
+[dependencies.rstd-cppstd]
+workspace = true
+visibility = "public"
+
+[dependencies.rstd-log]
+workspace = true
+visibility = "private"

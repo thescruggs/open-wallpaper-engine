@@ -24,6 +24,40 @@ name = "eigen"
 source = "git+https://gitlab.com/libeigen/eigen.git#bc3b39870ecb690a623a3f49149a358b95c5781d"
 
 [[packages]]
+name = "owe-kwe-common"
+version = "0.2.8"
+dependencies = [
+  "owe-core",
+  "rstd-cppstd",
+  "rstd-log",
+  "rstd-std",
+]
+
+[[packages]]
+name = "owe-kwe-scene-renderer"
+version = "0.2.8"
+dependencies = [
+  "owe-core",
+  "owe-kwe-common",
+  "owe-scene",
+  "rstd-cppstd",
+  "rstd-log",
+  "rstd-std",
+]
+
+[[packages]]
+name = "owe-kwe-web-renderer"
+version = "0.2.8"
+dependencies = [
+  "owe-core",
+  "owe-kwe-common",
+  "owe-web",
+  "rstd-cppstd",
+  "rstd-log",
+  "rstd-std",
+]
+
+[[packages]]
 name = "owe-scene"
 version = "0.2.8"
 dependencies = [

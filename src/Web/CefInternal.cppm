@@ -19,6 +19,7 @@ public:
     void SetMuteAudio(bool m) { m_mute_audio = m; }
     void SetSharedTextureEnabled(bool enabled) { m_shared_texture_enabled = enabled; }
     void SetRenderNodeOverride(const std::string& path) { m_render_node_override = path; }
+    void SetNoZygote(bool enabled) { m_no_zygote = enabled; }
 
     CefRefPtr<CefBrowserProcessHandler> GetBrowserProcessHandler() override { return this; }
     CefRefPtr<CefRenderProcessHandler>  GetRenderProcessHandler() override { return this; }
@@ -45,6 +46,7 @@ public:
 private:
     bool                                 m_mute_audio { false };
     bool                                 m_shared_texture_enabled { true };
+    bool                                 m_no_zygote { false };
     std::string                          m_render_node_override;
     int                                  m_next_audio_context_generation { 1 };
     std::unordered_map<const void*, int> m_audio_context_generations;

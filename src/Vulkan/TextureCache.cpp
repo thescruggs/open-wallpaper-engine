@@ -188,7 +188,8 @@ static rstd::uint32_t VkFormatToDrmFourcc(VkFormat fmt) {
 Option<ExImageParameters> CreateExImage(rstd::uint32_t width, rstd::uint32_t height,
                                         VkFormat format, VkImageTiling tiling,
                                         VkSamplerCreateInfo sampler_info, VkImageUsageFlags usage,
-                                        const vvk::Device& device, const vvk::PhysicalDevice& gpu) {
+                                        const vvk::Device& device, const vvk::PhysicalDevice& gpu,
+                                        bool host_visible = false) {
     ExImageParameters image;
     do {
         // Iteration 1a: switch the external handle type from OPAQUE_FD to
@@ -234,10 +235,38 @@ Option<ExImageParameters> CreateExImage(rstd::uint32_t width, rstd::uint32_t hei
 
         image.mem_reqs = device.GetImageMemoryRequirements(*image.handle);
 
-        if (auto opt = AllocateMemory(
+        // host_visible (RenderInitInfo.offscreen_host_visible): prefer true
+        // GTT so a CPU consumer can read the exported dmabuf at cached-memory
+        // speed (an mmap of VRAM reads uncached over the bus). Fall back down
+        // the chain so drivers without an exportable host-visible type still
+        // work — just slower for CPU readers.
+        Option<vvk::DeviceMemory> allocated;
+        if (host_visible) {
+            // 0x8 = VK_MEMORY_PROPERTY_HOST_CACHED_BIT (not re-exported by
+            // the vvk wrapper this TU compiles against).
+            allocated = AllocateMemory(device,
+                                       gpu,
+                                       image.mem_reqs,
+                                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | 0x8,
+                                       &ex_mem_info);
+            if (allocated.is_none()) {
+                allocated = AllocateMemory(device,
+                                           gpu,
+                                           image.mem_reqs,
+                                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+                                           &ex_mem_info);
+            }
+            if (allocated.is_none()) {
+                rstd_warn("[ex-image] no exportable host-visible memory type; "
+                          "falling back to device-local");
+            }
+        }
+        if (allocated.is_none()) {
+            allocated = AllocateMemory(
                 device, gpu, image.mem_reqs, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ex_mem_info);
-            opt.is_some()) {
-            image.mem = rstd::move(opt).unwrap();
+        }
+        if (allocated.is_some()) {
+            image.mem = rstd::move(allocated).unwrap();
         } else
             break;
 
@@ -373,7 +402,7 @@ usize TextureKey::HashValue(const TextureKey& k) {
 }
 
 Option<ExImageParameters> TextureCache::CreateExTex(u32 width, u32 height, VkFormat format,
-                                                    VkImageTiling tiling) {
+                                                    VkImageTiling tiling, bool host_visible) {
     VkSamplerCreateInfo sampler_info {
         .sType                   = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
         .pNext                   = nullptr,
@@ -401,7 +430,8 @@ Option<ExImageParameters> TextureCache::CreateExTex(u32 width, u32 height, VkFor
                              VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                                  VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                              m_device.device(),
-                             m_device.gpu());
+                             m_device.gpu(),
+                             host_visible);
     if (opt.is_some()) {
         AssignImageGeneration(*opt);
         const auto& eximg = *opt;

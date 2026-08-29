@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+# The scene and web renderer workers are no longer Rust crates: they are
+# built from the open-wallpaper-engine C++ workspace (../kwe/SceneRenderer
+# and ../kwe/WebRenderer) and installed under the same `kwe-scene-renderer`
+# / `kwe-web-renderer` binary names the daemon spawns. kwe-cdp and
+# kwe-shader-compiler left with them.
+members = [
+    "crates/kwe-audio-worker",
+    "crates/kwe-core",
+    "crates/kwe-cli",
+    "crates/kwe-daemon",
+    "crates/kwe-frame-protocol",
+    "crates/kwe-input-protocol",
+    "crates/kwe-mpv",
+    "crates/kwe-report-protocol",
+    "crates/kwe-scene-inspector",
+    "crates/kwe-test-renderer",
+    "crates/kwe-video-renderer",
+    "crates/kwe-vulkan",
+]
+
+[workspace.package]
+version = "0.1.0-alpha.1"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/kde-wallpaper-engine/kde-wallpaper-engine"
+rust-version = "1.88"
+
+[workspace.dependencies]
+anyhow = "1.0"
+ash = "0.38"
+cc = "1"
+clap = { version = "4.5", features = ["derive"] }
+hex = "0.4"
+libc = "0.2"
+lz4_flex = "0.14"
+memmap2 = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0"
