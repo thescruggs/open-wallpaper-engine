@@ -19,6 +19,11 @@ constexpr int MaxDurationSeconds = 24 * 60 * 60;
 constexpr int DefaultDurationSeconds = 5 * 60;
 constexpr int MaxTransitionSeconds = 10;
 const QString MigrationFlag = QStringLiteral("playlists/migrated");
+// Bounded, low-rate poll of the daemon's playback session so the UI shows
+// what is playing and when the next change comes. The client serializes and
+// bounds requests; the in-flight guard keeps a daemon outage from queueing
+// one poll per interval.
+constexpr int StatusPollMilliseconds = 3000;
 
 bool isTransition(const QString &value) {
     return value == QStringLiteral("none") || value == QStringLiteral("crossfade");
@@ -69,6 +74,22 @@ PlaylistController::PlaylistController(QString socketPath, QObject *parent)
             refresh(); // re-sync after the queue drained
         emit changed();
     });
+    connect(&m_client, &PlaylistClient::statusReceived, this, &PlaylistController::onStatus);
+    connect(&m_client, &PlaylistClient::statusFailed, this, [this](const QString &) {
+        // Poll failures stay silent (the state banner already covers a
+        // daemon outage); only clear the guard so polling resumes.
+        m_statusInFlight = false;
+    });
+    connect(&m_client, &PlaylistClient::activateFinished, this,
+            [this](bool ok, const QJsonObject &status, const QString &error) {
+                if (ok) {
+                    m_error.clear();
+                    onStatus(status);
+                } else {
+                    m_error = error;
+                }
+                emit changed();
+            });
     connect(&m_client, &PlaylistClient::stateChanged, this, [this] {
         if (m_client.state() == PlaylistClient::Error)
             m_error = m_pendingEdits > 0
@@ -78,8 +99,62 @@ PlaylistController::PlaylistController(QString socketPath, QObject *parent)
             m_error.clear();
         emit changed();
     });
+    m_statusTimer.setInterval(StatusPollMilliseconds);
+    connect(&m_statusTimer, &QTimer::timeout, this, [this] {
+        if (m_statusInFlight || !m_loaded || m_client.state() == PlaylistClient::Loading)
+            return;
+        m_statusInFlight = true;
+        m_client.requestStatus();
+    });
+    m_statusTimer.start();
     refresh();
 }
+
+QString PlaylistController::activeName() const {
+    for (auto it = m_ids.constBegin(); it != m_ids.constEnd(); ++it) {
+        if (it.value() == m_activeId)
+            return it.key();
+    }
+    return {};
+}
+
+void PlaylistController::onStatus(const QJsonObject &status) {
+    m_statusInFlight = false;
+    const bool playing = status.value(QStringLiteral("active")).toBool();
+    const QString activeId = status.value(QStringLiteral("playlist_id")).toString();
+    const auto decision = status.value(QStringLiteral("decision")).toObject();
+    const QString state = decision.value(QStringLiteral("state")).toString();
+    const QString nowPlaying = decision.value(QStringLiteral("wallpaper_id")).toString();
+    const int remaining = decision.contains(QStringLiteral("remaining_ms"))
+        ? int(decision.value(QStringLiteral("remaining_ms")).toDouble() / 1000.0)
+        : -1;
+    QStringList unavailable;
+    for (const auto &value : status.value(QStringLiteral("unavailable_ids")).toArray())
+        unavailable.push_back(value.toString());
+    if (playing == m_playing && activeId == m_activeId && state == m_playbackState
+        && nowPlaying == m_nowPlayingId && remaining == m_remainingSeconds
+        && unavailable == m_unavailableIds)
+        return;
+    m_playing = playing;
+    m_activeId = activeId;
+    m_playbackState = state;
+    m_nowPlayingId = nowPlaying;
+    m_remainingSeconds = remaining;
+    m_unavailableIds = unavailable;
+    emit playbackChanged();
+}
+
+void PlaylistController::play(const QString &name) {
+    const QString id = m_ids.value(name);
+    if (id.isEmpty()) {
+        m_error = tr("Select a valid playlist first.");
+        emit changed();
+        return;
+    }
+    m_client.activatePlaylist(id);
+}
+
+void PlaylistController::stop() { m_client.activatePlaylist(QString()); }
 
 // Reads the pre-M5k QSettings blob with the historical validation rules so a
 // corrupt blob is reported rather than silently migrated. The blob itself is
@@ -309,6 +384,19 @@ void PlaylistController::removeEntry(const QString &name, const QString &worksho
         m_client.putPlaylist(playlistObject(name));
         emit changed();
     }
+}
+
+void PlaylistController::moveEntry(const QString &name, int from, int to) {
+    if (!m_entries.contains(name))
+        return;
+    auto &entries = m_entries[name];
+    if (from < 0 || from >= entries.size() || to < 0 || to >= entries.size() || from == to)
+        return;
+    entries.move(from, to);
+    m_error.clear();
+    ++m_pendingEdits;
+    m_client.putPlaylist(playlistObject(name));
+    emit changed();
 }
 
 void PlaylistController::setShuffle(const QString &name, bool value) {

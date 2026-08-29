@@ -19,6 +19,10 @@ qt_add_executable(kwe-manager
     src/playlistclient.h
     src/issuereporter.cpp
     src/issuereporter.h
+    src/rendererdefaults.cpp
+    src/rendererdefaults.h
+    src/settingsclient.cpp
+    src/settingsclient.h
 )
 
 # WallpaperSelection is a pragma Singleton; the generated qmldir must
@@ -57,6 +61,8 @@ qt_add_qml_module(kwe-manager
     QML_FILES
         qml/Main.qml
         qml/GalleryPage.qml
+        qml/PlaylistPanel.qml
+        qml/SettingsPage.qml
         qml/WallpaperCard.qml
         qml/WallpaperDetail.qml
         qml/WallpaperSelection.qml

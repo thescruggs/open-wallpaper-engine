@@ -53,7 +53,8 @@ ExImageParameters::ExImageParameters(ExImageParameters&& o) noexcept
       drm_fourcc(o.drm_fourcc),
       drm_modifier(o.drm_modifier),
       plane0_offset(o.plane0_offset),
-      plane0_stride(o.plane0_stride) {}
+      plane0_stride(o.plane0_stride),
+      host_map(std::exchange(o.host_map, nullptr)) {}
 ExImageParameters& ExImageParameters::operator=(ExImageParameters&& o) noexcept {
     mem           = std::move(o.mem);
     mem_reqs      = o.mem_reqs;
@@ -68,6 +69,7 @@ ExImageParameters& ExImageParameters::operator=(ExImageParameters&& o) noexcept 
     drm_modifier  = o.drm_modifier;
     plane0_offset = o.plane0_offset;
     plane0_stride = o.plane0_stride;
+    host_map      = std::exchange(o.host_map, nullptr);
     return *this;
 }
 

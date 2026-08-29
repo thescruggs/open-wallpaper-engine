@@ -33,6 +33,22 @@ qt_add_executable(kwe-playlist-controller-test
 target_link_libraries(kwe-playlist-controller-test PRIVATE Qt6::Core Qt6::Network Qt6::Test)
 add_test(NAME kwe-playlist-controller-test COMMAND kwe-playlist-controller-test)
 
+qt_add_executable(kwe-settings-client-test
+    settingsclienttest.cpp
+    ../src/settingsclient.cpp
+    ../src/settingsclient.h
+)
+target_link_libraries(kwe-settings-client-test PRIVATE Qt6::Core Qt6::Network Qt6::Test)
+add_test(NAME kwe-settings-client-test COMMAND kwe-settings-client-test)
+
+qt_add_executable(kwe-renderer-defaults-test
+    rendererdefaultstest.cpp
+    ../src/rendererdefaults.cpp
+    ../src/rendererdefaults.h
+)
+target_link_libraries(kwe-renderer-defaults-test PRIVATE Qt6::Core Qt6::Test)
+add_test(NAME kwe-renderer-defaults-test COMMAND kwe-renderer-defaults-test)
+
 qt_add_executable(kwe-permissions-client-test
     permissionsclienttest.cpp
     ../src/permissionsclient.cpp

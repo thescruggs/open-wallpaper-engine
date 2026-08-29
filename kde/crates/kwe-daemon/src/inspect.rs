@@ -211,7 +211,7 @@ fn run_inspection_traced(config: &InspectConfig, input: &Path) -> (Value, Option
         // The inspector never needs XDG_RUNTIME_DIR (that is web-renderer
         // only in env_allowlist); RendererKind::Scene picks the same
         // {HOME, PATH}-only allowlist every non-web kind gets.
-        .envs(env_allowlist(RendererKind::Scene, &home_dir));
+        .envs(env_allowlist(RendererKind::Scene, &home_dir, false));
 
     let resource_limits = config.resource_limits;
     // SAFETY: this closure runs in the child after fork and before exec,

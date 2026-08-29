@@ -239,6 +239,11 @@ struct ExHandle {
     rstd::uint64_t drm_modifier { 0 };
     VkDeviceSize   plane0_offset { 0 };
     rstd::uint32_t plane0_stride { 0 };
+    // Same-process fast path: the exporting allocation's cached vkMapMemory
+    // pointer when the memory is host-visible (see
+    // ExImageParameters::host_map); null for cross-process handles (the fd
+    // is the only transportable reference) and for device-local memory.
+    rstd::uint8_t* host_ptr { nullptr };
 
     ExHandle() = default;
     ExHandle(int id): m_id(id) {};
@@ -493,6 +498,13 @@ struct ExImageParameters : NoCopy {
     rstd::uint64_t drm_modifier { 0 };
     VkDeviceSize   plane0_offset { 0 };
     rstd::uint32_t plane0_stride { 0 };
+    // Cached CPU mapping of the backing memory when it is host-visible
+    // (vkMapMemory, valid until `mem` is freed). In-process consumers must
+    // read frames through this instead of mmap()ing the exported dmabuf:
+    // at least NVIDIA's dmabuf mmap degrades to uncached reads for row
+    // pitches over 8 KiB (~12 MB/s — the "scene lags at widths > 2048"
+    // failure), while this mapping reads at cached-memory speed.
+    rstd::uint8_t* host_map { nullptr };
 
     ExImageParameters();
     ~ExImageParameters();
@@ -1201,6 +1213,7 @@ public:
             handle.drm_modifier  = h.image.drm_modifier;
             handle.plane0_offset = h.image.plane0_offset;
             handle.plane0_stride = h.image.plane0_stride;
+            handle.host_ptr      = h.image.host_map;
         }
         m_presented  = &m_handles[usize()].handle;
         m_ready      = &m_handles[usize(1)].handle;

@@ -63,6 +63,10 @@ public:
     QHash<int, QByteArray> roleNames() const override;
     void replaceFromCatalog(const QJsonObject &catalog);
     Q_INVOKABLE void toggleFavorite(const QString &workshopId);
+    // Lookup for views that hold bare workshop ids (playlist entries):
+    // returns found/title/kind/previewUrl; a missing id keeps the id as the
+    // title so stale entries stay identifiable.
+    Q_INVOKABLE QVariantMap itemById(const QString &workshopId) const;
     bool isFavorite(const QString &workshopId) const;
 
     int sceneCount() const { return m_sceneCount; }

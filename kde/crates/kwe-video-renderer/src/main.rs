@@ -152,6 +152,11 @@ struct Arguments {
     /// may omit it.
     #[arg(long, required_unless_present = "probe")]
     content: Option<PathBuf>,
+    /// Disable the audio track entirely (global wallpaper-audio setting;
+    /// the daemon passes this while audio output is disabled). Without it
+    /// mpv plays the video's own audio.
+    #[arg(long)]
+    mute: bool,
     /// Stall before creating the frame mapping (supervisor startup test).
     #[arg(long)]
     startup_hang: bool,
@@ -417,7 +422,7 @@ extern "C" fn on_render_update(context: *mut c_void) {
 }
 
 impl MpvSession {
-    fn create(hwdec: &str, spec: FrameSpec, scaling: &str) -> Result<Self> {
+    fn create(hwdec: &str, spec: FrameSpec, scaling: &str, mute: bool) -> Result<Self> {
         // SAFETY: mpv_create returns a valid handle or NULL (no preconditions).
         let handle = unsafe { mpv_ffi::mpv_create() };
         if handle.is_null() {
@@ -441,6 +446,12 @@ impl MpvSession {
             ("cache", "yes"),
         ] {
             session.set_option(name, value)?;
+        }
+        // Global wallpaper-audio setting: `audio=no` selects no audio track
+        // at all, so a muted wallpaper builds no audio pipeline (no sink
+        // input, no decode cost) instead of playing at volume zero.
+        if mute {
+            session.set_option("audio", "no")?;
         }
         // F1 scaling: mpv's video→canvas mapping. `aspect` is mpv's default
         // (fit + letterbox). `fill` pans-and-scans to cover the canvas,
@@ -855,7 +866,12 @@ impl VideoWorker {
     fn run_playback(&mut self, hwdec: &str) -> Result<Playback> {
         // Session creation happens here so the hwdec=no retry gets a fresh
         // handle (mpv can be initialized only once per handle).
-        let mut session = MpvSession::create(hwdec, self.spec, &self.arguments.scaling)?;
+        let mut session = MpvSession::create(
+            hwdec,
+            self.spec,
+            &self.arguments.scaling,
+            self.arguments.mute,
+        )?;
         session.initialize()?;
         session.load_file(&self.content)?;
         // The duration bound is per-file, so both decode attempts reject an

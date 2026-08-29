@@ -24,6 +24,10 @@ public:
     QList<QJsonObject> stored; // playlist.put payloads received
     QJsonArray imported; // playlist.import payloads received
     bool failList = false;
+    // playlist.activate/status: last activated id (isNull = deactivated) and
+    // the session status the stub reports back.
+    QJsonValue activatedId;
+    QJsonObject sessionStatus{{QStringLiteral("active"), false}};
 
 private:
     QLocalServer m_server;
@@ -73,6 +77,15 @@ private:
                     imported = params.value(QStringLiteral("playlists")).toArray();
                     result.insert(QStringLiteral("imported"), imported.size());
                     result.insert(QStringLiteral("rejected"), 0);
+                } else if (method == QStringLiteral("playlist.activate")) {
+                    activatedId = params.value(QStringLiteral("id"));
+                    sessionStatus.insert(QStringLiteral("active"), !activatedId.isNull());
+                    sessionStatus.insert(QStringLiteral("playlist_id"), activatedId);
+                    if (activatedId.isNull())
+                        sessionStatus.remove(QStringLiteral("decision"));
+                    result = sessionStatus;
+                } else if (method == QStringLiteral("playlist.status")) {
+                    result = sessionStatus;
                 }
                 const auto response = QJsonDocument(QJsonObject{
                     {QStringLiteral("version"), 1},
@@ -109,6 +122,8 @@ private slots:
         m_daemon.stored.clear();
         m_daemon.imported = {};
         m_daemon.failList = false;
+        m_daemon.activatedId = {};
+        m_daemon.sessionStatus = QJsonObject{{QStringLiteral("active"), false}};
     }
 
     void createAndEditReachTheDaemon() {
@@ -144,6 +159,76 @@ private slots:
         controller.remove(QStringLiteral("Morning"));
         QCOMPARE(controller.names(), QStringList{});
         QTRY_VERIFY(m_daemon.stored.isEmpty());
+    }
+
+    void moveEntryReordersAndPersists() {
+        PlaylistController controller(m_socketPath);
+        QSignalSpy changedSpy(&controller, &PlaylistController::changed);
+        QTRY_VERIFY(changedSpy.count() >= 1);
+        controller.create(QStringLiteral("Ordered"));
+        controller.add(QStringLiteral("Ordered"), QStringLiteral("one"));
+        controller.add(QStringLiteral("Ordered"), QStringLiteral("two"));
+        controller.add(QStringLiteral("Ordered"), QStringLiteral("three"));
+
+        controller.moveEntry(QStringLiteral("Ordered"), 0, 2);
+        const QStringList reordered{QStringLiteral("two"), QStringLiteral("three"),
+                                    QStringLiteral("one")};
+        QCOMPARE(controller.entries(QStringLiteral("Ordered")), reordered);
+
+        // Out-of-range and no-op moves change nothing.
+        controller.moveEntry(QStringLiteral("Ordered"), 2, 3);
+        controller.moveEntry(QStringLiteral("Ordered"), -1, 0);
+        controller.moveEntry(QStringLiteral("Ordered"), 1, 1);
+        QCOMPARE(controller.entries(QStringLiteral("Ordered")), reordered);
+
+        const auto persistedMatches = [this, &reordered] {
+            if (m_daemon.stored.size() != 1)
+                return false;
+            const auto entries = m_daemon.stored.first().value(QStringLiteral("entries")).toArray();
+            QStringList persisted;
+            for (const auto &entry : entries)
+                persisted.push_back(entry.toString());
+            return persisted == reordered;
+        };
+        QTRY_VERIFY(persistedMatches());
+    }
+
+    void playAndStopDriveTheDaemonSession() {
+        PlaylistController controller(m_socketPath);
+        QSignalSpy changedSpy(&controller, &PlaylistController::changed);
+        QTRY_VERIFY(changedSpy.count() >= 1);
+        controller.create(QStringLiteral("Day"));
+        controller.add(QStringLiteral("Day"), QStringLiteral("123"));
+
+        // The stub answers activate with a running session and a decision.
+        m_daemon.sessionStatus = QJsonObject{
+            {QStringLiteral("decision"),
+             QJsonObject{{QStringLiteral("state"), QStringLiteral("waiting")},
+                         {QStringLiteral("wallpaper_id"), QStringLiteral("123")},
+                         {QStringLiteral("index"), 0},
+                         {QStringLiteral("remaining_ms"), 90000}}},
+            {QStringLiteral("unavailable_ids"), QJsonArray{QStringLiteral("999")}},
+        };
+        QSignalSpy playbackSpy(&controller, &PlaylistController::playbackChanged);
+        controller.play(QStringLiteral("Day"));
+        QTRY_COMPARE(m_daemon.activatedId.toString(), QStringLiteral("Day"));
+        QTRY_VERIFY(playbackSpy.count() >= 1);
+        QVERIFY(controller.playing());
+        QCOMPARE(controller.activeName(), QStringLiteral("Day"));
+        QCOMPARE(controller.nowPlayingId(), QStringLiteral("123"));
+        QCOMPARE(controller.remainingSeconds(), 90);
+        QCOMPARE(controller.playbackState(), QStringLiteral("waiting"));
+        QCOMPARE(controller.unavailableIds(), QStringList{QStringLiteral("999")});
+
+        controller.stop();
+        QTRY_VERIFY(m_daemon.activatedId.isNull());
+        QTRY_VERIFY(!controller.playing());
+        QCOMPARE(controller.activeName(), QString{});
+
+        // A playlist unknown to the controller is rejected locally.
+        controller.play(QStringLiteral("Nope"));
+        QVERIFY(!controller.errorMessage().isEmpty());
+        QVERIFY(m_daemon.activatedId.isNull());
     }
 
     void rejectsInvalidInputWithoutChangingState() {

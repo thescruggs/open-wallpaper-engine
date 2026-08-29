@@ -188,6 +188,11 @@ Kirigami.Page {
             contentItem: ColumnLayout {
                 spacing: Kirigami.Units.smallSpacing
 
+                PlaylistPanel {
+                    Layout.fillWidth: true
+                    playlistName: playlistSelector.currentText
+                }
+
                 Flow {
                     Layout.fillWidth: true
                     Layout.preferredHeight: childrenRect.height

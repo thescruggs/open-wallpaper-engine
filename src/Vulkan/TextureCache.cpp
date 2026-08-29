@@ -241,6 +241,7 @@ Option<ExImageParameters> CreateExImage(rstd::uint32_t width, rstd::uint32_t hei
         // the chain so drivers without an exportable host-visible type still
         // work — just slower for CPU readers.
         Option<vvk::DeviceMemory> allocated;
+        bool                      host_visible_selected = false;
         if (host_visible) {
             // 0x8 = VK_MEMORY_PROPERTY_HOST_CACHED_BIT (not re-exported by
             // the vvk wrapper this TU compiles against).
@@ -259,6 +260,8 @@ Option<ExImageParameters> CreateExImage(rstd::uint32_t width, rstd::uint32_t hei
             if (allocated.is_none()) {
                 rstd_warn("[ex-image] no exportable host-visible memory type; "
                           "falling back to device-local");
+            } else {
+                host_visible_selected = true;
             }
         }
         if (allocated.is_none()) {
@@ -305,6 +308,20 @@ Option<ExImageParameters> CreateExImage(rstd::uint32_t width, rstd::uint32_t hei
         image.plane0_stride        = static_cast<rstd::uint32_t>(layout.rowPitch);
         image.drm_modifier         = 0; // DRM_FORMAT_MOD_LINEAR
         image.drm_fourcc           = VkFormatToDrmFourcc(format);
+
+        // Keep a persistent cached CPU mapping for in-process readers (see
+        // ExImageParameters::host_map). vkFreeMemory implicitly unmaps, so
+        // the mapping shares the memory's lifetime. Best-effort: a failed
+        // map only loses the fast path, never the image.
+        if (host_visible_selected) {
+            rstd::uint8_t* mapped = nullptr;
+            if (image.mem.Map(0, VK_WHOLE_SIZE, &mapped) == VK_SUCCESS) {
+                image.host_map = mapped;
+            } else {
+                rstd_warn("[ex-image] host-visible memory map failed; "
+                          "consumers fall back to the dmabuf mmap");
+            }
+        }
 
         return Some(rstd::move(image));
 

@@ -28,6 +28,7 @@ use crate::grants::{Grant, GrantPatch, GrantStore};
 #[cfg(test)]
 use crate::persist::unix_nanos;
 use crate::persist::{atomic_write, ensure_private_dir, unix_seconds};
+use crate::settings::SettingsStore;
 use anyhow::{Context, Result, anyhow, bail};
 use kwe_core::{preflight_scene, preflight_video, preflight_web};
 use kwe_frame_protocol::{FrameSnapshot, FrameSpec, ProtocolError, SharedFrameReader};
@@ -725,6 +726,8 @@ enum ControlCommand {
         reply: mpsc::Sender<Result<Grant>>,
     },
     PermissionsList(mpsc::Sender<Result<BTreeMap<String, Grant>>>),
+    AudioOutputGet(mpsc::Sender<Result<bool>>),
+    AudioOutputSet(bool, mpsc::Sender<Result<bool>>),
     QuarantinedIds(mpsc::Sender<BTreeSet<String>>),
     Shutdown,
 }
@@ -806,6 +809,14 @@ impl SupervisorHandle {
     }
 
     /// Every stored grant record (bounded by `MAX_GRANTS`).
+    pub fn audio_output_get(&self) -> Result<bool> {
+        self.request_value(ControlCommand::AudioOutputGet)
+    }
+
+    pub fn audio_output_set(&self, enabled: bool) -> Result<bool> {
+        self.request_value(|reply| ControlCommand::AudioOutputSet(enabled, reply))
+    }
+
     pub fn permissions_list(&self) -> Result<BTreeMap<String, Grant>> {
         self.request_value(ControlCommand::PermissionsList)
     }
@@ -863,11 +874,13 @@ impl SupervisorService {
         let build_id = build_identity(&config);
         let (store, state) = StateStore::open_for_build(config.state_dir.clone(), &build_id)?;
         let grant_store = GrantStore::open(&config.state_dir)?;
+        let settings_store = SettingsStore::open(&config.state_dir)?;
         let (sender, receiver) = mpsc::sync_channel(COMMAND_CAPACITY);
         let thread = thread::Builder::new()
             .name("kwe-renderer-supervisor".into())
             .spawn(move || {
-                SupervisorRuntime::new(config, store, state, grant_store).run(receiver)
+                SupervisorRuntime::new(config, store, state, grant_store, settings_store)
+                    .run(receiver)
             })?;
         Ok(Self {
             handle: SupervisorHandle { sender },
@@ -941,6 +954,11 @@ struct SupervisorRuntime {
     /// gates `audio.forward` delivery. Grants re-read per spawn, so a
     /// revocation takes effect on the next `renderer.start`.
     grant_store: GrantStore,
+    /// Daemon-global wallpaper settings. `audio_output` is re-read per spawn
+    /// (like grants), so disabling it appends `--mute` to the next video or
+    /// scene launch; the settings.set RPC also respawns the live worker so
+    /// the toggle is immediate.
+    settings_store: SettingsStore,
     /// Lifetime count of frames dropped because the active wallpaper lacks
     /// the audio grant; surfaced through `WorkerStatus::audio_grant_dropped`.
     audio_grant_dropped: u64,
@@ -962,12 +980,14 @@ impl SupervisorRuntime {
         store: StateStore,
         persisted: PersistedState,
         grant_store: GrantStore,
+        settings_store: SettingsStore,
     ) -> Self {
         Self {
             config,
             store,
             persisted,
             grant_store,
+            settings_store,
             audio_grant_dropped: 0,
             active: None,
             candidate: None,
@@ -1045,6 +1065,13 @@ impl SupervisorRuntime {
                 Ok(ControlCommand::PermissionsList(reply)) => {
                     let _ = reply.send(Ok(self.grant_store.all().clone()));
                 }
+                Ok(ControlCommand::AudioOutputGet(reply)) => {
+                    let _ = reply.send(Ok(self.settings_store.audio_output()));
+                }
+                Ok(ControlCommand::AudioOutputSet(enabled, reply)) => {
+                    let result = self.set_audio_output(enabled);
+                    let _ = reply.send(result);
+                }
                 Ok(ControlCommand::QuarantinedIds(reply)) => {
                     let ids = self
                         .persisted
@@ -1063,6 +1090,28 @@ impl SupervisorRuntime {
             }
             self.tick();
         }
+    }
+
+    /// Persists the global audio-output setting and, when it changed,
+    /// respawns the live video/scene worker so the toggle takes effect
+    /// immediately (`--mute` is decided in the spawn argv). A respawn
+    /// blocked by a pending display handoff is deferred — the setting is
+    /// already persisted and the next launch honors it. Returns the
+    /// effective value.
+    fn set_audio_output(&mut self, enabled: bool) -> Result<bool> {
+        let changed = self.settings_store.set_audio_output(enabled)?;
+        if changed
+            && let Some(spec) = self.requested.clone()
+            && matches!(spec.kind, RendererKind::Video | RendererKind::Scene)
+            && !matches!(
+                self.phase,
+                WorkerPhase::Idle | WorkerPhase::Stopped | WorkerPhase::Quarantined
+            )
+            && let Err(error) = self.start_selected(spec, false)
+        {
+            eprintln!("event=settings.audio_respawn_deferred detail={error}");
+        }
+        Ok(self.settings_store.audio_output())
     }
 
     fn start_selected(&mut self, spec: StartSpec, clear_failure: bool) -> Result<WorkerStatus> {
@@ -1186,6 +1235,16 @@ impl SupervisorRuntime {
             .arg(spec.fps.to_string())
             .arg("--scaling")
             .arg(spec.scaling.as_str());
+        // Global wallpaper-audio setting (settings-v1.json, re-read per
+        // spawn like grants): while audio output is disabled, video and
+        // scene workers launch muted. Web workers are always muted by
+        // their own policy and the test kind has no audio path, so
+        // neither receives the flag.
+        if matches!(spec.kind, RendererKind::Video | RendererKind::Scene)
+            && !self.settings_store.audio_output()
+        {
+            command.arg("--mute");
+        }
         if let Some(content) = &spec.content {
             let path = match content {
                 ContentSpec::Video { path } | ContentSpec::Scene { path } => path,
@@ -1233,7 +1292,11 @@ impl SupervisorRuntime {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env_clear()
-            .envs(env_allowlist(spec.kind, &home_dir));
+            .envs(env_allowlist(
+                spec.kind,
+                &home_dir,
+                self.settings_store.audio_output(),
+            ));
         // OWE scene workers compile scene shaders on load; a persistent
         // cache directory (the per-launch HOME is wiped on reap) keeps
         // restarts from paying the full compile again.
@@ -2205,9 +2268,16 @@ fn flush_pending(
 /// Chromium treats the variable as unset, falling back to its tmpfs
 /// profile — a harmless no-op today, kept so the value rides along once
 /// grants bind it in (M2c). It is deliberately not granted to the
-/// video/scene/test kinds.
-pub(crate) fn env_allowlist(kind: RendererKind, home: &Path) -> Vec<(String, String)> {
-    env_allowlist_with_runtime(kind, home, std::env::var_os("XDG_RUNTIME_DIR"))
+/// test kind; video receives it only while the global audio-output
+/// setting is enabled (libmpv needs the PipeWire socket to play the
+/// video's own audio — without the variable a video worker is silent
+/// no matter what mpv selects).
+pub(crate) fn env_allowlist(
+    kind: RendererKind,
+    home: &Path,
+    video_audio: bool,
+) -> Vec<(String, String)> {
+    env_allowlist_with_runtime(kind, home, video_audio, std::env::var_os("XDG_RUNTIME_DIR"))
 }
 
 /// Every renderer HOME is a daemon-created 0700 directory. Remove it after
@@ -2242,6 +2312,7 @@ pub(crate) fn cleanup_renderer_home(home: &Path) {
 fn env_allowlist_with_runtime(
     kind: RendererKind,
     home: &Path,
+    video_audio: bool,
     runtime_dir: Option<OsString>,
 ) -> Vec<(String, String)> {
     let mut entries = vec![
@@ -2250,10 +2321,13 @@ fn env_allowlist_with_runtime(
     ];
     // OWE backend: web (Chromium/CEF) and scene (the engine's PipeWire
     // audio output and audio-response capture) both need the session
-    // runtime dir; test and video deliberately still do not get it.
-    if matches!(kind, RendererKind::Web | RendererKind::Scene)
-        && let Some(runtime) = runtime_dir
-    {
+    // runtime dir; the test kind deliberately does not get it. Video gets
+    // it only while the global audio-output setting is enabled — least
+    // privilege: a muted video worker has no reason to see the session
+    // runtime dir at all.
+    let grants_runtime = matches!(kind, RendererKind::Web | RendererKind::Scene)
+        || (kind == RendererKind::Video && video_audio);
+    if grants_runtime && let Some(runtime) = runtime_dir {
         entries.push((
             "XDG_RUNTIME_DIR".to_string(),
             runtime.to_string_lossy().into_owned(),
@@ -2814,17 +2888,47 @@ mod tests {
             ("HOME".to_string(), home.to_string_lossy().into_owned()),
             ("PATH".to_string(), "/usr/bin:/usr/sbin:/bin".to_string()),
         ];
-        for kind in [RendererKind::Test, RendererKind::Video] {
+        // Test never inherits the runtime dir; video only while the global
+        // audio-output setting is enabled (libmpv needs the PipeWire socket).
+        for video_audio in [false, true] {
             assert_eq!(
-                env_allowlist_with_runtime(kind, home, Some("/run/user/1000".into())),
+                env_allowlist_with_runtime(
+                    RendererKind::Test,
+                    home,
+                    video_audio,
+                    Some("/run/user/1000".into())
+                ),
                 expected_base,
-                "kind {} must not inherit XDG_RUNTIME_DIR",
-                kind.as_str()
+                "the test kind must never inherit XDG_RUNTIME_DIR"
             );
         }
+        assert_eq!(
+            env_allowlist_with_runtime(
+                RendererKind::Video,
+                home,
+                false,
+                Some("/run/user/1000".into())
+            ),
+            expected_base,
+            "a muted video worker must not inherit XDG_RUNTIME_DIR"
+        );
+        let video_loud = env_allowlist_with_runtime(
+            RendererKind::Video,
+            home,
+            true,
+            Some("/run/user/1000".into()),
+        );
+        assert!(
+            video_loud.contains(&("XDG_RUNTIME_DIR".to_string(), "/run/user/1000".to_string())),
+            "a loud video worker inherits the runtime dir for PipeWire"
+        );
         for kind in [RendererKind::Web, RendererKind::Scene] {
-            assert_eq!(env_allowlist_with_runtime(kind, home, None), expected_base);
-            let granted = env_allowlist_with_runtime(kind, home, Some("/run/user/1000".into()));
+            assert_eq!(
+                env_allowlist_with_runtime(kind, home, false, None),
+                expected_base
+            );
+            let granted =
+                env_allowlist_with_runtime(kind, home, false, Some("/run/user/1000".into()));
             assert_eq!(
                 granted.len(),
                 3,
@@ -2861,6 +2965,7 @@ mod tests {
             store,
             state,
             GrantStore::open(&root.join("state")).unwrap(),
+            SettingsStore::open(&root.join("state")).unwrap(),
         );
         let spec = StartSpec {
             wallpaper_id: "431960-123".into(),
@@ -2945,6 +3050,7 @@ mod tests {
                 store,
                 state,
                 GrantStore::open(&root.join("state")).unwrap(),
+                SettingsStore::open(&root.join("state")).unwrap(),
             );
             let spec = StartSpec {
                 wallpaper_id: "431960-123".into(),
@@ -2999,6 +3105,7 @@ mod tests {
             store,
             state,
             GrantStore::open(&root.join("state")).unwrap(),
+            SettingsStore::open(&root.join("state")).unwrap(),
         );
         let base = StartSpec {
             wallpaper_id: "431960-123".into(),
@@ -3166,6 +3273,7 @@ mod tests {
             store,
             state,
             GrantStore::open(&root.join("state")).unwrap(),
+            SettingsStore::open(&root.join("state")).unwrap(),
         );
         let spec = StartSpec {
             wallpaper_id: "431960-123".into(),
@@ -3383,7 +3491,13 @@ mod tests {
             )
             .unwrap();
         let (store, state) = StateStore::open(root.join("state")).unwrap();
-        let mut runtime = SupervisorRuntime::new(config, store, state, grant_store);
+        let mut runtime = SupervisorRuntime::new(
+            config,
+            store,
+            state,
+            grant_store,
+            SettingsStore::open(&root.join("state")).unwrap(),
+        );
         let spec = StartSpec {
             wallpaper_id: "431960-123".into(),
             content_hash: "abc123".into(),
@@ -3443,6 +3557,94 @@ mod tests {
     }
 
     #[test]
+    fn audio_output_setting_mutes_video_and_scene_spawns_but_never_web() {
+        let root = temporary_directory("audio-output-argv");
+        fs::create_dir_all(&root).unwrap();
+        let script = root.join("renderer");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$HOME/argv.txt\"\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = validated_config(&root);
+        config.renderer_paths = BTreeMap::from([
+            (RendererKind::Video, script.clone()),
+            (RendererKind::Web, script.clone()),
+        ]);
+        let config = config.validate().unwrap();
+        let mut settings_store = SettingsStore::open(&root.join("state")).unwrap();
+        settings_store.set_audio_output(false).unwrap();
+        let (store, state) = StateStore::open(root.join("state")).unwrap();
+        let mut runtime = SupervisorRuntime::new(
+            config,
+            store,
+            state,
+            GrantStore::open(&root.join("state")).unwrap(),
+            settings_store,
+        );
+        let spec = StartSpec {
+            wallpaper_id: "431960-123".into(),
+            content_hash: "abc123".into(),
+            width: 160,
+            height: 90,
+            fps: 30,
+            kind: RendererKind::Video,
+            content: Some(ContentSpec::Video {
+                path: script.clone(),
+            }),
+            test_fault: None,
+            stderr_lines: None,
+            scaling: ScalingMode::Aspect,
+            capability_limitations: Vec::new(),
+        };
+        let read_argv = |home: &Path| {
+            let path = home.join("argv.txt");
+            for _ in 0..200 {
+                if let Ok(argv) = fs::read_to_string(&path) {
+                    return argv;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            panic!(
+                "fake renderer never recorded its argv at {}",
+                path.display()
+            );
+        };
+        // Disabled: the video worker launches with --mute.
+        let mut worker = runtime.spawn_worker(spec.clone()).unwrap();
+        let argv = read_argv(&root.join("runtime/home-1"));
+        assert!(
+            argv.contains("--mute"),
+            "audio-output disabled must mute a video spawn: {argv}"
+        );
+        let _ = inspect_worker(&mut worker, &runtime.config);
+        // A web worker never receives the flag (always muted by policy).
+        let web_spec = StartSpec {
+            kind: RendererKind::Web,
+            content: Some(ContentSpec::Web { root: root.clone() }),
+            ..spec.clone()
+        };
+        let mut worker = runtime.spawn_worker(web_spec).unwrap();
+        let argv = read_argv(&root.join("runtime/home-2"));
+        assert!(
+            !argv.contains("--mute"),
+            "a web spawn must not carry --mute: {argv}"
+        );
+        let _ = inspect_worker(&mut worker, &runtime.config);
+        // Re-enabled (the per-spawn re-read): the next video launch is loud.
+        runtime.settings_store.set_audio_output(true).unwrap();
+        let mut worker = runtime.spawn_worker(spec).unwrap();
+        let argv = read_argv(&root.join("runtime/home-3"));
+        assert!(
+            !argv.contains("--mute"),
+            "audio-output enabled must not mute a video spawn: {argv}"
+        );
+        let _ = inspect_worker(&mut worker, &runtime.config);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn audio_frames_drop_latest_wins_without_the_audio_grant_and_deliver_with_it() {
         use std::os::fd::OwnedFd;
         use std::os::unix::io::FromRawFd;
@@ -3455,6 +3657,7 @@ mod tests {
             store,
             state,
             GrantStore::open(&root.join("state")).unwrap(),
+            SettingsStore::open(&root.join("state")).unwrap(),
         );
         runtime.display_generation = 1;
         // Synthetic worker with real pipe ends (mirrors the ack-ceiling test).
@@ -3579,6 +3782,7 @@ mod tests {
             store,
             state,
             GrantStore::open(&root.join("state")).unwrap(),
+            SettingsStore::open(&root.join("state")).unwrap(),
         )
     }
 

@@ -30,6 +30,10 @@ public:
     void importLegacy(const QJsonArray &playlists);
     void putPlaylist(const QJsonObject &playlist);
     void removePlaylist(const QString &id);
+    // Starts playback of the playlist with the given daemon id; an empty id
+    // deactivates the session (stop).
+    void activatePlaylist(const QString &id);
+    void requestStatus();
 
 signals:
     void stateChanged();
@@ -38,6 +42,9 @@ signals:
     void importFinished(bool ok, int imported, int rejected, const QString &error);
     void putFinished(bool ok, const QString &error);
     void removeFinished(bool ok, const QString &error);
+    void activateFinished(bool ok, const QJsonObject &status, const QString &error);
+    void statusReceived(const QJsonObject &status);
+    void statusFailed(const QString &error);
 
 private:
     struct Pending {

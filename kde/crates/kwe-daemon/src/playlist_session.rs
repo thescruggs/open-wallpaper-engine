@@ -573,6 +573,9 @@ impl SessionRuntime {
     ///   the session too;
     /// * the session displaces its OWN stale renderer on an entry change
     ///   (the timer advanced: the old entry's renderer must go, hard cut);
+    ///   the renderer live at activation counts as the session's own (the
+    ///   activation takeover, `seed_activation_takeover`), so pressing
+    ///   Play displaces the wallpaper applied before it;
     /// * a user/manager apply wins: when a DIFFERENT, foreign renderer is
     ///   live (Starting/Canary/Live/AwaitingAck/Restarting/RolledBack),
     ///   the session yields — it never fights the user's choice — and
@@ -786,6 +789,30 @@ impl SessionRuntime {
         self.applied_wallpaper = None;
         self.reset_backoff();
         self.gate_refused_ids.clear();
+    }
+
+    /// Activation takeover: activation is an explicit user action, so the
+    /// renderer live at that moment — typically the wallpaper the user
+    /// applied BEFORE pressing Play — belongs to the session now. Without
+    /// this, the verdict classifies that renderer as a foreign user apply
+    /// and yields to it forever: the playlist ticks but the display never
+    /// changes. Recording it as the session's own applied identity routes
+    /// the first decision through the existing own-stale-renderer
+    /// displacement instead. A user apply that lands AFTER activation
+    /// still wins — it no longer matches the recorded identity, so the
+    /// foreign-renderer yield applies to it unchanged.
+    fn seed_activation_takeover(&mut self) {
+        let Some(supervisor) = &self.supervisor else {
+            return;
+        };
+        // A status error keeps the pre-takeover behavior (yield): failing
+        // open here could displace a renderer the user just started.
+        let Ok(status) = supervisor.status() else {
+            return;
+        };
+        if let Some(takeover) = takeover_identity(&status) {
+            self.applied_wallpaper = Some(takeover);
+        }
     }
 
     /// Persists the active runtime's snapshot if the given decision changed
@@ -1032,10 +1059,18 @@ impl SessionRuntime {
         let Some(playlist) = self.playlists.iter().find(|p| p.id == id).cloned() else {
             return Err(SessionError::NotFound(id));
         };
-        if self.active.as_deref() != Some(&id) {
+        if self.active.as_deref() == Some(&id) {
+            // Re-activating the running playlist re-asserts it over a
+            // foreign renderer the session may have yielded to, without
+            // disturbing the running timer.
+            self.seed_activation_takeover();
+            return Ok(self.status());
+        }
+        {
             // A different (or fresh) active session starts its apply state
             // clean: the new entry's first decision applies immediately.
             self.reset_apply();
+            self.seed_activation_takeover();
             let unavailable = self.unavailable_for(&playlist);
             let now_ms = self.now_ms();
             let (decision, snapshot) = {
@@ -1290,6 +1325,19 @@ pub(crate) fn foreign_renderer_live(
     phase_has_live_worker(status.phase)
         && status.requested_wallpaper_id.as_deref() != Some(desired)
         && status.requested_wallpaper_id.as_deref() != applied
+}
+
+/// The renderer identity an activation takes over (see
+/// `seed_activation_takeover`): the requested wallpaper of a live-phase
+/// worker; None when nothing is live (or the live worker has no request —
+/// nothing to take over). Pure so the takeover rule is unit-testable with
+/// fabricated worker state.
+fn takeover_identity(status: &WorkerStatus) -> Option<String> {
+    if phase_has_live_worker(status.phase) {
+        status.requested_wallpaper_id.clone()
+    } else {
+        None
+    }
 }
 
 /// Exponential backoff between playlist apply attempts: 1 s doubling to a
@@ -2175,6 +2223,84 @@ mod tests {
             apply_verdict(None, "1", &idle, false),
             ApplyVerdict::Hold,
             "a closed backoff gate must not apply for a fresh entry either"
+        );
+    }
+
+    #[test]
+    fn activation_takes_over_the_live_renderer() {
+        // The wallpaper the user applied before pressing Play: every live
+        // phase is taken over, so the session's first decision displaces it
+        // through the own-stale-renderer path instead of yielding forever.
+        for phase in [
+            WorkerPhase::Starting,
+            WorkerPhase::Canary,
+            WorkerPhase::Live,
+            WorkerPhase::AwaitingAck,
+            WorkerPhase::Restarting,
+            WorkerPhase::RolledBack,
+        ] {
+            let live = fabricated_status(phase, Some("user-pick"));
+            assert_eq!(
+                takeover_identity(&live).as_deref(),
+                Some("user-pick"),
+                "a live {phase:?} renderer must be taken over at activation"
+            );
+        }
+        // Nothing live (or nothing requested): nothing to take over, and
+        // the session keeps the fresh-activation behavior.
+        for phase in [
+            WorkerPhase::Idle,
+            WorkerPhase::Stopped,
+            WorkerPhase::Quarantined,
+        ] {
+            let inert = fabricated_status(phase, Some("user-pick"));
+            assert_eq!(
+                takeover_identity(&inert),
+                None,
+                "an inert {phase:?} renderer is not taken over"
+            );
+        }
+        let unrequested = fabricated_status(WorkerPhase::Live, None);
+        assert_eq!(takeover_identity(&unrequested), None);
+
+        // With the takeover recorded, the verdict displaces the renderer
+        // (the own-stale path) instead of yielding to it.
+        let live = fabricated_status(WorkerPhase::Live, Some("user-pick"));
+        assert_eq!(
+            apply_verdict(Some("user-pick"), "entry-1", &live, true),
+            ApplyVerdict::Apply,
+            "the taken-over renderer must be displaced by the first entry"
+        );
+    }
+
+    #[test]
+    fn activation_seeds_takeover_and_reactivation_reasserts() {
+        // SessionRuntime wiring: activate_playlist must record the live
+        // renderer as the session's own applied identity — both for a fresh
+        // activation and for re-activating the already-active playlist
+        // (the Play-again re-assert after a yield). No supervisor is
+        // configured here, so the seeding path is exercised through
+        // seed_activation_takeover's absence: with no supervisor the
+        // identity stays None (fail closed, yield preserved).
+        let dir = temporary_state_dir("activation-seed");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut runtime = SessionRuntime::new(config(dir, &["1", "2", "3"]));
+        runtime.put_playlist(daily_playlist()).unwrap();
+        runtime.applied_wallpaper = Some("stale".into());
+        runtime.activate_playlist(Some("daily".into())).unwrap();
+        assert_eq!(
+            runtime.applied_wallpaper, None,
+            "without a supervisor, activation must fail closed to the yield behavior"
+        );
+        // Re-activation of the active playlist keeps the runtime (the
+        // decision stays) and does not reset apply state it did not seed.
+        runtime.applied_wallpaper = Some("applied-1".into());
+        let status = runtime.activate_playlist(Some("daily".into())).unwrap();
+        assert!(status.active);
+        assert_eq!(
+            runtime.applied_wallpaper.as_deref(),
+            Some("applied-1"),
+            "re-activation without a live renderer must not clear the applied identity"
         );
     }
 

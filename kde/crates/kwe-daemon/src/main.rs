@@ -9,6 +9,7 @@ mod inspect;
 mod persist;
 mod playlist_session;
 mod selfcheck;
+mod settings;
 mod supervisor;
 mod workshop_cache;
 
@@ -1008,6 +1009,28 @@ fn process_request(
                     .permissions_list()
                     .map(|grants| json!({"grants": grants}))
             }),
+            // Global wallpaper settings. `audio_output` gates wallpaper SOUND
+            // (video/scene workers launch with --mute while disabled; the set
+            // respawns the live worker so the toggle is immediate). Distinct
+            // from the per-wallpaper `audio` grant, which gates captured
+            // system audio for audio-reactive wallpapers.
+            "settings.get" => permissions_call(supervisor, |handle| {
+                handle
+                    .audio_output_get()
+                    .map(|enabled| json!({"audio_output": enabled}))
+            }),
+            "settings.set" => {
+                match serde_json::from_value::<SettingsSetParams>(request.params.clone()) {
+                    Ok(params) => permissions_call(supervisor, |handle| {
+                        handle
+                            .audio_output_set(params.audio_output)
+                            .map(|enabled| json!({"audio_output": enabled}))
+                    }),
+                    Err(error) => {
+                        json!({"error": "invalid_params", "detail": error.to_string()})
+                    }
+                }
+            }
             "media.state" => {
                 match serde_json::from_value::<MediaStateParams>(request.params.clone()) {
                     Ok(params) => match MediaState::new(
@@ -1192,6 +1215,14 @@ struct MediaStateParams {
 #[serde(deny_unknown_fields)]
 struct PermissionsGetParams {
     wallpaper_id: String,
+}
+
+/// `settings.set` params: the global wallpaper-audio switch. Unknown fields
+/// are rejected so a typo cannot silently change policy.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SettingsSetParams {
+    audio_output: bool,
 }
 
 /// `permissions.set` params (BETA_M2c): patch the stored record. Provided
@@ -1956,6 +1987,37 @@ mod tests {
         assert_eq!(grants.len(), 1);
         assert_eq!(grants["431960-123"]["network"], true);
         assert_eq!(grants["431960-123"]["audio"], true);
+    }
+
+    #[test]
+    fn settings_audio_output_defaults_on_round_trips_and_rejects_bad_params() {
+        let service = supervisor_service();
+        let handle = service.handle();
+        let (ok, result) =
+            process_with_supervisor(r#"{"version":1,"method":"settings.get"}"#, &handle);
+        assert!(ok, "{result}");
+        assert_eq!(result["audio_output"], true, "default must be enabled");
+
+        let (ok, result) = process_with_supervisor(
+            r#"{"version":1,"method":"settings.set","params":{"audio_output":false}}"#,
+            &handle,
+        );
+        assert!(ok, "{result}");
+        assert_eq!(result["audio_output"], false);
+        let (ok, result) =
+            process_with_supervisor(r#"{"version":1,"method":"settings.get"}"#, &handle);
+        assert!(ok, "{result}");
+        assert_eq!(result["audio_output"], false, "the set must persist");
+
+        // Unknown or missing fields fail closed at the params boundary.
+        for bad in [
+            r#"{"version":1,"method":"settings.set","params":{"audio_output":false,"bogus":1}}"#,
+            r#"{"version":1,"method":"settings.set","params":{}}"#,
+        ] {
+            let (ok, result) = process_with_supervisor(bad, &handle);
+            assert!(!ok, "{bad}");
+            assert_eq!(result["error"], "invalid_params", "{bad}");
+        }
     }
 
     #[test]

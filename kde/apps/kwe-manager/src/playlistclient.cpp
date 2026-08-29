@@ -68,6 +68,26 @@ void PlaylistClient::removePlaylist(const QString &id) {
         [this](bool ok, const QJsonObject &, const QString &error) { emit removeFinished(ok, error); }});
 }
 
+void PlaylistClient::activatePlaylist(const QString &id) {
+    send(Pending{
+        QStringLiteral("playlist.activate"),
+        QJsonObject{{QStringLiteral("id"),
+                     id.isEmpty() ? QJsonValue(QJsonValue::Null) : QJsonValue(id)}},
+        [this](bool ok, const QJsonObject &result, const QString &error) {
+            emit activateFinished(ok, result, error);
+        }});
+}
+
+void PlaylistClient::requestStatus() {
+    send(Pending{QStringLiteral("playlist.status"), {},
+                 [this](bool ok, const QJsonObject &result, const QString &error) {
+                     if (ok)
+                         emit statusReceived(result);
+                     else
+                         emit statusFailed(error);
+                 }});
+}
+
 void PlaylistClient::send(Pending pending) {
     if (m_state == Loading) {
         if (m_queue.size() >= MaxQueuedOperations) {

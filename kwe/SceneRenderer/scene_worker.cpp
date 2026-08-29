@@ -193,6 +193,9 @@ int main(int argc, char** argv) {
         std::make_shared<owe::wpscene::SceneDocument>(rstd::move(*scene_document));
     config.fps       = args.fps;
     config.fill_mode = fill_mode_for(args.scaling);
+    // Global wallpaper-audio setting: --mute silences the engine's sound
+    // manager (scene-authored sounds); frame output is unaffected.
+    config.muted = args.mute;
     wallpaper.configure(rstd::move(config));
 
     {
@@ -269,14 +272,40 @@ int main(int argc, char** argv) {
     uint64_t                  published  = 0;
     kwe::FramePacer           pacer(args.fps);
 
+    // Dev-only stage timing (KWE_SCENE_TIMING=1): microseconds spent per
+    // stage, reported once a second on stderr.
+    const bool timing_enabled = [] {
+        const char* value = std::getenv("KWE_SCENE_TIMING");
+        return value && *value && *value != '0';
+    }();
+    auto     now_us       = [] {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return uint64_t(ts.tv_sec) * 1000000u + uint64_t(ts.tv_nsec) / 1000u;
+    };
+    uint64_t stat_start   = now_us();
+    uint64_t us_sync      = 0, us_copy = 0, us_publish = 0, us_pace = 0;
+    uint64_t stat_frames  = 0, stat_loops = 0;
+
     while (! kwe::TerminationFlag().load(std::memory_order_acquire)) {
         kwe::ApplyPublishFaults(args, published, writer);
         input.Poll(callbacks);
+        ++stat_loops;
 
         if (owe::ExHandle* handle = swapchain->eatFrame(); handle != nullptr) {
+            ++stat_frames;
+            const uint64_t t_sync = timing_enabled ? now_us() : 0;
             wait_render_complete(swapchain->takeLastFrameSyncFd());
-            MappedSlot& slot = mapped_slots[handle->id().to_primitive()];
-            if (! slot.base && handle->fd >= 0) {
+            if (timing_enabled) us_sync += now_us() - t_sync;
+            // Same-process fast path: read through the engine's cached
+            // vkMapMemory pointer when the slot memory is host-visible.
+            // The dmabuf mmap below stays as the fallback only — NVIDIA's
+            // dmabuf mmap degrades to uncached reads (~12 MB/s) for row
+            // pitches over 8 KiB, which collapsed every canvas wider than
+            // 2048 px to 2-3 fps.
+            const bool  fast_path = handle->host_ptr != nullptr;
+            MappedSlot& slot      = mapped_slots[handle->id().to_primitive()];
+            if (! fast_path && ! slot.base && handle->fd >= 0) {
                 void* base =
                     ::mmap(nullptr, handle->size.to_primitive(), PROT_READ, MAP_SHARED,
                            handle->fd, 0);
@@ -292,10 +321,13 @@ int main(int argc, char** argv) {
                 slot.base = base;
                 slot.size = handle->size.to_primitive();
             }
-            if (slot.base) {
-                dmabuf_sync(handle->fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
-                const uint8_t* source = static_cast<const uint8_t*>(slot.base) +
-                                        size_t(handle->plane0_offset);
+            if (fast_path || slot.base) {
+                const uint64_t t_copy = timing_enabled ? now_us() : 0;
+                if (! fast_path) dmabuf_sync(handle->fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
+                const uint8_t* source =
+                    (fast_path ? static_cast<const uint8_t*>(handle->host_ptr)
+                               : static_cast<const uint8_t*>(slot.base)) +
+                    size_t(handle->plane0_offset);
                 const size_t source_stride = handle->plane0_stride
                                                  ? size_t(handle->plane0_stride)
                                                  : size_t(spec.stride);
@@ -317,7 +349,8 @@ int main(int argc, char** argv) {
                         out[column * 4 + 2] = red;
                     }
                 }
-                dmabuf_sync(handle->fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
+                if (! fast_path) dmabuf_sync(handle->fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
+                if (timing_enabled) us_copy += now_us() - t_copy;
                 have_frame = true;
             }
         }
@@ -326,9 +359,31 @@ int main(int argc, char** argv) {
             // Re-published even without a new engine frame so the
             // supervisor's generation watchdog sees liveness on static
             // scenes, exactly like the retired Rust worker.
-            published = writer.Publish(staging.data());
+            const uint64_t t_publish = timing_enabled ? now_us() : 0;
+            published                = writer.Publish(staging.data());
+            if (timing_enabled) us_publish += now_us() - t_publish;
         }
-        pacer.WaitNext();
+        {
+            const uint64_t t_pace = timing_enabled ? now_us() : 0;
+            pacer.WaitNext();
+            if (timing_enabled) us_pace += now_us() - t_pace;
+        }
+        if (timing_enabled && now_us() - stat_start >= 1000000) {
+            const uint64_t total = now_us() - stat_start;
+            std::fprintf(stderr,
+                         "timing loops=%llu engine_frames=%llu sync_us=%llu copy_us=%llu "
+                         "publish_us=%llu pace_us=%llu other_us=%llu\n",
+                         (unsigned long long)stat_loops,
+                         (unsigned long long)stat_frames,
+                         (unsigned long long)us_sync,
+                         (unsigned long long)us_copy,
+                         (unsigned long long)us_publish,
+                         (unsigned long long)us_pace,
+                         (unsigned long long)(total - us_sync - us_copy - us_publish - us_pace));
+            stat_start = now_us();
+            us_sync = us_copy = us_publish = us_pace = 0;
+            stat_frames = stat_loops = 0;
+        }
     }
 
     writer.SetState(kwe::ProducerState::Stopping);

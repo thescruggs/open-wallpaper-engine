@@ -228,6 +228,34 @@ future stricter modes and is not enforced yet.
 - **Pointer**: pass-through stays enabled by default; the pointer grant is
   reserved for future stricter modes and is not enforced yet.
 
+## Global settings
+
+One daemon-wide record in `settings-v1.json` (same quarantine-on-corrupt
+posture as the grant store). One knob today: whether wallpapers may PLAY
+sound. This is distinct from the per-wallpaper `audio` grant above, which
+gates delivery of *captured* system audio to audio-reactive wallpapers.
+
+- `settings.get` → `{"audio_output": true|false}` (default `true`).
+- `settings.set` `{"audio_output": false}` → persists the value and answers
+  the effective record. Unknown or missing fields are rejected
+  (`invalid_params`).
+
+### Enforcement
+
+The supervisor re-reads the store at every spawn (like grants) and appends
+`--mute` to **video** and **scene** workers while audio output is disabled —
+video selects no audio track at all (`audio=no`, no sink input, no decode
+cost); scene silences the engine's sound manager. **Web** workers never
+receive the flag: their audio output is always off by policy. Least
+privilege rides along: a video worker inherits `XDG_RUNTIME_DIR` (the
+PipeWire socket libmpv needs to actually play sound) only while audio
+output is enabled; muted video workers, like the test kind, see no session
+runtime dir at all. A
+`settings.set` that changes the value also respawns the live video/scene
+worker through the normal candidate/canary/handoff lifecycle, so the toggle
+is immediate; a respawn blocked by a pending display handoff is deferred
+(`settings.audio_respawn_deferred`) and the next launch honors the setting.
+
 ## Audio and media control
 
 *(BETA_M1a: daemon-side producers/forwarders for the two media wire types.)*

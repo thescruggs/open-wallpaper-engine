@@ -43,6 +43,11 @@ Kirigami.ApplicationWindow {
         }
     }
 
+    SettingsPage {
+        id: settingsPage
+        visible: false
+    }
+
     footer: Kirigami.NavigationTabBar {
         actions: [
             Kirigami.Action {
@@ -66,6 +71,18 @@ Kirigami.ApplicationWindow {
                         while (pageStack.depth > 0)
                             pageStack.pop()
                         pageStack.push(workshopPage)
+                    }
+                }
+            },
+            Kirigami.Action {
+                icon.name: "configure-symbolic"
+                text: qsTr("Settings")
+                checked: settingsPage.visible
+                onTriggered: {
+                    if (!settingsPage.visible) {
+                        while (pageStack.depth > 0)
+                            pageStack.pop()
+                        pageStack.push(settingsPage)
                     }
                 }
             }

@@ -159,6 +159,25 @@ void CatalogModel::toggleFavorite(const QString &workshopId) {
     emit favoritesChanged();
 }
 
+QVariantMap CatalogModel::itemById(const QString &workshopId) const {
+    for (const auto &item : m_items) {
+        if (item.workshopId == workshopId) {
+            return {
+                {QStringLiteral("found"), true},
+                {QStringLiteral("title"), item.title},
+                {QStringLiteral("kind"), item.kind},
+                {QStringLiteral("previewUrl"), item.previewUrl},
+            };
+        }
+    }
+    return {
+        {QStringLiteral("found"), false},
+        {QStringLiteral("title"), workshopId},
+        {QStringLiteral("kind"), QString()},
+        {QStringLiteral("previewUrl"), QUrl()},
+    };
+}
+
 WallpaperFilterModel::WallpaperFilterModel(QObject *parent) : QSortFilterProxyModel(parent) {
     setDynamicSortFilter(true);
     setSortCaseSensitivity(Qt::CaseInsensitive);

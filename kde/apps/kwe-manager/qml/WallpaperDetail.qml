@@ -76,7 +76,10 @@ Kirigami.ScrollablePage {
         applyClient.listOutputs();
     }
 
-    Component.onCompleted: detailPage.ensureOutputs()
+    Component.onCompleted: {
+        detailPage.ensureOutputs();
+        detailPage.seedApplyDefaults();
+    }
 
     onVisibleChanged: {
         if (visible) {
@@ -98,6 +101,21 @@ Kirigami.ScrollablePage {
         }
     }
 
+    // Preselect the Apply controls from the Settings page's per-renderer
+    // defaults. Only on selection change: a value the user picked for THIS
+    // wallpaper is never overwritten while it stays selected.
+    function seedApplyDefaults() {
+        if (!detailPage.applyableKind)
+            return;
+        const kind = WallpaperSelection.selectedKind;
+        const scalingIndex = scalingPicker.indexOfValue(rendererDefaults.scaling(kind));
+        if (scalingIndex >= 0)
+            scalingPicker.currentIndex = scalingIndex;
+        const fpsIndex = fpsPicker.indexOfValue(rendererDefaults.fps(kind));
+        if (fpsIndex >= 0)
+            fpsPicker.currentIndex = fpsIndex;
+    }
+
     Connections {
         target: WallpaperSelection
         function onSelectedIdChanged() {
@@ -106,6 +124,7 @@ Kirigami.ScrollablePage {
             applyClient.resetStatus();
             if (detailPage.visible)
                 refreshPermissions();
+            detailPage.seedApplyDefaults();
         }
     }
 

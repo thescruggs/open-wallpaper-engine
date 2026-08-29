@@ -11,6 +11,8 @@
 #include "rendererstatus.h"
 #include "webpreview.h"
 #include "playlistcontroller.h"
+#include "rendererdefaults.h"
+#include "settingsclient.h"
 
 #include <QCommandLineParser>
 #include <QGuiApplication>
@@ -113,6 +115,11 @@ int main(int argc, char *argv[]) {
     // (relaunching once if the loaded record differs).
     WebPreview webPreview(&permissionsClient);
     PlaylistController playlistController(socketPath);
+    // Per-renderer-kind apply defaults (Settings page); they preselect the
+    // details pane's Apply controls, the daemon still owns per-output state.
+    RendererDefaults rendererDefaults;
+    // Daemon-global settings (settings.get/set): the wallpaper-audio switch.
+    SettingsClient settingsClient(socketPath);
     // F4: "Report rendering issue" — a local diagnostic bundle the
     // maintainer records by hand, written under ~/.local/share/kwe/reports/.
     // Nothing here is uploaded anywhere.
@@ -163,6 +170,8 @@ int main(int argc, char *argv[]) {
     engine.rootContext()->setContextProperty(QStringLiteral("rendererStatus"), &rendererStatus);
     engine.rootContext()->setContextProperty(QStringLiteral("webPreview"), &webPreview);
     engine.rootContext()->setContextProperty(QStringLiteral("playlistController"), &playlistController);
+    engine.rootContext()->setContextProperty(QStringLiteral("rendererDefaults"), &rendererDefaults);
+    engine.rootContext()->setContextProperty(QStringLiteral("settingsClient"), &settingsClient);
     engine.rootContext()->setContextProperty(QStringLiteral("issueReporter"), &issueReporter);
     engine.load(QUrl(QStringLiteral("qrc:/qt/qml/org/kde/kwe/qml/Main.qml")));
     if (engine.rootObjects().isEmpty()) return 1;

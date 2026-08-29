@@ -45,6 +45,10 @@ struct WorkerArgs {
     uint32_t    fps { 30 };
     std::string scaling { "aspect" }; // aspect | fill | stretch
     std::string content;
+    // Global wallpaper-audio setting: launch with audio output disabled.
+    // Scene: the engine's sound manager is muted. Web: accepted for argv
+    // compatibility (web audio output is already always off).
+    bool mute { false };
     // Scene kind only.
     std::string assets_dir;
     std::string shader_helper; // accepted for argv compatibility; unused
@@ -145,6 +149,8 @@ inline std::optional<WorkerArgs> ParseWorkerArgs(int argc, char** argv, bool web
             }
         } else if (flag == "--content") {
             if (! take_string(args.content)) return std::nullopt;
+        } else if (flag == "--mute") {
+            args.mute = true;
         } else if (! web && flag == "--assets-dir") {
             if (! take_string(args.assets_dir)) return std::nullopt;
         } else if (! web && flag == "--shader-helper") {
