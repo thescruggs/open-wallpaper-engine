@@ -9,15 +9,18 @@
 #include <QTimer>
 #include <functional>
 
-// Daemon-backed global wallpaper settings (settings.get/set). One knob today:
-// audioOutput — whether wallpapers may play sound. The daemon persists the
-// value and respawns the live renderer on change, so the toggle is immediate;
-// this client mirrors the effective value. Transport mirrors PlaylistClient:
+// Daemon-backed global wallpaper settings (settings.get/set). Two knobs:
+// audioOutput — whether wallpapers may play sound (the daemon respawns the
+// live renderer on change), and pauseWhenCovered (F3) — whether rendering
+// pauses while every display is covered by a maximized or fullscreen
+// window (the daemon starts its KWin-backed detector while this is on).
+// This client mirrors the effective values. Transport mirrors PlaylistClient:
 // one request per connection, newline-delimited JSON, bounded queue with
 // backoff so a toggle survives a daemon restart.
 class SettingsClient final : public QObject {
     Q_OBJECT
     Q_PROPERTY(bool audioOutput READ audioOutput NOTIFY settingsChanged)
+    Q_PROPERTY(bool pauseWhenCovered READ pauseWhenCovered NOTIFY settingsChanged)
     Q_PROPERTY(bool loaded READ loaded NOTIFY settingsChanged)
     Q_PROPERTY(bool busy READ busy NOTIFY busyChanged)
     Q_PROPERTY(QString errorMessage READ errorMessage NOTIFY errorMessageChanged)
@@ -25,12 +28,14 @@ class SettingsClient final : public QObject {
 public:
     explicit SettingsClient(QString socketPath, QObject *parent = nullptr);
     bool audioOutput() const { return m_audioOutput; }
+    bool pauseWhenCovered() const { return m_pauseWhenCovered; }
     bool loaded() const { return m_loaded; }
     bool busy() const { return m_busy; }
     QString errorMessage() const { return m_errorMessage; }
 
     Q_INVOKABLE void refresh();
     Q_INVOKABLE void setAudioOutput(bool enabled);
+    Q_INVOKABLE void setPauseWhenCovered(bool enabled);
 
 signals:
     void settingsChanged();
@@ -65,6 +70,7 @@ private:
     int m_retryDelayMilliseconds = 5000;
     int m_requestSerial = 0;
     bool m_audioOutput = true;
+    bool m_pauseWhenCovered = false;
     bool m_loaded = false;
     bool m_busy = false;
     QString m_errorMessage;

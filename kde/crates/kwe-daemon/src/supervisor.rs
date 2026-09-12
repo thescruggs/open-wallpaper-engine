@@ -25,6 +25,7 @@ use std::{
 };
 
 use crate::grants::{Grant, GrantPatch, GrantStore};
+use crate::occlusion::{OcclusionDetector, OcclusionDetectorStatus};
 #[cfg(test)]
 use crate::persist::unix_nanos;
 use crate::persist::{atomic_write, ensure_private_dir, unix_seconds};
@@ -34,8 +35,8 @@ use kwe_core::{preflight_scene, preflight_video, preflight_web};
 use kwe_frame_protocol::{FrameSnapshot, FrameSpec, ProtocolError, SharedFrameReader};
 use kwe_input_protocol::{
     AudioFrame, MAX_MESSAGE_BYTES as MAX_INPUT_MESSAGE_BYTES, MediaState, PointerButton,
-    PointerMessage, PointerPhase, decode_ack_line, encode_audio_frame, encode_media_state,
-    encode_pointer_line,
+    PointerMessage, PointerPhase, RenderPause, decode_ack_line, encode_audio_frame,
+    encode_media_state, encode_pointer_line, encode_render_pause,
 };
 use serde::{Deserialize, Serialize};
 
@@ -142,6 +143,18 @@ pub struct SupervisorConfig {
     /// default, not the only path to a working helper). Scene kind only —
     /// no other renderer kind ever compiles a material shader.
     pub shader_helper_path: Option<PathBuf>,
+    /// F3: the `kwe-occlusion-worker` helper and the daemon socket it
+    /// reports back to. `None` disables the automatic KWin-backed detector;
+    /// the pause policy then only reacts to explicit `occlusion.report`
+    /// calls (tests, alternative detectors).
+    pub occlusion_worker: Option<OcclusionWorkerConfig>,
+}
+
+/// F3 detector launch parameters (see `occlusion.rs`).
+#[derive(Debug, Clone)]
+pub struct OcclusionWorkerConfig {
+    pub worker_path: PathBuf,
+    pub socket: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -536,6 +549,16 @@ pub struct WorkerStatus {
     /// `capability_limitations` — capabilities the apply gate tolerated as
     /// missing rather than refusing the apply over.
     pub capability_limitations: Vec<String>,
+    /// F3: the global pause-when-covered policy switch.
+    pub pause_when_covered: bool,
+    /// F3: the latest occlusion verdict (every output covered by a
+    /// maximized/fullscreen window). Reset to `false` whenever the detector
+    /// goes away, so a dead detector can never freeze the wallpaper.
+    pub desktop_covered: bool,
+    /// F3: what the active worker was last told (`render_pause`); equals
+    /// `pause_when_covered && desktop_covered` once the message was queued.
+    pub render_paused: bool,
+    pub occlusion_detector: OcclusionDetectorStatus,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -728,6 +751,10 @@ enum ControlCommand {
     PermissionsList(mpsc::Sender<Result<BTreeMap<String, Grant>>>),
     AudioOutputGet(mpsc::Sender<Result<bool>>),
     AudioOutputSet(bool, mpsc::Sender<Result<bool>>),
+    PauseWhenCoveredGet(mpsc::Sender<Result<bool>>),
+    PauseWhenCoveredSet(bool, mpsc::Sender<Result<bool>>),
+    /// F3: the detector's (or a test's) verdict — every output covered.
+    OcclusionReport(bool, mpsc::Sender<Result<WorkerStatus>>),
     QuarantinedIds(mpsc::Sender<BTreeSet<String>>),
     Shutdown,
 }
@@ -815,6 +842,21 @@ impl SupervisorHandle {
 
     pub fn audio_output_set(&self, enabled: bool) -> Result<bool> {
         self.request_value(|reply| ControlCommand::AudioOutputSet(enabled, reply))
+    }
+
+    pub fn pause_when_covered_get(&self) -> Result<bool> {
+        self.request_value(ControlCommand::PauseWhenCoveredGet)
+    }
+
+    pub fn pause_when_covered_set(&self, enabled: bool) -> Result<bool> {
+        self.request_value(|reply| ControlCommand::PauseWhenCoveredSet(enabled, reply))
+    }
+
+    /// F3: feed an occlusion verdict. `covered` means every output is
+    /// covered; the supervisor pauses/resumes the live worker according to
+    /// the policy switch and reports the resulting status.
+    pub fn occlusion_report(&self, covered: bool) -> Result<WorkerStatus> {
+        self.request(|reply| ControlCommand::OcclusionReport(covered, reply))
     }
 
     pub fn permissions_list(&self) -> Result<BTreeMap<String, Grant>> {
@@ -929,6 +971,11 @@ struct ActiveWorker {
     audio_coalesced: u64,
     pending_media: Option<Vec<u8>>,
     media_coalesced: u64,
+    /// F3: one pending `render_pause` line (latest-wins like the others) and
+    /// the state this worker was last told, so promotion/rollback can
+    /// re-synchronize without re-sending an identical message.
+    pending_pause: Option<Vec<u8>>,
+    render_paused: bool,
     stderr: ChildStderr,
     stderr_ring: StderrRing,
 }
@@ -972,6 +1019,9 @@ struct SupervisorRuntime {
     last_failure: Option<(FailureKind, String)>,
     launch_serial: u64,
     display_generation: u64,
+    /// F3: detector child + latest verdict; see `effective_render_pause`.
+    occlusion: OcclusionDetector,
+    desktop_covered: bool,
 }
 
 impl SupervisorRuntime {
@@ -982,6 +1032,19 @@ impl SupervisorRuntime {
         grant_store: GrantStore,
         settings_store: SettingsStore,
     ) -> Self {
+        let mut occlusion = OcclusionDetector::new(
+            config
+                .occlusion_worker
+                .as_ref()
+                .map(|worker| worker.worker_path.clone()),
+            config
+                .occlusion_worker
+                .as_ref()
+                .map(|worker| worker.socket.clone())
+                .unwrap_or_default(),
+        );
+        // The policy persists; the detector follows it from the first tick.
+        occlusion.set_enabled(settings_store.pause_when_covered());
         Self {
             config,
             store,
@@ -999,6 +1062,8 @@ impl SupervisorRuntime {
             last_failure: None,
             launch_serial: 0,
             display_generation: 0,
+            occlusion,
+            desktop_covered: false,
         }
     }
 
@@ -1072,6 +1137,18 @@ impl SupervisorRuntime {
                     let result = self.set_audio_output(enabled);
                     let _ = reply.send(result);
                 }
+                Ok(ControlCommand::PauseWhenCoveredGet(reply)) => {
+                    let _ = reply.send(Ok(self.settings_store.pause_when_covered()));
+                }
+                Ok(ControlCommand::PauseWhenCoveredSet(enabled, reply)) => {
+                    let result = self.set_pause_when_covered(enabled);
+                    let _ = reply.send(result);
+                }
+                Ok(ControlCommand::OcclusionReport(covered, reply)) => {
+                    self.desktop_covered = covered;
+                    self.sync_render_pause();
+                    let _ = reply.send(Ok(self.status()));
+                }
                 Ok(ControlCommand::QuarantinedIds(reply)) => {
                     let ids = self
                         .persisted
@@ -1084,6 +1161,7 @@ impl SupervisorRuntime {
                 }
                 Ok(ControlCommand::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                     self.stop_all(false);
+                    self.occlusion.shutdown();
                     return;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -1112,6 +1190,70 @@ impl SupervisorRuntime {
             eprintln!("event=settings.audio_respawn_deferred detail={error}");
         }
         Ok(self.settings_store.audio_output())
+    }
+
+    /// F3 policy switch: persists, starts/stops the detector, and applies
+    /// the new effective state to the live worker at once (turning the
+    /// policy off while paused resumes immediately).
+    fn set_pause_when_covered(&mut self, enabled: bool) -> Result<bool> {
+        self.settings_store.set_pause_when_covered(enabled)?;
+        self.occlusion.set_enabled(enabled);
+        if !enabled {
+            // No detector → no verdict. A stale "covered" must not survive
+            // the policy being switched off and on again.
+            self.desktop_covered = false;
+        }
+        self.sync_render_pause();
+        Ok(self.settings_store.pause_when_covered())
+    }
+
+    #[cfg(test)]
+    fn occlusion_report_for_test(&mut self, covered: bool) -> WorkerStatus {
+        self.desktop_covered = covered;
+        self.sync_render_pause();
+        self.status()
+    }
+
+    fn effective_render_pause(&self) -> bool {
+        self.settings_store.pause_when_covered() && self.desktop_covered
+    }
+
+    /// Brings the active worker in line with the effective pause state.
+    /// Candidates are never paused (the canary needs real frames); the
+    /// promoted worker picks the state up here right after promotion, and
+    /// a rolled-back worker re-synchronizes the same way.
+    fn sync_render_pause(&mut self) {
+        let desired = self.effective_render_pause();
+        let generation = self.display_generation.max(1);
+        let Some(worker) = self.active.as_mut() else {
+            return;
+        };
+        if worker.render_paused == desired {
+            return;
+        }
+        match RenderPause::new(generation, desired)
+            .and_then(|message| encode_render_pause(&message))
+        {
+            Ok(bytes) => {
+                let mut coalesced = 0;
+                if let Err(error) = queue_control_message(
+                    &worker.input,
+                    bytes,
+                    &mut worker.pending_pause,
+                    &mut coalesced,
+                ) {
+                    eprintln!("event=renderer.pause_write_error detail={error}");
+                    return;
+                }
+                worker.render_paused = desired;
+                raise_ack_ceiling(worker, generation);
+                eprintln!(
+                    "event=renderer.render_pause paused={desired} generation={generation} pid={}",
+                    worker.child.id()
+                );
+            }
+            Err(error) => eprintln!("event=renderer.pause_encode_error detail={error}"),
+        }
     }
 
     fn start_selected(&mut self, spec: StartSpec, clear_failure: bool) -> Result<WorkerStatus> {
@@ -1427,6 +1569,8 @@ impl SupervisorRuntime {
             audio_coalesced: 0,
             pending_media: None,
             media_coalesced: 0,
+            pending_pause: None,
+            render_paused: false,
             stderr,
             stderr_ring: StderrRing::default(),
         })
@@ -1545,10 +1689,22 @@ impl SupervisorRuntime {
             &mut worker.input_protocol_errors,
             "renderer.media_write_error",
         );
+        flush_pending(
+            &worker.input,
+            &mut worker.pending_pause,
+            &mut worker.input_protocol_errors,
+            "renderer.pause_write_error",
+        );
     }
 
     fn tick(&mut self) {
         self.service_active_input();
+        // F3: reap/restart the detector; losing it drops any covered verdict
+        // so the wallpaper resumes rather than staying frozen.
+        if self.occlusion.tick() && self.desktop_covered {
+            self.desktop_covered = false;
+            self.sync_render_pause();
+        }
         if self
             .retired
             .as_ref()
@@ -1662,6 +1818,9 @@ impl SupervisorRuntime {
         self.display_generation = self.display_generation.wrapping_add(1).max(1);
         self.pending = None;
         self.restart_count = 0;
+        // F3: the promoted worker rendered live for the canary; it inherits
+        // the effective pause state only now that it is the display.
+        self.sync_render_pause();
         if let Some(worker) = previous {
             self.retired = Some(RetiredWorker {
                 worker,
@@ -1705,6 +1864,7 @@ impl SupervisorRuntime {
         if let Some(retired) = self.retired.take() {
             self.active = Some(retired.worker);
             self.display_generation = self.display_generation.wrapping_add(1).max(1);
+            self.sync_render_pause();
             self.requested = Some(spec.clone());
             let quarantined = self.record_failure(kind, &detail, &spec);
             if quarantined {
@@ -1841,6 +2001,7 @@ impl SupervisorRuntime {
         let Some(spec) = self.active.as_ref().map(|worker| worker.spec.clone()) else {
             self.active = Some(retired.worker);
             self.phase = WorkerPhase::RolledBack;
+            self.sync_render_pause();
             return;
         };
         match self.persist_last_good(&spec, &retired.promotion_snapshot) {
@@ -1860,6 +2021,7 @@ impl SupervisorRuntime {
                 }
                 self.active = Some(retired.worker);
                 self.display_generation = self.display_generation.wrapping_add(1).max(1);
+                self.sync_render_pause();
                 self.handle_candidate_failure(FailureKind::InvalidFrame, detail, spec);
             }
         }
@@ -2005,6 +2167,10 @@ impl SupervisorRuntime {
                 .map(|worker| worker.spec.capability_limitations.clone())
                 .or_else(|| requested.map(|spec| spec.capability_limitations.clone()))
                 .unwrap_or_default(),
+            pause_when_covered: self.settings_store.pause_when_covered(),
+            desktop_covered: self.desktop_covered,
+            render_paused: active.is_some_and(|worker| worker.render_paused),
+            occlusion_detector: self.occlusion.status(),
         }
     }
 }
@@ -2876,6 +3042,7 @@ mod tests {
             ]),
             scene_assets_dir: None,
             shader_helper_path: None,
+            occlusion_worker: None,
         }
         .validate()
         .unwrap()
@@ -3420,6 +3587,8 @@ mod tests {
             audio_coalesced: 0,
             pending_media: None,
             media_coalesced: 0,
+            pending_pause: None,
+            render_paused: false,
             stderr,
             stderr_ring: StderrRing::default(),
         };
@@ -3553,6 +3722,133 @@ mod tests {
             "revoked web worker argv must not carry --allow-network: {argv}"
         );
         let _ = inspect_worker(&mut worker, &runtime.config);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// F3: the pause policy reaches the ACTIVE worker as `render_pause`
+    /// lines, is re-applied on promotion, and clears when the policy is
+    /// switched off or the detector goes away.
+    #[test]
+    fn render_pause_follows_policy_and_coverage_on_the_active_worker() {
+        let root = temporary_directory("render-pause");
+        fs::create_dir_all(&root).unwrap();
+        let script = root.join("renderer");
+        // The fake worker mirrors its control pipe into a file and lives
+        // until the supervisor stops it.
+        fs::write(&script, "#!/bin/sh\ncat > \"$HOME/stdin.txt\"\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = validated_config(&root);
+        config.renderer_paths = BTreeMap::from([(RendererKind::Test, script.clone())]);
+        let config = config.validate().unwrap();
+        let (store, state) = StateStore::open(root.join("state")).unwrap();
+        let mut runtime = SupervisorRuntime::new(
+            config,
+            store,
+            state,
+            GrantStore::open(&root.join("state")).unwrap(),
+            SettingsStore::open(&root.join("state")).unwrap(),
+        );
+        let spec = StartSpec {
+            wallpaper_id: "431960-123".into(),
+            content_hash: "abc123".into(),
+            width: 160,
+            height: 90,
+            fps: 30,
+            kind: RendererKind::Test,
+            content: None,
+            test_fault: None,
+            stderr_lines: None,
+            scaling: ScalingMode::Aspect,
+            capability_limitations: Vec::new(),
+        };
+        let read_lines = |home: &Path, expected: usize| -> Vec<String> {
+            let path = home.join("stdin.txt");
+            for _ in 0..200 {
+                if let Ok(text) = fs::read_to_string(&path) {
+                    let lines: Vec<String> = text.lines().map(str::to_string).collect();
+                    if lines.len() >= expected {
+                        return lines;
+                    }
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            panic!("fake renderer never mirrored {expected} control line(s)");
+        };
+
+        // A covered desktop with the policy OFF sends nothing.
+        let candidate = runtime.spawn_worker(spec.clone()).unwrap();
+        let home = candidate.home_path.clone();
+        runtime.candidate = Some(candidate);
+        runtime.desktop_covered = true;
+        let snapshot = FrameSnapshot {
+            spec: FrameSpec::new(160, 90).unwrap(),
+            sequence: 1,
+            producer_state: kwe_frame_protocol::ProducerState::Running,
+            pixels: vec![0; 160 * 90 * 4],
+        };
+        runtime.promote_candidate(snapshot.clone());
+        assert!(
+            runtime.active.is_some(),
+            "promotion must make the worker active"
+        );
+        assert!(!runtime.status().render_paused);
+
+        // Policy ON with a covered desktop pauses the active worker at once.
+        assert!(runtime.set_pause_when_covered(true).unwrap());
+        assert!(runtime.status().render_paused);
+        let lines = read_lines(&home, 1);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let message = kwe_input_protocol::decode_render_pause(lines[0].as_bytes()).unwrap();
+        assert!(message.paused);
+        assert_eq!(message.sequence, runtime.display_generation);
+
+        // An identical verdict is not re-sent; an uncovered desktop resumes.
+        let _ = runtime.occlusion_report_for_test(true);
+        assert_eq!(read_lines(&home, 1).len(), 1);
+        let _ = runtime.occlusion_report_for_test(false);
+        let lines = read_lines(&home, 2);
+        assert!(
+            !kwe_input_protocol::decode_render_pause(lines[1].as_bytes())
+                .unwrap()
+                .paused
+        );
+        assert!(!runtime.status().render_paused);
+
+        // Covered again, then the policy goes off: that resumes too, and a
+        // later verdict without the policy changes nothing.
+        let _ = runtime.occlusion_report_for_test(true);
+        assert_eq!(read_lines(&home, 3).len(), 3);
+        assert!(!runtime.set_pause_when_covered(false).unwrap());
+        let lines = read_lines(&home, 4);
+        assert!(
+            !kwe_input_protocol::decode_render_pause(lines[3].as_bytes())
+                .unwrap()
+                .paused
+        );
+        assert!(
+            !runtime.status().desktop_covered,
+            "policy off drops the verdict"
+        );
+        let _ = runtime.occlusion_report_for_test(true);
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(read_lines(&home, 4).len(), 4);
+
+        // A freshly promoted worker inherits the effective state.
+        runtime.set_pause_when_covered(true).unwrap();
+        let _ = runtime.occlusion_report_for_test(true);
+        let next = runtime.spawn_worker(spec).unwrap();
+        let next_home = next.home_path.clone();
+        runtime.candidate = Some(next);
+        runtime.promote_candidate(snapshot);
+        let lines = read_lines(&next_home, 1);
+        assert!(
+            kwe_input_protocol::decode_render_pause(lines[0].as_bytes())
+                .unwrap()
+                .paused
+        );
+        assert!(runtime.status().render_paused);
+
+        runtime.stop_all(false);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3716,6 +4012,8 @@ mod tests {
             audio_coalesced: 0,
             pending_media: None,
             media_coalesced: 0,
+            pending_pause: None,
+            render_paused: false,
             stderr,
             stderr_ring: StderrRing::default(),
         };

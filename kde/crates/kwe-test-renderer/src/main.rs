@@ -13,7 +13,7 @@ use clap::Parser;
 use kwe_frame_protocol::{FrameSpec, ProducerState, SharedFrameWriter};
 use kwe_input_protocol::{
     InputAck, MAX_MESSAGE_BYTES as MAX_INPUT_MESSAGE_BYTES, PointerPhase, decode_pointer_line,
-    encode_ack_line,
+    decode_render_pause, encode_ack_line,
 };
 
 #[derive(Debug, Parser)]
@@ -138,12 +138,14 @@ fn main() -> Result<()> {
         }
 
         input_channel.poll();
-        draw_test_pattern(
-            &mut pixels,
-            spec,
-            published,
-            input_channel.state.pointer(spec),
-        );
+        if !input_channel.state.render_paused {
+            draw_test_pattern(
+                &mut pixels,
+                spec,
+                published,
+                input_channel.state.pointer(spec),
+            );
+        }
         published = writer.publish(&pixels)?;
         deadline += interval;
         if let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
@@ -160,6 +162,8 @@ struct InputState {
     x: u16,
     y: u16,
     inside: bool,
+    /// F3: freeze the animated pattern while paused (frames still publish).
+    render_paused: bool,
 }
 
 impl InputState {
@@ -216,13 +220,22 @@ impl InputChannel {
             self.buffer.extend_from_slice(&chunk[..read]);
             while let Some(newline) = self.buffer.iter().position(|byte| *byte == b'\n') {
                 let line: Vec<u8> = self.buffer.drain(..=newline).collect();
-                let Ok(message) = decode_pointer_line(&line) else {
-                    continue;
+                // F3: a render_pause line is acknowledged like pointer input
+                // and idles the pattern (the frame keeps re-publishing so the
+                // supervisor's watchdog sees keepalives, exactly as the real
+                // renderers do).
+                let sequence = if let Ok(pause) = decode_render_pause(&line) {
+                    self.state.render_paused = pause.paused;
+                    pause.sequence
+                } else {
+                    let Ok(message) = decode_pointer_line(&line) else {
+                        continue;
+                    };
+                    self.state
+                        .record(message.sequence, message.phase, message.x, message.y);
+                    message.sequence
                 };
-                self.state
-                    .record(message.sequence, message.phase, message.x, message.y);
-                let Ok(ack) = InputAck::new(message.sequence).and_then(|ack| encode_ack_line(&ack))
-                else {
+                let Ok(ack) = InputAck::new(sequence).and_then(|ack| encode_ack_line(&ack)) else {
                     continue;
                 };
                 // SAFETY: acknowledgements are bounded immutable byte slices;

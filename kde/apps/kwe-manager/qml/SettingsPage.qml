@@ -44,6 +44,28 @@ Kirigami.ScrollablePage {
             opacity: 0.8
         }
 
+        Kirigami.Heading {
+            text: qsTr("Performance")
+            level: 2
+        }
+
+        Controls.Switch {
+            text: qsTr("Pause when a window covers the desktop")
+            checked: settingsClient.pauseWhenCovered
+            enabled: settingsClient.loaded && !settingsClient.busy
+            Accessible.description: qsTr("Pauses the wallpaper while a maximized or fullscreen window covers every display, and resumes when the desktop is visible again.")
+            Controls.ToolTip.visible: hovered
+            Controls.ToolTip.text: Accessible.description
+            onToggled: settingsClient.setPauseWhenCovered(checked)
+        }
+
+        Controls.Label {
+            Layout.fillWidth: true
+            text: qsTr("Saves CPU and GPU while you work in a maximized or fullscreen window. With more than one display the wallpaper pauses only when every display is covered, because all displays share one renderer. Needs KWin; the last frame stays on screen while paused.")
+            wrapMode: Text.Wrap
+            opacity: 0.8
+        }
+
         Kirigami.InlineMessage {
             Layout.fillWidth: true
             type: Kirigami.MessageType.Error

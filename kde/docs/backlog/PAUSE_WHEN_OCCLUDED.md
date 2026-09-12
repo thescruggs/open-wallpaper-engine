@@ -2,8 +2,26 @@
 
 - **Requested:** 2026-08-22 (user: "an option to pause when windows are
   maximized / full screen")
-- **Status:** DESIGN (not started). Needs a protocol addition and a KWin-side
-  detector; sized as its own slice.
+- **Status:** **IMPLEMENTED 2026-09-11** on `kde-owe-backend` (this
+  OWE-backed tree). Deviations from the design below, as built:
+  - Detector = `kwe-occlusion-worker` (Qt Core/DBus/Network helper spawned
+    by the daemon while the setting is on) + a plain-JS KWin script loaded
+    via `org.kde.kwin.Scripting` (`loadScript`/`start`/`unloadScript`),
+    reporting per-output coverage over the helper's own bus name
+    `org.kde.kwe.Occlusion1`. The helper relays to the daemon over the RPC
+    socket as `occlusion.report` — no D-Bus in the Rust daemon.
+  - Policy is **global** (`settings.pause_when_covered`, Settings page
+    "Performance"), not per assignment: one renderer serves every display,
+    so the pause fires only when every output is covered.
+  - The daemon does **not** relax the frame timeout: paused workers keep
+    keepalive-publishing at 500 ms (video/test in Rust; scene/web via the
+    shared `InputWire` in `kwe/Common`). Scene = engine `pause()`/`play()`,
+    web = CEF `WasHidden` + heartbeat suspended, video = mpv `pause`.
+  - Evidence: input-protocol/settings/detector/supervisor/RPC unit tests,
+    manager client test, bridge test against a stub daemon;
+    `scripts/smoke-owe-workers.sh` render-pause lane for the C++ workers'
+    ack; live check on the maintainer's desktop.
+- **Original status:** DESIGN (2026-08-22).
 
 ## Why it is not a one-liner
 

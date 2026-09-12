@@ -44,6 +44,14 @@ else
     echo "dev-run: OWE web worker not built ($web_worker); web applies will fail" >&2
 fi
 
+# F3: the occlusion detector helper from the build tree (its KWin script is
+# copied beside it by CMake); the daemon spawns it only while the
+# pause-when-covered setting is on.
+occlusion_worker="build/cmake/apps/kwe-occlusion-worker/kwe-occlusion-worker"
+if [[ -x "$occlusion_worker" ]]; then
+    renderer_flags+=(--occlusion-worker "$occlusion_worker")
+fi
+
 target/debug/kwe-daemon --socket "$socket_path" "${renderer_flags[@]}" &
 daemon_pid=$!
 cleanup() {

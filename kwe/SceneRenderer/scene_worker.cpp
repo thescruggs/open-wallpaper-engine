@@ -27,6 +27,7 @@
 #include <vulkan/vulkan.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -265,6 +266,20 @@ int main(int argc, char** argv) {
         status.album  = event.album;
         wallpaper.setMediaStatus(std::move(status));
     };
+    // F3: pause stops the engine's simulation/render thread (no GPU work,
+    // no frame eats); the loop below keeps re-publishing the last frame at
+    // the keepalive cadence until the daemon resumes rendering.
+    bool render_paused = false;
+    callbacks.on_render_pause = [&wallpaper, &render_paused](const kwe::RenderPauseEvent& event) {
+        if (event.paused == render_paused) return;
+        render_paused = event.paused;
+        if (render_paused) {
+            wallpaper.pause();
+        } else {
+            wallpaper.play();
+        }
+        std::fprintf(stderr, "event=renderer.render_pause paused=%d\n", int(render_paused));
+    };
 
     std::map<int, MappedSlot> mapped_slots;
     std::vector<uint8_t>      staging(spec.pixel_bytes(), 0);
@@ -287,10 +302,29 @@ int main(int argc, char** argv) {
     uint64_t us_sync      = 0, us_copy = 0, us_publish = 0, us_pace = 0;
     uint64_t stat_frames  = 0, stat_loops = 0;
 
+    auto last_keepalive = std::chrono::steady_clock::now();
     while (! kwe::TerminationFlag().load(std::memory_order_acquire)) {
         kwe::ApplyPublishFaults(args, published, writer);
         input.Poll(callbacks);
         ++stat_loops;
+
+        if (render_paused) {
+            // Drain any frame the engine finished before it stopped so the
+            // swapchain slot is returned, but never copy it: the desktop is
+            // covered and the last published frame stays on screen.
+            if (owe::ExHandle* handle = swapchain->eatFrame(); handle != nullptr) {
+                wait_render_complete(swapchain->takeLastFrameSyncFd());
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (have_frame && now - last_keepalive >= kwe::kRenderPauseKeepalive) {
+                published      = writer.Publish(staging.data());
+                last_keepalive = now;
+            }
+            // Input/termination stay responsive at the pacer's cadence while
+            // the CPU copy and publish are skipped.
+            pacer.WaitNext();
+            continue;
+        }
 
         if (owe::ExHandle* handle = swapchain->eatFrame(); handle != nullptr) {
             ++stat_frames;
@@ -361,6 +395,7 @@ int main(int argc, char** argv) {
             // scenes, exactly like the retired Rust worker.
             const uint64_t t_publish = timing_enabled ? now_us() : 0;
             published                = writer.Publish(staging.data());
+            last_keepalive           = std::chrono::steady_clock::now();
             if (timing_enabled) us_publish += now_us() - t_publish;
         }
         {

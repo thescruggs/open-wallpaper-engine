@@ -45,6 +45,15 @@ void SettingsClient::setAudioOutput(bool enabled) {
                  QJsonObject{{QStringLiteral("audio_output"), enabled}}, true});
 }
 
+void SettingsClient::setPauseWhenCovered(bool enabled) {
+    if (m_pauseWhenCovered != enabled || !m_loaded) {
+        m_pauseWhenCovered = enabled;
+        emit settingsChanged();
+    }
+    send(Pending{QStringLiteral("settings.set"),
+                 QJsonObject{{QStringLiteral("pause_when_covered"), enabled}}, true});
+}
+
 void SettingsClient::send(Pending pending) {
     if (m_inFlight) {
         if (m_queue.size() >= MaxQueuedOperations)
@@ -113,9 +122,12 @@ void SettingsClient::consumeResponse() {
 void SettingsClient::applyResult(const QJsonObject &result) {
     const bool enabled =
         result.value(QStringLiteral("audio_output")).toBool(m_audioOutput);
-    const bool changed = !m_loaded || enabled != m_audioOutput;
+    const bool pause =
+        result.value(QStringLiteral("pause_when_covered")).toBool(m_pauseWhenCovered);
+    const bool changed = !m_loaded || enabled != m_audioOutput || pause != m_pauseWhenCovered;
     m_loaded = true;
     m_audioOutput = enabled;
+    m_pauseWhenCovered = pause;
     if (changed)
         emit settingsChanged();
 }

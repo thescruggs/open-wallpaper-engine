@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Renderer-side consumer of the KDE Wallpaper Engine normalized input
 // protocol v1 (kde/docs/INPUT_PROTOCOL_V1.md). The supervisor writes one
-// compact JSON line per event onto the worker's stdin; pointer events are
-// acknowledged on stdout as `{"version":1,"type":"input_ack","sequence":N}`.
+// compact JSON line per event onto the worker's stdin; pointer and
+// render_pause events are acknowledged on stdout as
+// `{"version":1,"type":"input_ack","sequence":N}`.
 module;
 
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -58,9 +60,21 @@ struct MediaStateEvent {
     std::string album;
 };
 
+// F3: the daemon's render pause/resume verdict. A paused worker must stop
+// simulating/painting but keep re-publishing its last frame at a bounded
+// keepalive rate (kRenderPauseKeepalive) so the supervisor's watchdog stays
+// meaningful. `sequence` carries the display generation, like media_state.
+struct RenderPauseEvent {
+    uint64_t sequence { 0 };
+    bool     paused { false };
+};
+
+inline constexpr auto kRenderPauseKeepalive = std::chrono::milliseconds(500);
+
 struct InputCallbacks {
-    std::function<void(const PointerEvent&)>    on_pointer;
-    std::function<void(const MediaStateEvent&)> on_media_state;
+    std::function<void(const PointerEvent&)>     on_pointer;
+    std::function<void(const MediaStateEvent&)>  on_media_state;
+    std::function<void(const RenderPauseEvent&)> on_render_pause;
     // Bands per channel (16/32/64 f32 values in 0..=1). Sequence carries the
     // display generation, never validated for monotonicity.
     std::function<void(const std::vector<float>& left, const std::vector<float>& right)>
@@ -148,6 +162,8 @@ private:
             dispatchMediaState(parsed, callbacks);
         } else if (type == "audio_bands") {
             dispatchAudioBands(parsed, callbacks);
+        } else if (type == "render_pause") {
+            dispatchRenderPause(parsed, callbacks);
         }
         // Unknown types are ignored at the framing boundary per the protocol.
     }
@@ -216,6 +232,16 @@ private:
         (void)owe::GetJsonValue(parsed, "artist", event.artist, /*warn=*/false);
         (void)owe::GetJsonValue(parsed, "album", event.album, /*warn=*/false);
         if (callbacks.on_media_state) callbacks.on_media_state(event);
+    }
+
+    static void dispatchRenderPause(const owe::Json& parsed, const InputCallbacks& callbacks) {
+        auto sequence = readSequence(parsed);
+        if (! sequence || *sequence == 0) return;
+        RenderPauseEvent event;
+        event.sequence = *sequence;
+        if (! owe::GetJsonValue(parsed, "paused", event.paused, /*warn=*/false)) return;
+        if (callbacks.on_render_pause) callbacks.on_render_pause(event);
+        writeAck(event.sequence);
     }
 
     static void dispatchAudioBands(const owe::Json& parsed, const InputCallbacks& callbacks) {

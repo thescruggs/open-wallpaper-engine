@@ -107,6 +107,32 @@ gracefully on SIGTERM (it first stops `pw-record`). Capture requires the
 user's PipeWire session (inherited `XDG_RUNTIME_DIR`); per-wallpaper audio
 grants are a later milestone.
 
+## Render pause *(F3)*
+
+The supervisor writes a `render_pause` line — same nonblocking, latest-wins
+path as the streams above, one pending message — whenever the effective pause
+state of the ACTIVE worker changes: the global `pause_when_covered` setting is
+on AND the occlusion detector reports every output covered by a maximized or
+fullscreen window. Candidates never receive it (the canary needs real frames);
+the promoted worker is synchronized right after promotion, a rolled-back
+worker right after rollback.
+
+```json
+{"version":1,"type":"render_pause","sequence":4,"paused":true}
+```
+
+`sequence` carries the display generation like `media_state`. Renderers
+acknowledge it with the usual `input_ack`. Contract while paused: stop
+decoding / simulating / painting (video: player paused; scene: engine
+`pause()`; web: page hidden, no invalidate kicks, heartbeat suspended) but
+**keep re-publishing the last frame at a bounded keepalive cadence** (500 ms —
+four keepalives inside the daemon's default 2 s frame timeout), so a paused
+worker that dies is still caught by the watchdog and the daemon never has to
+relax its liveness rule. `paused:false` resumes rendering at the wallpaper's
+fps; a renderer that never received a pause ignores the resume. Renderers
+that cannot pause ignore the line at the framing boundary like any unknown
+type.
+
 ## Display behavior
 
 The standalone Qt surface maps pointer positions only inside the actual image

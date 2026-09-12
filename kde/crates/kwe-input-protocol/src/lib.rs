@@ -173,6 +173,35 @@ impl MediaState {
     }
 }
 
+/// F3: render pause/resume control. `sequence` carries the daemon's
+/// promoted display generation exactly like `media_state` (never validated
+/// for monotonicity by renderers). A paused renderer must keep re-publishing
+/// its last frame at a bounded keepalive rate so the supervisor's frame
+/// watchdog stays meaningful; it stops decoding/simulating/painting.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RenderPause {
+    pub version: u32,
+    #[serde(rename = "type")]
+    pub message_type: String,
+    pub sequence: u64,
+    pub paused: bool,
+}
+
+impl RenderPause {
+    pub fn new(sequence: u64, paused: bool) -> Result<Self, InputProtocolError> {
+        if sequence == 0 {
+            return Err(InputProtocolError::InvalidSequence);
+        }
+        Ok(Self {
+            version: VERSION,
+            message_type: "render_pause".into(),
+            sequence,
+            paused,
+        })
+    }
+}
+
 fn truncate(value: Option<String>) -> Option<String> {
     value.map(|text| text.chars().take(512).collect())
 }
@@ -322,6 +351,20 @@ pub fn decode_media_state(bytes: &[u8]) -> Result<MediaState, InputProtocolError
     )
 }
 
+pub fn encode_render_pause(message: &RenderPause) -> Result<Vec<u8>, InputProtocolError> {
+    RenderPause::new(message.sequence, message.paused)?;
+    encode_line(message)
+}
+
+pub fn decode_render_pause(bytes: &[u8]) -> Result<RenderPause, InputProtocolError> {
+    let payload = validate_framing(bytes)?;
+    let message: RenderPause = serde_json::from_slice(payload)?;
+    if message.version != VERSION || message.message_type != "render_pause" {
+        return Err(InputProtocolError::UnexpectedMessageType);
+    }
+    RenderPause::new(message.sequence, message.paused)
+}
+
 fn encode_line(value: &impl Serialize) -> Result<Vec<u8>, InputProtocolError> {
     let mut bytes = serde_json::to_vec(value)?;
     bytes.push(b'\n');
@@ -408,6 +451,30 @@ mod tests {
         assert!(
             PointerMessage::button_event(8, PointerPhase::Move, PointerButton::Primary, 0.5, 0.5)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn render_pause_round_trips_and_rejects_zero_sequence() {
+        let message = RenderPause::new(4, true).unwrap();
+        let line = encode_render_pause(&message).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&line).unwrap(),
+            "{\"version\":1,\"type\":\"render_pause\",\"sequence\":4,\"paused\":true}\n"
+        );
+        assert_eq!(decode_render_pause(&line).unwrap(), message);
+        assert!(RenderPause::new(0, false).is_err());
+        assert!(
+            decode_render_pause(
+                br#"{"version":1,"type":"media_state","sequence":4,"paused":true}"#
+            )
+            .is_err()
+        );
+        assert!(
+            decode_render_pause(
+                br#"{"version":1,"type":"render_pause","sequence":4,"paused":true,"x":1}"#
+            )
+            .is_err()
         );
     }
 

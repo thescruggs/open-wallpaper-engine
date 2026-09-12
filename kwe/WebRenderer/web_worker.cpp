@@ -399,10 +399,26 @@ int main(int argc, char** argv) {
         host.PushAudioData(response.data(), response.size());
     };
 
+    // F3: a paused page is hidden from CEF's point of view (WasHidden stops
+    // OSR painting and throttles timers/rAF); the invalidate kicks stop and
+    // the heartbeat is suspended, because paint recency is no longer a
+    // liveness signal. The last frame keeps re-publishing at the keepalive
+    // cadence. On resume the paint clock restarts from now so the budget is
+    // measured from the resume, not from before the pause.
+    bool render_paused = false;
+    callbacks.on_render_pause = [&host, &paint, &render_paused](const kwe::RenderPauseEvent& event) {
+        if (event.paused == render_paused) return;
+        render_paused = event.paused;
+        host.SetPaused(render_paused);
+        if (! render_paused) paint.last_paint = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "event=renderer.render_pause paused=%d\n", int(render_paused));
+    };
+
     const auto heartbeat_budget =
         std::chrono::milliseconds(args.web_heartbeat_ms * args.web_heartbeat_max_failures);
     uint64_t        published = 0;
     kwe::FramePacer pacer(args.fps);
+    auto            last_keepalive = std::chrono::steady_clock::now();
 
     while (! kwe::TerminationFlag().load(std::memory_order_acquire)) {
         if (host.ShouldExit()) {
@@ -415,12 +431,22 @@ int main(int argc, char** argv) {
         input.Poll(callbacks);
 
         host.Pump();
+        if (render_paused) {
+            const auto now = std::chrono::steady_clock::now();
+            if (paint.have_frame && now - last_keepalive >= kwe::kRenderPauseKeepalive) {
+                published      = writer.Publish(paint.staging.data());
+                last_keepalive = now;
+            }
+            pacer.WaitNext();
+            continue;
+        }
         // CEF's OSR pacing goes idle without explicit invalidate kicks;
         // the kick also makes paint recency a valid liveness signal.
         host.Invalidate();
 
         if (paint.have_frame) {
-            published = writer.Publish(paint.staging.data());
+            published      = writer.Publish(paint.staging.data());
+            last_keepalive = std::chrono::steady_clock::now();
             if (std::chrono::steady_clock::now() - paint.last_paint > heartbeat_budget) {
                 std::fprintf(stderr,
                              "event=renderer.error reason=backend_reject detail=heartbeat "

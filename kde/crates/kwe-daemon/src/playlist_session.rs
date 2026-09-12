@@ -1761,6 +1761,7 @@ mod tests {
             ]),
             scene_assets_dir: None,
             shader_helper_path: None,
+            occlusion_worker: None,
         }
     }
 
@@ -2124,6 +2125,15 @@ mod tests {
             stderr_tail: Vec::new(),
             stderr_dropped_bytes: 0,
             capability_limitations: Vec::new(),
+            pause_when_covered: false,
+            desktop_covered: false,
+            render_paused: false,
+            occlusion_detector: crate::occlusion::OcclusionDetectorStatus {
+                enabled: false,
+                pid: None,
+                restarts: 0,
+                disabled_reason: None,
+            },
         }
     }
 

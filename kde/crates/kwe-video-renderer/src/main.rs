@@ -34,7 +34,8 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use kwe_frame_protocol::{FrameSpec, ProducerState, SharedFrameWriter};
 use kwe_input_protocol::{
-    InputAck, decode_audio_frame, decode_media_state, decode_pointer_line, encode_ack_line,
+    InputAck, decode_audio_frame, decode_media_state, decode_pointer_line, decode_render_pause,
+    encode_ack_line,
 };
 
 /// Set by a signal handler; checked at the top of every loop iteration.
@@ -50,6 +51,9 @@ const SOFTWARE_DECODE: &str = "no";
 
 /// Longest single mpv wait; bounds event latency and the pacing timer.
 const MAX_WAIT: Duration = Duration::from_millis(50);
+/// F3: keepalive re-publish cadence while render-paused (the supervisor's
+/// frame timeout defaults to 2 s; 500 ms keeps four keepalives inside it).
+const RENDER_PAUSE_KEEPALIVE: Duration = Duration::from_millis(500);
 
 /// Media with a known duration above this bound is a backend rejection
 /// (exit 73): the static preflight never opens media, so the 24 h cap is
@@ -237,6 +241,8 @@ struct InputChannel {
     pending: Vec<u8>,
     stdout: std::io::Stdout,
     media: Option<MediaCommand>,
+    /// F3: latest `render_pause` verdict from the daemon (None = unchanged).
+    render_pause: Option<bool>,
 }
 
 impl InputChannel {
@@ -248,6 +254,7 @@ impl InputChannel {
             pending: Vec::with_capacity(MAX_INPUT_MESSAGE_BYTES),
             stdout: std::io::stdout(),
             media: None,
+            render_pause: None,
         })
     }
 
@@ -308,6 +315,12 @@ impl InputChannel {
             Some("audio_bands") if decode_audio_frame(line).is_ok() => {
                 self.ack(ack.as_deref()); // count and discard; video has no audio path
             }
+            Some("render_pause") => {
+                if let Ok(message) = decode_render_pause(line) {
+                    self.render_pause = Some(message.paused);
+                    self.ack(ack.as_deref());
+                }
+            }
             _ => {} // unknown types and malformed messages are ignored
         }
     }
@@ -324,6 +337,10 @@ impl InputChannel {
 
     fn take_media(&mut self) -> Option<MediaCommand> {
         self.media.take()
+    }
+
+    fn take_render_pause(&mut self) -> Option<bool> {
+        self.render_pause.take()
     }
 }
 
@@ -914,11 +931,32 @@ impl VideoWorker {
             .context("frame dimensions overflow the scratch buffer")?;
         let mut scratch = vec![0_u8; scratch_len];
         let format = "bgr0";
+        // F3: while the daemon says the desktop is covered, playback is
+        // paused (no decode) and the last frame is re-published at the
+        // keepalive rate instead of the wallpaper's fps, so the supervisor's
+        // watchdog still sees liveness at a fraction of the cost.
+        let mut render_paused = false;
+        let mut media_paused = false;
         eprintln!("event=renderer.video.session hwdec={hwdec} format={format}");
         loop {
             self.input.poll();
             if let Some(command) = self.input.take_media() {
-                self.apply_media(session, command);
+                media_paused = !matches!(command, MediaCommand::Play);
+                // A render pause holds the player regardless of media state;
+                // the media command is remembered for the resume below.
+                if !render_paused {
+                    self.apply_media(session, command);
+                }
+            }
+            if let Some(paused) = self.input.take_render_pause()
+                && paused != render_paused
+            {
+                render_paused = paused;
+                let hold = paused || media_paused;
+                match session.set_property_flag("pause", hold) {
+                    Ok(()) => eprintln!("event=renderer.render_pause paused={paused}"),
+                    Err(error) => eprintln!("event=renderer.media_error detail={error}"),
+                }
             }
             self.check_faults()?;
             if TERMINATED.load(Ordering::Acquire) {
@@ -938,6 +976,11 @@ impl VideoWorker {
                 session.wait_event(wait)?;
                 continue;
             }
+            let publish_interval = if render_paused {
+                RENDER_PAUSE_KEEPALIVE.max(interval)
+            } else {
+                interval
+            };
             match next_publish(now, deadline, new_frame_queued, last_pixels.is_some()) {
                 PublishDecision::NewFrame => {
                     new_frame_queued = false;
@@ -973,7 +1016,7 @@ impl VideoWorker {
                 }
                 PublishDecision::Wait => {}
             }
-            deadline = now + interval;
+            deadline = now + publish_interval;
         }
     }
 

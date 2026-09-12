@@ -94,6 +94,17 @@ that the daemon and display client keep using.
   with a `/usr/bin/kwe-web-renderer` symlink; `scripts/dev-run.sh`
   flattens the extracted CEF archive for dev-tree runs.
 
+## Render pause (F3)
+
+Both workers honour the `render_pause` input line through the shared
+`kwe/Common/InputWire.cppm` dispatcher: the scene worker calls the engine's
+`pause()`/`play()` and stops copying frames, the web worker hides the CEF
+browser (`SetPaused` → `WasHidden`), stops its invalidate kicks and
+suspends the paint heartbeat. Both keep re-publishing the last frame every
+500 ms while paused so kwe-daemon's frame watchdog needs no special case.
+The detector side lives in `kde/apps/kwe-occlusion-worker` (see
+`kde/docs/SUPERVISOR_API_V1.md`, "Pause when covered").
+
 ## Capability gate
 
 `kwe-core`'s `SCENE_CAPABILITIES_IMPLEMENTED` now covers every id the

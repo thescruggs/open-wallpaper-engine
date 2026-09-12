@@ -6,6 +6,7 @@ mod apply;
 mod audio;
 mod grants;
 mod inspect;
+mod occlusion;
 mod persist;
 mod playlist_session;
 mod selfcheck;
@@ -43,8 +44,9 @@ use playlist_session::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use supervisor::{
-    ContentSpec, RendererKind, RendererResourceLimits, ScalingMode, StartSpec, SupervisorConfig,
-    SupervisorHandle, SupervisorService, TestFault, WorkerStatus, validate_identity_part,
+    ContentSpec, OcclusionWorkerConfig, RendererKind, RendererResourceLimits, ScalingMode,
+    StartSpec, SupervisorConfig, SupervisorHandle, SupervisorService, TestFault, WorkerStatus,
+    validate_identity_part,
 };
 use workshop_cache::WorkshopCache;
 
@@ -114,6 +116,15 @@ struct Arguments {
     /// (decision (c)).
     #[arg(long = "shader-helper")]
     shader_helper: Option<PathBuf>,
+    /// F3: occlusion detector helper (`kwe-occlusion-worker`, the Qt/D-Bus
+    /// process that loads the packaged KWin script). Default: beside the
+    /// daemon executable. Spawned only while the `pause_when_covered`
+    /// setting is on; `--no-occlusion-worker` disables the automatic
+    /// detector entirely (explicit `occlusion.report` calls still work).
+    #[arg(long = "occlusion-worker")]
+    occlusion_worker: Option<PathBuf>,
+    #[arg(long)]
+    no_occlusion_worker: bool,
     /// Wallpaper Engine assets root (S1), passed to the scene worker and
     /// to scene preflight so model layers can resolve their material
     /// textures. Default: the first existing
@@ -435,6 +446,18 @@ fn main() -> Result<()> {
             .shader_helper
             .clone()
             .or_else(default_shader_helper_path),
+        occlusion_worker: if arguments.no_occlusion_worker {
+            None
+        } else {
+            arguments
+                .occlusion_worker
+                .clone()
+                .or_else(default_occlusion_worker_path)
+                .map(|worker_path| OcclusionWorkerConfig {
+                    worker_path,
+                    socket: socket.clone(),
+                })
+        },
     })?;
     let supervisor = supervisor_service.handle();
     let workshop_cache = Arc::new(std::sync::Mutex::new(WorkshopCache::open(
@@ -1014,18 +1037,42 @@ fn process_request(
             // respawns the live worker so the toggle is immediate). Distinct
             // from the per-wallpaper `audio` grant, which gates captured
             // system audio for audio-reactive wallpapers.
-            "settings.get" => permissions_call(supervisor, |handle| {
-                handle
-                    .audio_output_get()
-                    .map(|enabled| json!({"audio_output": enabled}))
-            }),
+            "settings.get" => permissions_call(supervisor, settings_record),
             "settings.set" => {
                 match serde_json::from_value::<SettingsSetParams>(request.params.clone()) {
+                    Ok(params)
+                        if params.audio_output.is_none() && params.pause_when_covered.is_none() =>
+                    {
+                        json!({
+                            "error": "invalid_params",
+                            "detail": "settings.set needs at least one of audio_output, pause_when_covered"
+                        })
+                    }
                     Ok(params) => permissions_call(supervisor, |handle| {
-                        handle
-                            .audio_output_set(params.audio_output)
-                            .map(|enabled| json!({"audio_output": enabled}))
+                        if let Some(enabled) = params.audio_output {
+                            handle.audio_output_set(enabled)?;
+                        }
+                        if let Some(enabled) = params.pause_when_covered {
+                            handle.pause_when_covered_set(enabled)?;
+                        }
+                        settings_record(handle)
                     }),
+                    Err(error) => {
+                        json!({"error": "invalid_params", "detail": error.to_string()})
+                    }
+                }
+            }
+            // F3: an occlusion verdict from the daemon's detector helper (or
+            // a test). The socket is user-private, so any local caller may
+            // feed one; the worst case is a paused wallpaper on the same
+            // desktop the caller already controls.
+            "occlusion.report" => {
+                match serde_json::from_value::<OcclusionReportParams>(request.params.clone()) {
+                    Ok(params) => {
+                        let covered =
+                            occlusion::all_outputs_covered(&params.outputs, &params.covered);
+                        supervisor_call(supervisor, |handle| handle.occlusion_report(covered))
+                    }
                     Err(error) => {
                         json!({"error": "invalid_params", "detail": error.to_string()})
                     }
@@ -1222,7 +1269,26 @@ struct PermissionsGetParams {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SettingsSetParams {
-    audio_output: bool,
+    audio_output: Option<bool>,
+    pause_when_covered: Option<bool>,
+}
+
+/// `occlusion.report` params (F3): the detector's current view — every
+/// output it knows about and the subset covered by a maximized or
+/// fullscreen window. Bounded: a session has a handful of outputs.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OcclusionReportParams {
+    outputs: Vec<String>,
+    covered: Vec<String>,
+}
+
+/// The effective global settings record answered by `settings.get`/`set`.
+fn settings_record(handle: &SupervisorHandle) -> Result<Value> {
+    Ok(json!({
+        "audio_output": handle.audio_output_get()?,
+        "pause_when_covered": handle.pause_when_covered_get()?,
+    }))
 }
 
 /// `permissions.set` params (BETA_M2c): patch the stored record. Provided
@@ -1597,6 +1663,14 @@ fn default_inspector_path() -> Option<PathBuf> {
 /// `--shader-helper` flag (its own sibling-resolution fallback still
 /// applies; decision (c) means an unavailable helper never breaks
 /// rendering either way).
+/// Default `kwe-occlusion-worker` beside the daemon executable (F3); like
+/// the shader helper, optional — `None` just means no automatic detector.
+fn default_occlusion_worker_path() -> Option<PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    let directory = executable.parent()?;
+    Some(directory.join("kwe-occlusion-worker"))
+}
+
 fn default_shader_helper_path() -> Option<PathBuf> {
     let executable = std::env::current_exe().ok()?;
     let directory = executable.parent()?;
@@ -1811,6 +1885,7 @@ mod tests {
             ]),
             scene_assets_dir: None,
             shader_helper_path: None,
+            occlusion_worker: None,
         })
         .unwrap()
     }
@@ -2013,6 +2088,69 @@ mod tests {
         for bad in [
             r#"{"version":1,"method":"settings.set","params":{"audio_output":false,"bogus":1}}"#,
             r#"{"version":1,"method":"settings.set","params":{}}"#,
+        ] {
+            let (ok, result) = process_with_supervisor(bad, &handle);
+            assert!(!ok, "{bad}");
+            assert_eq!(result["error"], "invalid_params", "{bad}");
+        }
+    }
+
+    /// F3: the pause policy is a second settings knob (default off), the
+    /// two knobs patch independently, and `occlusion.report` feeds the
+    /// supervisor's verdict — visible on `renderer.status` even without a
+    /// live worker.
+    #[test]
+    fn settings_pause_when_covered_and_occlusion_report_round_trip() {
+        let service = supervisor_service();
+        let handle = service.handle();
+        let (ok, result) =
+            process_with_supervisor(r#"{"version":1,"method":"settings.get"}"#, &handle);
+        assert!(ok, "{result}");
+        assert_eq!(result["pause_when_covered"], false, "default must be off");
+        assert_eq!(result["audio_output"], true);
+
+        let (ok, result) = process_with_supervisor(
+            r#"{"version":1,"method":"settings.set","params":{"pause_when_covered":true}}"#,
+            &handle,
+        );
+        assert!(ok, "{result}");
+        assert_eq!(result["pause_when_covered"], true);
+        assert_eq!(result["audio_output"], true, "the other knob is untouched");
+
+        // Every output covered → covered verdict; a partial cover is not.
+        let (ok, result) = process_with_supervisor(
+            r#"{"version":1,"method":"occlusion.report","params":{"outputs":["DP-1","HDMI-A-1"],"covered":["DP-1"]}}"#,
+            &handle,
+        );
+        assert!(ok, "{result}");
+        assert_eq!(result["desktop_covered"], false);
+        let (ok, result) = process_with_supervisor(
+            r#"{"version":1,"method":"occlusion.report","params":{"outputs":["DP-1","HDMI-A-1"],"covered":["HDMI-A-1","DP-1"]}}"#,
+            &handle,
+        );
+        assert!(ok, "{result}");
+        assert_eq!(result["desktop_covered"], true);
+        assert_eq!(result["pause_when_covered"], true);
+        // Nothing is live, so nothing was told to pause.
+        assert_eq!(result["render_paused"], false);
+        assert_eq!(result["occlusion_detector"]["enabled"], true);
+
+        // Switching the policy off drops the verdict.
+        let (ok, result) = process_with_supervisor(
+            r#"{"version":1,"method":"settings.set","params":{"pause_when_covered":false,"audio_output":false}}"#,
+            &handle,
+        );
+        assert!(ok, "{result}");
+        assert_eq!(result["pause_when_covered"], false);
+        assert_eq!(result["audio_output"], false);
+        let (ok, result) =
+            process_with_supervisor(r#"{"version":1,"method":"renderer.status"}"#, &handle);
+        assert!(ok, "{result}");
+        assert_eq!(result["desktop_covered"], false);
+
+        for bad in [
+            r#"{"version":1,"method":"occlusion.report","params":{"outputs":["DP-1"]}}"#,
+            r#"{"version":1,"method":"occlusion.report","params":{"outputs":["DP-1"],"covered":[],"x":1}}"#,
         ] {
             let (ok, result) = process_with_supervisor(bad, &handle);
             assert!(!ok, "{bad}");
@@ -2951,6 +3089,7 @@ with open(args.output, "wb") as frame:
             ]),
             scene_assets_dir: None,
             shader_helper_path: None,
+            occlusion_worker: None,
         }
     }
 
@@ -4438,6 +4577,7 @@ args = parser.parse_args()
             ]),
             scene_assets_dir: None,
             shader_helper_path: None,
+            occlusion_worker: None,
         })
         .unwrap();
         let supervisor = supervisor_service.handle();

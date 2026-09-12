@@ -17,7 +17,9 @@ public:
     }
     bool listen(const QString &path) { return m_server.listen(path); }
     bool audioOutput = true;
+    bool pauseWhenCovered = false;
     int sets = 0;
+    QJsonObject lastSetParams;
     bool failNext = false;
 
 private:
@@ -39,13 +41,17 @@ private:
                 result.insert(QStringLiteral("error"), QStringLiteral("permissions_failed"));
             } else if (method == QStringLiteral("settings.get")) {
                 result.insert(QStringLiteral("audio_output"), audioOutput);
+                result.insert(QStringLiteral("pause_when_covered"), pauseWhenCovered);
             } else if (method == QStringLiteral("settings.set")) {
                 ++sets;
-                audioOutput = request.value(QStringLiteral("params"))
-                                  .toObject()
-                                  .value(QStringLiteral("audio_output"))
-                                  .toBool();
+                lastSetParams = request.value(QStringLiteral("params")).toObject();
+                if (lastSetParams.contains(QStringLiteral("audio_output")))
+                    audioOutput = lastSetParams.value(QStringLiteral("audio_output")).toBool();
+                if (lastSetParams.contains(QStringLiteral("pause_when_covered")))
+                    pauseWhenCovered =
+                        lastSetParams.value(QStringLiteral("pause_when_covered")).toBool();
                 result.insert(QStringLiteral("audio_output"), audioOutput);
+                result.insert(QStringLiteral("pause_when_covered"), pauseWhenCovered);
             }
             socket->write(QJsonDocument(QJsonObject{
                               {QStringLiteral("version"), 1},
@@ -70,8 +76,27 @@ private slots:
 
     void init() {
         m_daemon.audioOutput = true;
+        m_daemon.pauseWhenCovered = false;
         m_daemon.sets = 0;
         m_daemon.failNext = false;
+        m_daemon.lastSetParams = {};
+    }
+
+    void pauseWhenCoveredPatchesOnlyItsOwnField() {
+        m_daemon.pauseWhenCovered = true;
+        SettingsClient client(m_socketPath);
+        QTRY_VERIFY(client.loaded());
+        QVERIFY(client.pauseWhenCovered());
+        QVERIFY(client.audioOutput());
+
+        client.setPauseWhenCovered(false);
+        QVERIFY(!client.pauseWhenCovered());
+        QTRY_COMPARE(m_daemon.sets, 1);
+        QTRY_VERIFY(!client.busy());
+        QVERIFY(!m_daemon.pauseWhenCovered);
+        QCOMPARE(m_daemon.lastSetParams.keys(), QStringList{QStringLiteral("pause_when_covered")});
+        QVERIFY(m_daemon.audioOutput);
+        QVERIFY(client.errorMessage().isEmpty());
     }
 
     void loadsTheDaemonValueAndSetsRoundTrip() {

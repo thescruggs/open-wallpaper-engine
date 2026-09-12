@@ -2,16 +2,20 @@
 //! Daemon-owned global wallpaper settings.
 //!
 //! One record for the whole daemon, in `settings-v1.json` beside
-//! `permissions-v1.json` in the private state directory. Currently a single
-//! knob: `audio_output` — whether wallpapers may PLAY sound (distinct from
-//! the per-wallpaper `audio` grant, which gates delivery of CAPTURED system
-//! audio to audio-reactive wallpapers). The supervisor re-reads the store at
+//! `permissions-v1.json` in the private state directory. Two knobs:
+//! `audio_output` — whether wallpapers may PLAY sound (distinct from the
+//! per-wallpaper `audio` grant, which gates delivery of CAPTURED system
+//! audio to audio-reactive wallpapers); the supervisor re-reads the store at
 //! every spawn and appends `--mute` to video and scene workers while audio
-//! output is disabled; web workers stay always-muted by their own policy.
+//! output is disabled (web workers stay always-muted by their own policy).
+//! `pause_when_covered` (F3) — whether the live renderer is told to pause
+//! while every output is covered by a maximized or fullscreen window; the
+//! supervisor runs the occlusion detector only while this is on.
 //!
-//! Default: enabled (the behavior before this store existed). Persistence is
-//! atomic; a corrupt file is quarantined with the rename-to-invalid pattern
-//! and the store starts fresh, mirroring `grants::GrantStore`.
+//! Defaults: audio enabled (the behavior before this store existed), pause
+//! off. Persistence is atomic; a corrupt file is quarantined with the
+//! rename-to-invalid pattern and the store starts fresh, mirroring
+//! `grants::GrantStore`.
 
 use std::{
     fs::OpenOptions,
@@ -39,6 +43,9 @@ struct PersistedSettings {
     schema_version: u32,
     #[serde(default = "default_audio_output")]
     audio_output: bool,
+    /// Additive (F3): files written before the field existed load as `false`.
+    #[serde(default)]
+    pause_when_covered: bool,
 }
 
 impl Default for PersistedSettings {
@@ -46,6 +53,7 @@ impl Default for PersistedSettings {
         Self {
             schema_version: 1,
             audio_output: true,
+            pause_when_covered: false,
         }
     }
 }
@@ -80,6 +88,23 @@ impl SettingsStore {
         }
         let mut next = self.state.clone();
         next.audio_output = enabled;
+        self.save(&next)?;
+        self.state = next;
+        Ok(true)
+    }
+
+    pub fn pause_when_covered(&self) -> bool {
+        self.state.pause_when_covered
+    }
+
+    /// F3: persists the pause-when-covered policy atomically. Returns whether
+    /// the value changed.
+    pub fn set_pause_when_covered(&mut self, enabled: bool) -> Result<bool> {
+        if self.state.pause_when_covered == enabled {
+            return Ok(false);
+        }
+        let mut next = self.state.clone();
+        next.pause_when_covered = enabled;
         self.save(&next)?;
         self.state = next;
         Ok(true)
@@ -173,6 +198,28 @@ mod tests {
 
         let reloaded = SettingsStore::open(&directory).unwrap();
         assert!(!reloaded.audio_output(), "the value must persist");
+    }
+
+    #[test]
+    fn pause_when_covered_defaults_off_round_trips_and_loads_legacy_files() {
+        let directory = temporary_directory("pause");
+        let mut store = SettingsStore::open(&directory).unwrap();
+        assert!(!store.pause_when_covered(), "pause must default to off");
+        assert!(store.set_pause_when_covered(true).unwrap());
+        assert!(!store.set_pause_when_covered(true).unwrap());
+        let reloaded = SettingsStore::open(&directory).unwrap();
+        assert!(reloaded.pause_when_covered());
+        assert!(reloaded.audio_output(), "the other knob is untouched");
+
+        // A record written before F3 existed loads with the field defaulted.
+        std::fs::write(
+            directory.join(SETTINGS_FILE),
+            br#"{"schema_version":1,"audio_output":false}"#,
+        )
+        .unwrap();
+        let legacy = SettingsStore::open(&directory).unwrap();
+        assert!(!legacy.audio_output());
+        assert!(!legacy.pause_when_covered());
     }
 
     #[test]

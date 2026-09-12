@@ -26,6 +26,8 @@ documented in `PROTOCOL_V1.md`. These additive methods use version `1`:
 - `wallpaper.apply` *(BETA_M4a)*
 - `wallpaper.restore` *(BETA_M4a)*
 - `wallpaper.assignments` *(BETA_M4a)*
+- `settings.get` / `settings.set`
+- `occlusion.report` *(F3)*
 
 ## Start and retry
 
@@ -136,7 +138,10 @@ persisted record is quarantined; a quarantined `renderer.start` leaves the
 record's `last_failure`/`last_failure_detail` in the status so the caller
 can say why. `scaling` (F1) is the active worker's scaling mode (the
 requested one while nothing is live) — the plugin reads it for the frame →
-output mapping.
+output mapping. `pause_when_covered`, `desktop_covered`, `render_paused`
+and `occlusion_detector` (F3) describe the pause-when-covered policy, the
+detector's latest verdict and what the active worker was told (see Global
+settings → Pause when covered).
 
 The PID/frame/sequence fields always describe the active display source.
 Candidate state is separate in `requested_*`, `candidate_pid`,
@@ -231,14 +236,18 @@ future stricter modes and is not enforced yet.
 ## Global settings
 
 One daemon-wide record in `settings-v1.json` (same quarantine-on-corrupt
-posture as the grant store). One knob today: whether wallpapers may PLAY
-sound. This is distinct from the per-wallpaper `audio` grant above, which
-gates delivery of *captured* system audio to audio-reactive wallpapers.
+posture as the grant store). Two knobs: whether wallpapers may PLAY sound
+(distinct from the per-wallpaper `audio` grant above, which gates delivery
+of *captured* system audio to audio-reactive wallpapers), and whether
+rendering pauses while the desktop is covered (F3).
 
-- `settings.get` → `{"audio_output": true|false}` (default `true`).
-- `settings.set` `{"audio_output": false}` → persists the value and answers
-  the effective record. Unknown or missing fields are rejected
-  (`invalid_params`).
+- `settings.get` → `{"audio_output": true|false, "pause_when_covered":
+  true|false}` (defaults `true` / `false`).
+- `settings.set` `{"audio_output": false}` or `{"pause_when_covered": true}`
+  (either or both) → persists the values and answers the effective record.
+  Unknown fields, or a patch naming neither knob, are rejected
+  (`invalid_params`). A record written before `pause_when_covered` existed
+  loads with it off.
 
 ### Enforcement
 
@@ -255,6 +264,33 @@ runtime dir at all. A
 worker through the normal candidate/canary/handoff lifecycle, so the toggle
 is immediate; a respawn blocked by a pending display handoff is deferred
 (`settings.audio_respawn_deferred`) and the next launch honors the setting.
+
+### Pause when covered *(F3)*
+
+While `pause_when_covered` is on the supervisor runs `kwe-occlusion-worker`
+(resolved beside the daemon, `--occlusion-worker` overrides,
+`--no-occlusion-worker` disables; same bounded lifecycle as the audio
+worker — own process group, parent-death SIGTERM, three restarts per ten
+minutes, then disabled until the setting is toggled). The helper owns the
+session-bus name `org.kde.kwe.Occlusion1`, loads the packaged KWin script
+(`/usr/share/kde-wallpaper-engine/kwin/kwe-occlusion.js`) through
+`org.kde.kwin.Scripting`, and relays each debounced transition (250 ms) as:
+
+- `occlusion.report` `{"outputs": ["DP-1", "HDMI-A-1"], "covered": ["DP-1"]}`
+  → answers `renderer.status`. The socket is user-private, so any local
+  caller may feed a verdict (the smoke lanes do).
+
+Policy: the desktop counts as covered only when **every** reported output is
+covered (all displays share one renderer) and at least one output was
+reported. The effective pause — setting on AND covered — reaches the ACTIVE
+worker as one `render_pause` line (`docs/INPUT_PROTOCOL_V1.md`); candidates
+render normally through the canary and the promoted worker is synchronized
+after promotion. The verdict is dropped (resume) whenever the detector exits,
+KWin unregisters, or the setting is switched off, so a dead detector can
+never leave the wallpaper frozen. Playlist timers keep running (wall clock).
+`renderer.status` carries `pause_when_covered`, `desktop_covered`,
+`render_paused` (what the active worker was last told) and
+`occlusion_detector` `{enabled, pid, restarts, disabled_reason}`.
 
 ## Audio and media control
 

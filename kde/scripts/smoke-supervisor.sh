@@ -43,6 +43,7 @@ start_daemon() {
         --renderer-handoff-timeout-ms 1000 \
         --renderer-max-failures 3 \
         --renderer-address-space-mib 384 \
+        --no-occlusion-worker \
         --allow-test-faults >"$smoke_root/daemon.log" 2>&1 &
     daemon_pid=$!
     for _attempt in {1..100}; do
@@ -144,6 +145,38 @@ if call_daemon renderer.input "{\"generation\":$healthy_generation,\"phase\":\"m
 fi
 call_daemon renderer.input "{\"generation\":$healthy_generation,\"phase\":\"leave\",\"x\":0.25,\"y\":0.75}" >/dev/null
 echo "supervisor generation-bound pointer input and renderer acknowledgement passed"
+# F3: the pause policy reaches the live worker as render_pause, the paused
+# worker keeps publishing keepalives (sequence advances, no failure), and
+# resume/policy-off clear it. The verdict is fed directly (--no-occlusion-worker).
+pause_status="$(call_daemon settings.set '{"pause_when_covered":true}')"
+[[ "$(jq -r '.result.pause_when_covered' <<<"$pause_status")" == "true" ]]
+[[ "$(jq -r '.result.audio_output' <<<"$pause_status")" == "true" ]]
+partial_status="$(call_daemon occlusion.report '{"outputs":["DP-1","HDMI-A-1"],"covered":["DP-1"]}')"
+[[ "$(jq -r '.result.desktop_covered' <<<"$partial_status")" == "false" ]]
+[[ "$(jq -r '.result.render_paused' <<<"$partial_status")" == "false" ]]
+covered_status="$(call_daemon occlusion.report '{"outputs":["DP-1","HDMI-A-1"],"covered":["HDMI-A-1","DP-1"]}')"
+[[ "$(jq -r '.result.desktop_covered' <<<"$covered_status")" == "true" ]]
+[[ "$(jq -r '.result.render_paused' <<<"$covered_status")" == "true" ]]
+paused_sequence="$(jq -r '.result.sequence' <<<"$covered_status")"
+sleep 0.4
+keepalive_status="$(call_daemon renderer.status)"
+[[ "$(jq -r '.result.phase' <<<"$keepalive_status")" == "live" ]]
+[[ "$(jq -r '.result.last_failure' <<<"$keepalive_status")" == "null" ]]
+(( "$(jq -r '.result.sequence' <<<"$keepalive_status")" > paused_sequence ))
+grep -q 'event=renderer.render_pause paused=true' "$smoke_root/daemon.log"
+resumed_status="$(call_daemon occlusion.report '{"outputs":["DP-1","HDMI-A-1"],"covered":[]}')"
+[[ "$(jq -r '.result.render_paused' <<<"$resumed_status")" == "false" ]]
+call_daemon occlusion.report '{"outputs":["DP-1"],"covered":["DP-1"]}' >/dev/null
+off_status="$(call_daemon settings.set '{"pause_when_covered":false}')"
+[[ "$(jq -r '.result.pause_when_covered' <<<"$off_status")" == "false" ]]
+off_status="$(call_daemon renderer.status)"
+[[ "$(jq -r '.result.desktop_covered' <<<"$off_status")" == "false" ]]
+[[ "$(jq -r '.result.render_paused' <<<"$off_status")" == "false" ]]
+if call_daemon occlusion.report '{"outputs":["DP-1"]}' >/dev/null 2>&1; then
+    echo "occlusion.report without covered was accepted" >&2
+    exit 1
+fi
+echo "supervisor render-pause policy, keepalive liveness and resume passed"
 last_good_file="$(jq -r '.last_good.file' "$state_dir/supervisor-v1.json")"
 [[ -s "$state_dir/$last_good_file" ]]
 head -c 2 "$state_dir/$last_good_file" | cmp -s - <(printf 'P6')
