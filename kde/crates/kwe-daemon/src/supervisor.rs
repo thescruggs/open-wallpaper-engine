@@ -551,9 +551,9 @@ pub struct WorkerStatus {
     pub capability_limitations: Vec<String>,
     /// F3: the global pause-when-covered policy switch.
     pub pause_when_covered: bool,
-    /// F3: the latest occlusion verdict (every output covered by a
-    /// maximized/fullscreen window). Reset to `false` whenever the detector
-    /// goes away, so a dead detector can never freeze the wallpaper.
+    /// F3: the latest occlusion verdict (every output showing a fullscreen
+    /// application). Reset to `false` whenever the detector goes away, so a
+    /// dead detector can never freeze the wallpaper.
     pub desktop_covered: bool,
     /// F3: what the active worker was last told (`render_pause`); equals
     /// `pause_when_covered && desktop_covered` once the message was queued.

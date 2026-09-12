@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // KDE Wallpaper Engine occlusion detector (F3). Loaded into KWin by
 // kwe-occlusion-worker through org.kde.kwin.Scripting; reports, per output,
-// whether a normal window on the current desktop/activity is fullscreen or
-// covers the output's whole maximize area. One D-Bus call per transition —
-// the report string is compared before sending, so window drags and
-// per-frame geometry updates never spam the bus. The bridge debounces and
-// relays to kwe-daemon as `occlusion.report`; the daemon applies the
-// "every output covered" policy.
+// whether an application window on the current desktop/activity is
+// FULLSCREEN (a game, a video player). Maximized windows deliberately do not
+// count: the maintainer wants the wallpaper animating behind normal work,
+// and KWin lists the Plasma desktop itself as a captionless full-size
+// "normal" window, so a geometry-based rule saw the desktop as permanently
+// covered. One D-Bus call per transition — the report string is compared
+// before sending, so per-frame updates never spam the bus. The bridge
+// debounces and relays to kwe-daemon as `occlusion.report`; the daemon
+// applies the "every output covered" policy.
 "use strict";
 
 const SERVICE = "org.kde.kwe.Occlusion1";
@@ -14,13 +17,6 @@ const PATH = "/org/kde/kwe/Occlusion";
 const INTERFACE = "org.kde.kwe.Occlusion1";
 
 let lastReport = "";
-
-function rectCovers(outer, inner) {
-    // One pixel of slack: fractional frame geometry on scaled outputs.
-    return outer.x <= inner.x + 1 && outer.y <= inner.y + 1 &&
-        outer.x + outer.width >= inner.x + inner.width - 1 &&
-        outer.y + outer.height >= inner.y + inner.height - 1;
-}
 
 function sameDesktop(a, b) {
     if (a === b) return true;
@@ -43,22 +39,12 @@ function onCurrentActivity(window) {
     return activities.indexOf(workspace.currentActivity) >= 0;
 }
 
-function maximizeArea(window) {
-    try {
-        return workspace.clientArea(KWin.MaximizeArea, window);
-    } catch (error) {
-        return window.output ? window.output.geometry : null;
-    }
-}
-
 function windowCovers(window) {
     if (!window || window.deleted || window.minimized) return false;
-    if (!window.normalWindow) return false;
-    if (!onCurrentDesktop(window) || !onCurrentActivity(window)) return false;
-    if (window.fullScreen) return true;
-    const area = maximizeArea(window);
-    if (!area) return false;
-    return rectCovers(window.frameGeometry, area);
+    if (!window.fullScreen) return false;
+    // The desktop, panels and other shell surfaces are never "an app".
+    if (window.desktopWindow || window.dock || window.specialWindow) return false;
+    return onCurrentDesktop(window) && onCurrentActivity(window);
 }
 
 function evaluate() {
@@ -84,8 +70,8 @@ function evaluate() {
 }
 
 const WINDOW_SIGNALS = [
-    "frameGeometryChanged", "minimizedChanged", "fullScreenChanged",
-    "desktopsChanged", "outputChanged", "activitiesChanged", "closed",
+    "minimizedChanged", "fullScreenChanged", "desktopsChanged",
+    "outputChanged", "activitiesChanged", "closed",
 ];
 
 function track(window) {

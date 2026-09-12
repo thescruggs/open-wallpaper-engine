@@ -9,8 +9,8 @@
 //! every spawn and appends `--mute` to video and scene workers while audio
 //! output is disabled (web workers stay always-muted by their own policy).
 //! `pause_when_covered` (F3) — whether the live renderer is told to pause
-//! while every output is covered by a maximized or fullscreen window; the
-//! supervisor runs the occlusion detector only while this is on.
+//! while every output shows a fullscreen application; the supervisor runs
+//! the occlusion detector only while this is on.
 //!
 //! Defaults: audio enabled (the behavior before this store existed), pause
 //! off. Persistence is atomic; a corrupt file is quarantined with the

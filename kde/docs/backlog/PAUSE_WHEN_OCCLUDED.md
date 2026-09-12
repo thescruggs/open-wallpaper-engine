@@ -13,6 +13,12 @@
   - Policy is **global** (`settings.pause_when_covered`, Settings page
     "Performance"), not per assignment: one renderer serves every display,
     so the pause fires only when every output is covered.
+  - **Fullscreen only** (maintainer, first live test 2026-09-11: "let's only
+    pause if an app goes full screen"). The original maximized rule was also
+    broken in practice: KWin reports the Plasma desktop surface as a
+    captionless full-size `normalWindow`, so the wallpaper paused at once
+    and never resumed. `desktopWindow`/`dock`/`specialWindow` are excluded
+    and `frameGeometryChanged` is no longer tracked.
   - The daemon does **not** relax the frame timeout: paused workers keep
     keepalive-publishing at 500 ms (video/test in Rust; scene/web via the
     shared `InputWire` in `kwe/Common`). Scene = engine `pause()`/`play()`,

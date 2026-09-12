@@ -12,3 +12,6 @@
 /packaging/*.pkg.tar
 /packaging/*.pkg.tar.zst
 
+/packaging/open-wallpaper-engine/
+/packaging/src/
+/packaging/pkg/

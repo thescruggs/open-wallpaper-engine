@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! F3 occlusion detector lifecycle: owns the `kwe-occlusion-worker` child
 //! (a small Qt/D-Bus helper that loads the packaged KWin script and relays
-//! per-output "covered by a maximized/fullscreen window" transitions back
-//! over the daemon socket as `occlusion.report`). Driven synchronously from
+//! per-output "a fullscreen application is showing" transitions back over
+//! the daemon socket as `occlusion.report`). Driven synchronously from
 //! the supervisor tick — no thread of its own — because the only consumer
 //! of its state is the supervisor's render-pause policy.
 //!
@@ -256,7 +256,8 @@ fn signal_process_group(pid: u32, signal: libc::c_int) {
 
 /// Pure policy: the desktop counts as covered only when every reported
 /// output is covered and at least one output was reported. An empty output
-/// list (detector starting up, KWin gone) never pauses.
+/// list (detector starting up, KWin gone) never pauses. "Covered" means a
+/// fullscreen application window — maximized windows do not count.
 pub fn all_outputs_covered(outputs: &[String], covered: &[String]) -> bool {
     !outputs.is_empty() && outputs.iter().all(|output| covered.contains(output))
 }

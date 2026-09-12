@@ -50,10 +50,10 @@ Kirigami.ScrollablePage {
         }
 
         Controls.Switch {
-            text: qsTr("Pause when a window covers the desktop")
+            text: qsTr("Pause while an app is fullscreen")
             checked: settingsClient.pauseWhenCovered
             enabled: settingsClient.loaded && !settingsClient.busy
-            Accessible.description: qsTr("Pauses the wallpaper while a maximized or fullscreen window covers every display, and resumes when the desktop is visible again.")
+            Accessible.description: qsTr("Pauses the wallpaper while a fullscreen application, such as a game, is on every display, and resumes when it leaves fullscreen.")
             Controls.ToolTip.visible: hovered
             Controls.ToolTip.text: Accessible.description
             onToggled: settingsClient.setPauseWhenCovered(checked)
@@ -61,7 +61,7 @@ Kirigami.ScrollablePage {
 
         Controls.Label {
             Layout.fillWidth: true
-            text: qsTr("Saves CPU and GPU while you work in a maximized or fullscreen window. With more than one display the wallpaper pauses only when every display is covered, because all displays share one renderer. Needs KWin; the last frame stays on screen while paused.")
+            text: qsTr("Saves CPU and GPU while you play a game or watch a video fullscreen. Maximized windows do not pause. With more than one display the wallpaper pauses only when every display has a fullscreen app, because all displays share one renderer. Needs KWin; the last frame stays on screen while paused.")
             wrapMode: Text.Wrap
             opacity: 0.8
         }

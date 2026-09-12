@@ -1274,8 +1274,8 @@ struct SettingsSetParams {
 }
 
 /// `occlusion.report` params (F3): the detector's current view — every
-/// output it knows about and the subset covered by a maximized or
-/// fullscreen window. Bounded: a session has a handful of outputs.
+/// output it knows about and the subset showing a fullscreen application.
+/// Bounded: a session has a handful of outputs.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OcclusionReportParams {

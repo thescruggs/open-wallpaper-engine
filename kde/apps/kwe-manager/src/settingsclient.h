@@ -12,8 +12,8 @@
 // Daemon-backed global wallpaper settings (settings.get/set). Two knobs:
 // audioOutput — whether wallpapers may play sound (the daemon respawns the
 // live renderer on change), and pauseWhenCovered (F3) — whether rendering
-// pauses while every display is covered by a maximized or fullscreen
-// window (the daemon starts its KWin-backed detector while this is on).
+// pauses while a fullscreen application covers every display (the daemon
+// starts its KWin-backed detector while this is on).
 // This client mirrors the effective values. Transport mirrors PlaylistClient:
 // one request per connection, newline-delimited JSON, bounded queue with
 // backoff so a toggle survives a daemon restart.

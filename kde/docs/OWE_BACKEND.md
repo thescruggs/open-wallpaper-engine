@@ -102,8 +102,9 @@ Both workers honour the `render_pause` input line through the shared
 browser (`SetPaused` → `WasHidden`), stops its invalidate kicks and
 suspends the paint heartbeat. Both keep re-publishing the last frame every
 500 ms while paused so kwe-daemon's frame watchdog needs no special case.
-The detector side lives in `kde/apps/kwe-occlusion-worker` (see
-`kde/docs/SUPERVISOR_API_V1.md`, "Pause when covered").
+The detector side lives in `kde/apps/kwe-occlusion-worker` (fullscreen
+applications only; see `kde/docs/SUPERVISOR_API_V1.md`, "Pause when
+covered").
 
 ## Capability gate
 

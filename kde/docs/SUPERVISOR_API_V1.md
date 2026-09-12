@@ -239,7 +239,7 @@ One daemon-wide record in `settings-v1.json` (same quarantine-on-corrupt
 posture as the grant store). Two knobs: whether wallpapers may PLAY sound
 (distinct from the per-wallpaper `audio` grant above, which gates delivery
 of *captured* system audio to audio-reactive wallpapers), and whether
-rendering pauses while the desktop is covered (F3).
+rendering pauses while a fullscreen application is showing (F3).
 
 - `settings.get` → `{"audio_output": true|false, "pause_when_covered":
   true|false}` (defaults `true` / `false`).
@@ -280,8 +280,13 @@ session-bus name `org.kde.kwe.Occlusion1`, loads the packaged KWin script
   → answers `renderer.status`. The socket is user-private, so any local
   caller may feed a verdict (the smoke lanes do).
 
-Policy: the desktop counts as covered only when **every** reported output is
-covered (all displays share one renderer) and at least one output was
+Policy: an output is "covered" when a non-minimized fullscreen application
+window on the current desktop/activity sits on it — maximized windows do
+**not** count (maintainer decision 2026-09-11: pause only for games/fullscreen
+players; KWin also lists the Plasma desktop itself as a full-size "normal"
+window, which made any geometry-based rule see the desktop as permanently
+covered). The desktop counts as covered only when **every** reported output
+is covered (all displays share one renderer) and at least one output was
 reported. The effective pause — setting on AND covered — reaches the ACTIVE
 worker as one `render_pause` line (`docs/INPUT_PROTOCOL_V1.md`); candidates
 render normally through the canary and the promoted worker is synchronized
