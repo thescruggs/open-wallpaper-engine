@@ -94,10 +94,19 @@ void AppHandler::OnBeforeCommandLineProcessing(const CefString&          process
     std::string dis_features;
     if (cmd->HasSwitch("disable-features")) {
         dis_features = cmd->GetSwitchValue("disable-features").ToString();
-        if (! dis_features.empty()) dis_features += ",";
-        dis_features +=
-            "Crashpad,AutofillServerCommunication,HardwareMediaKeyHandling,WebBluetooth,WebUSB";
     }
+    if (! dis_features.empty()) dis_features += ",";
+    dis_features += "Crashpad,AutofillServerCommunication,HardwareMediaKeyHandling,WebBluetooth,WebUSB,"
+                    // Chromium's on-device AI model service. With it enabled the browser
+                    // spawns an `on_device_model.mojom.OnDeviceModelService` utility
+                    // ~3 min after startup (on_device_startup_metric_delay) to estimate a
+                    // GPU performance class; that helper SIGABRTs on nvidia 615.x and
+                    // surfaces as a crash notification. Wallpapers never use it.
+                    "OptimizationGuideOnDeviceModel,OptimizationGuideModelExecution,"
+                    "OnDeviceModelPerformanceParams,OnDeviceModelFetchPerformanceClassEveryStartup";
+    // No component updater either: it is what registers the on-device model
+    // download in the first place, and wallpapers need no Chrome components.
+    cmd->AppendSwitch("disable-component-update");
 
     auto dis_vulkan = [&dis_features, &cmd] {
         if (! dis_features.empty()) dis_features += ",";
