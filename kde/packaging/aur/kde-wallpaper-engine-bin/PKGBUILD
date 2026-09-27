@@ -1,0 +1,52 @@
+# Maintainer: thescruggs <scruggs at thescruggs dot org>
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Prebuilt KDE Wallpaper Engine. The archive is the package built from
+# kde/packaging/PKGBUILD of the tagged commit and attached to the GitHub
+# release; scripts/release.sh keeps pkgrel and the checksum in step with it.
+
+pkgname=kde-wallpaper-engine-bin
+pkgver=0.2.0.alpha.1
+pkgrel=7
+pkgdesc="Experimental Plasma 6 app to browse, install, and safely run Wallpaper Engine Workshop wallpapers (prebuilt)"
+arch=('x86_64')
+url="https://github.com/thescruggs/open-wallpaper-engine"
+license=('GPL-3.0-or-later' 'GPL-2.0-only')
+depends=(
+    'qt6-base'
+    'qt6-declarative'
+    'kirigami'
+    'vulkan-icd-loader'
+    'vulkan-driver'
+    'kscreen'
+    'qt6-tools'
+    'libkscreen'
+    'lz4'
+    'freetype2'
+    'fontconfig'
+    'libpipewire'
+    'nss'
+    'nspr'
+    'alsa-lib'
+    'libxkbcommon'
+    'libcups'
+    'at-spi2-core'
+    'libdrm'
+    'mesa'
+)
+provides=("kde-wallpaper-engine=${pkgver}")
+conflicts=('kde-wallpaper-engine')
+# The binaries are already stripped release builds; the CEF runtime must not
+# be touched.
+options=('!strip' '!debug')
+install=kde-wallpaper-engine.install
+_archive="kde-wallpaper-engine-${pkgver}-${pkgrel}-x86_64.pkg.tar.zst"
+source=("${_archive}::${url}/releases/download/kwe-v${pkgver}-${pkgrel}/${_archive}")
+noextract=("${_archive}")
+sha256sums=('SKIP')
+
+package() {
+    bsdtar -xf "${srcdir}/${_archive}" -C "${pkgdir}" \
+        --exclude='.PKGINFO' --exclude='.BUILDINFO' \
+        --exclude='.MTREE' --exclude='.INSTALL'
+}
