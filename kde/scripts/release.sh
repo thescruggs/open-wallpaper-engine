@@ -84,6 +84,13 @@ run gh release create "$tag" "$archive" \
 
 sha256: \`${sha256}\`"
 
+# Rolling pacman repository on the fork (works without an AUR account).
+if (( dry_run )); then
+    scripts/publish-repo.sh --dry-run
+else
+    scripts/publish-repo.sh
+fi
+
 if (( push_aur )); then
     if [[ ! -d "$aur_clone/.git" ]]; then
         run git clone "ssh://aur@aur.archlinux.org/${aur_name}.git" "$aur_clone"
