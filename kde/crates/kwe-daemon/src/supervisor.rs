@@ -3832,7 +3832,7 @@ mod tests {
         let script = root.join("renderer");
         // The fake worker mirrors its control pipe into a file and lives
         // until the supervisor stops it.
-        fs::write(&script, "#!/bin/sh\ncat > \"$HOME/stdin.txt\"\n").unwrap();
+        fs::write(&script, "#!/bin/sh\nexec cat > \"$HOME/stdin.txt\"\n").unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
         let mut config = validated_config(&root);
         config.renderer_paths = BTreeMap::from([(RendererKind::Test, script.clone())]);
