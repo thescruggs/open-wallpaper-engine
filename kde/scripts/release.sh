@@ -65,7 +65,7 @@ echo "release $tag  sha256 $sha256"
 
 # AUR recipe first, so the tagged commit carries the matching checksum.
 aur_pkgbuild="packaging/aur/${aur_name}/PKGBUILD"
-sed -i \
+run sed -i \
     -e "s/^pkgver=.*/pkgver=${pkgver}/" \
     -e "s/^pkgrel=.*/pkgrel=${pkgrel}/" \
     -e "s/^sha256sums=.*/sha256sums=('${sha256}')/" \

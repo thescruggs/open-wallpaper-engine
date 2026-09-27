@@ -43,7 +43,7 @@ install=kde-wallpaper-engine.install
 _archive="kde-wallpaper-engine-${pkgver}-${pkgrel}-x86_64.pkg.tar.zst"
 source=("${_archive}::${url}/releases/download/kwe-v${pkgver}-${pkgrel}/${_archive}")
 noextract=("${_archive}")
-sha256sums=('SKIP')
+sha256sums=('83bf9ee4e4b6ce1153db53aa7bbd603c9dd7c27c52370795569ca675aaeb8ec2')
 
 package() {
     bsdtar -xf "${srcdir}/${_archive}" -C "${pkgdir}" \
