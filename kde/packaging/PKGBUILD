@@ -13,7 +13,7 @@
 # checkout (kde/packaging/ under the repository root), the source is the
 # local git repository at its current committed HEAD, so `makepkg -si`
 # needs no network access for the repo itself. Anywhere else (AUR builders,
-# CI) the published GitHub repository is used instead.
+# CI) the published GitHub fork (branch kde-owe-backend) is used instead.
 #
 # The lito builder is bootstrapped from its official release archive when it
 # is not already on PATH; set LITO_BIN to use a specific binary.
@@ -21,7 +21,7 @@
 if [[ -z "${KWE_FORCE_AUR_SOURCE:-}" && -f "../../lito.toml" ]]; then
     _source="git+file://$(cd ../.. && pwd -P)#commit=$(git -C ../.. rev-parse --short HEAD)"
 else
-    _source="git+https://github.com/waywallen/open-wallpaper-engine.git"
+    _source="git+https://github.com/thescruggs/open-wallpaper-engine.git#branch=kde-owe-backend"
 fi
 source=("open-wallpaper-engine::${_source}")
 sha256sums=('SKIP')
@@ -32,8 +32,10 @@ pkgver=0.2.0.alpha.1
 pkgrel=7
 pkgdesc="Experimental Plasma 6 app to browse, install, and safely run Wallpaper Engine Workshop wallpapers via a supervised renderer daemon rendering through open-wallpaper-engine"
 arch=('x86_64')
-url="https://github.com/waywallen/open-wallpaper-engine"
-license=('GPL-3.0-or-later')
+url="https://github.com/thescruggs/open-wallpaper-engine"
+# The KDE stack (kde/) is GPL-3.0-or-later; the OWE renderer workers are
+# built from the GPL-2.0-only engine.
+license=('GPL-3.0-or-later' 'GPL-2.0-only')
 depends=(
     'qt6-base'
     'qt6-declarative'
