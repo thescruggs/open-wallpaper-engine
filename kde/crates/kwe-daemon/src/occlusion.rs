@@ -12,6 +12,11 @@
 //! While the detector is not running the desktop is treated as uncovered —
 //! the failure mode is "wallpaper keeps rendering", never "wallpaper stays
 //! frozen".
+//!
+//! F4 reuses the same lifecycle for `kwe-display-power-worker` (the helper
+//! that watches display power state): a second `OcclusionDetector` built
+//! with `with_label("display_power", ..)`, so its events are distinguishable
+//! in the journal and its restart budget is independent of the KWin one.
 
 use std::{
     collections::VecDeque,
@@ -42,6 +47,8 @@ pub struct OcclusionDetectorStatus {
 }
 
 pub struct OcclusionDetector {
+    /// Event prefix (`event=<label>.worker.spawned`, ...).
+    label: &'static str,
     worker_path: Option<PathBuf>,
     socket: PathBuf,
     enabled: bool,
@@ -58,7 +65,14 @@ impl OcclusionDetector {
     /// still be toggled and `occlusion.report` still accepted from any local
     /// caller, only the automatic KWin-backed source is missing.
     pub fn new(worker_path: Option<PathBuf>, socket: PathBuf) -> Self {
+        Self::with_label("occlusion", worker_path, socket)
+    }
+
+    /// Same lifecycle for another daemon-spawned detector helper (F4: the
+    /// display power worker); `label` prefixes its journal events.
+    pub fn with_label(label: &'static str, worker_path: Option<PathBuf>, socket: PathBuf) -> Self {
         Self {
+            label,
             worker_path,
             socket,
             enabled: false,
@@ -109,14 +123,14 @@ impl OcclusionDetector {
         if let Some(child) = self.child.as_mut() {
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    eprintln!("event=occlusion.worker.exited status={status}");
+                    eprintln!("event={}.worker.exited status={status}", self.label);
                     self.child = None;
                     lost = true;
                     self.schedule_restart();
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    eprintln!("event=occlusion.worker.wait_error detail={error}");
+                    eprintln!("event={}.worker.wait_error detail={error}", self.label);
                     self.child = None;
                     lost = true;
                     self.schedule_restart();
@@ -130,7 +144,7 @@ impl OcclusionDetector {
         {
             self.next_spawn_at = None;
             if let Err(error) = self.spawn() {
-                eprintln!("event=occlusion.worker.spawn_failed detail={error}");
+                eprintln!("event={}.worker.spawn_failed detail={error}", self.label);
                 self.schedule_restart();
             }
         }
@@ -159,7 +173,7 @@ impl OcclusionDetector {
                 "restart budget exhausted ({MAX_RESTARTS} within {}s)",
                 RESTART_WINDOW.as_secs()
             );
-            eprintln!("event=occlusion.worker.disabled detail={reason}");
+            eprintln!("event={}.worker.disabled detail={reason}", self.label);
             self.disabled_reason = Some(reason);
             self.next_spawn_at = None;
             return;
@@ -171,8 +185,11 @@ impl OcclusionDetector {
 
     fn spawn(&mut self) -> Result<()> {
         let Some(worker_path) = self.worker_path.clone() else {
-            self.disabled_reason = Some("no occlusion worker binary configured".into());
-            eprintln!("event=occlusion.worker.disabled detail=no worker binary configured");
+            self.disabled_reason = Some(format!("no {} worker binary configured", self.label));
+            eprintln!(
+                "event={}.worker.disabled detail=no worker binary configured",
+                self.label
+            );
             return Ok(());
         };
         let mut command = Command::new(&worker_path);
@@ -198,7 +215,7 @@ impl OcclusionDetector {
                 if libc::getppid() != expected_parent {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Interrupted,
-                        "daemon exited before occlusion worker exec",
+                        "daemon exited before detector worker exec",
                     ));
                 }
                 if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
@@ -210,7 +227,7 @@ impl OcclusionDetector {
         let child = command
             .spawn()
             .with_context(|| format!("launch {}", worker_path.display()))?;
-        eprintln!("event=occlusion.worker.spawned pid={}", child.id());
+        eprintln!("event={}.worker.spawned pid={}", self.label, child.id());
         self.child = Some(child);
         Ok(())
     }
@@ -234,7 +251,7 @@ impl OcclusionDetector {
         signal_process_group(pid, libc::SIGKILL);
         let _ = child.kill();
         let _ = child.wait();
-        eprintln!("event=occlusion.worker.forced_kill pid={pid}");
+        eprintln!("event={}.worker.forced_kill pid={pid}", self.label);
     }
 }
 
@@ -260,6 +277,14 @@ fn signal_process_group(pid: u32, signal: libc::c_int) {
 /// fullscreen application window — maximized windows do not count.
 pub fn all_outputs_covered(outputs: &[String], covered: &[String]) -> bool {
     !outputs.is_empty() && outputs.iter().all(|output| covered.contains(output))
+}
+
+/// F4 policy, same shape: the displays count as asleep only when every
+/// reported output is powered down and at least one output was reported, so
+/// one monitor switched off beside a live one never freezes the wallpaper
+/// and an empty report (helper starting up, compositor gone) never pauses.
+pub fn all_outputs_asleep(outputs: &[String], asleep: &[String]) -> bool {
+    all_outputs_covered(outputs, asleep)
 }
 
 #[cfg(test)]
@@ -306,6 +331,14 @@ mod tests {
             &outputs[..1],
             &["HDMI-A-1".to_string(), "DP-1".to_string()]
         ));
+    }
+
+    #[test]
+    fn asleep_policy_requires_every_reported_output() {
+        let outputs = vec!["DP-1".to_string(), "HDMI-A-1".to_string()];
+        assert!(!all_outputs_asleep(&[], &[]));
+        assert!(!all_outputs_asleep(&outputs, &["DP-1".to_string()]));
+        assert!(all_outputs_asleep(&outputs, &outputs));
     }
 
     #[test]

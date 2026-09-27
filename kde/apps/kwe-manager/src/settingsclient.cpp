@@ -54,6 +54,15 @@ void SettingsClient::setPauseWhenCovered(bool enabled) {
                  QJsonObject{{QStringLiteral("pause_when_covered"), enabled}}, true});
 }
 
+void SettingsClient::setPauseWhenDisplayOff(bool enabled) {
+    if (m_pauseWhenDisplayOff != enabled || !m_loaded) {
+        m_pauseWhenDisplayOff = enabled;
+        emit settingsChanged();
+    }
+    send(Pending{QStringLiteral("settings.set"),
+                 QJsonObject{{QStringLiteral("pause_when_display_off"), enabled}}, true});
+}
+
 void SettingsClient::send(Pending pending) {
     if (m_inFlight) {
         if (m_queue.size() >= MaxQueuedOperations)
@@ -124,10 +133,14 @@ void SettingsClient::applyResult(const QJsonObject &result) {
         result.value(QStringLiteral("audio_output")).toBool(m_audioOutput);
     const bool pause =
         result.value(QStringLiteral("pause_when_covered")).toBool(m_pauseWhenCovered);
-    const bool changed = !m_loaded || enabled != m_audioOutput || pause != m_pauseWhenCovered;
+    const bool pauseDisplayOff = result.value(QStringLiteral("pause_when_display_off"))
+                                     .toBool(m_pauseWhenDisplayOff);
+    const bool changed = !m_loaded || enabled != m_audioOutput || pause != m_pauseWhenCovered ||
+                         pauseDisplayOff != m_pauseWhenDisplayOff;
     m_loaded = true;
     m_audioOutput = enabled;
     m_pauseWhenCovered = pause;
+    m_pauseWhenDisplayOff = pauseDisplayOff;
     if (changed)
         emit settingsChanged();
 }

@@ -28,6 +28,7 @@ documented in `PROTOCOL_V1.md`. These additive methods use version `1`:
 - `wallpaper.assignments` *(BETA_M4a)*
 - `settings.get` / `settings.set`
 - `occlusion.report` *(F3)*
+- `display.power.report` *(F4)*
 
 ## Start and retry
 
@@ -236,18 +237,20 @@ future stricter modes and is not enforced yet.
 ## Global settings
 
 One daemon-wide record in `settings-v1.json` (same quarantine-on-corrupt
-posture as the grant store). Two knobs: whether wallpapers may PLAY sound
+posture as the grant store). Three knobs: whether wallpapers may PLAY sound
 (distinct from the per-wallpaper `audio` grant above, which gates delivery
-of *captured* system audio to audio-reactive wallpapers), and whether
-rendering pauses while a fullscreen application is showing (F3).
+of *captured* system audio to audio-reactive wallpapers), whether
+rendering pauses while a fullscreen application is showing (F3), and whether
+it pauses while every display is powered down (F4).
 
 - `settings.get` → `{"audio_output": true|false, "pause_when_covered":
-  true|false}` (defaults `true` / `false`).
-- `settings.set` `{"audio_output": false}` or `{"pause_when_covered": true}`
-  (either or both) → persists the values and answers the effective record.
-  Unknown fields, or a patch naming neither knob, are rejected
-  (`invalid_params`). A record written before `pause_when_covered` existed
-  loads with it off.
+  true|false, "pause_when_display_off": true|false}` (defaults `true` /
+  `false` / `false`).
+- `settings.set` `{"audio_output": false}`, `{"pause_when_covered": true}`
+  or `{"pause_when_display_off": true}` (any combination) → persists the
+  values and answers the effective record. Unknown fields, or a patch naming
+  no knob, are rejected (`invalid_params`). A record written before a pause
+  knob existed loads with it off.
 
 ### Enforcement
 
@@ -296,6 +299,33 @@ never leave the wallpaper frozen. Playlist timers keep running (wall clock).
 `renderer.status` carries `pause_when_covered`, `desktop_covered`,
 `render_paused` (what the active worker was last told) and
 `occlusion_detector` `{enabled, pid, restarts, disabled_reason}`.
+
+
+### Pause when the displays are off *(F4)*
+
+While `pause_when_display_off` is on the supervisor runs
+`kwe-display-power-worker` (resolved beside the daemon,
+`--display-power-worker` overrides, `--no-display-power-worker` disables;
+the same bounded lifecycle as the occlusion worker, with its own restart
+budget and `event=display_power.*` journal lines). The helper is a
+windowless compositor client that reads display power state (DPMS) through
+libkscreen and relays each debounced transition (250 ms) as:
+
+- `display.power.report` `{"outputs": ["DP-1", "HDMI-A-1"], "asleep":
+  ["DP-1"]}` → answers `renderer.status`.
+
+Policy: an output is "asleep" in DPMS standby, suspend or off. The displays
+count as asleep only when **every** reported output is asleep and at least
+one output was reported, so a monitor that disconnects entirely when it
+powers down (no outputs left) does not pause. An output whose state was
+never announced counts as awake. The effective pause is `(pause_when_covered
+AND covered) OR (pause_when_display_off AND asleep)`; the worker receives
+one `render_pause` line per change of that combined state and keeps
+re-publishing its last frame, so the frame watchdog is unchanged and the
+last frame is what the display shows on wake. The verdict is dropped
+(resume) whenever the helper exits or the setting is switched off.
+`renderer.status` carries `pause_when_display_off`, `displays_asleep` and
+`display_power_detector`.
 
 ## Audio and media control
 

@@ -32,8 +32,10 @@ bool readNames(const QJsonValue &value, QStringList &names) {
 }
 } // namespace
 
-OcclusionBridge::OcclusionBridge(QString socketPath, int debounceMilliseconds, QObject *parent)
-    : QObject(parent), m_socketPath(std::move(socketPath)) {
+OcclusionBridge::OcclusionBridge(QString socketPath, int debounceMilliseconds, QObject *parent,
+                                 QString method, QString subsetKey)
+    : QObject(parent), m_socketPath(std::move(socketPath)), m_method(std::move(method)),
+      m_subsetKey(std::move(subsetKey)) {
     m_debounce.setSingleShot(true);
     m_debounce.setInterval(debounceMilliseconds);
     connect(&m_debounce, &QTimer::timeout, this, &OcclusionBridge::flush);
@@ -41,10 +43,10 @@ OcclusionBridge::OcclusionBridge(QString socketPath, int debounceMilliseconds, Q
         const QJsonObject request{
             {QStringLiteral("version"), 1},
             {QStringLiteral("id"), ++m_serial},
-            {QStringLiteral("method"), QStringLiteral("occlusion.report")},
+            {QStringLiteral("method"), m_method},
             {QStringLiteral("params"),
              QJsonObject{{QStringLiteral("outputs"), QJsonArray::fromStringList(m_outputs)},
-                         {QStringLiteral("covered"), QJsonArray::fromStringList(m_covered)}}},
+                         {m_subsetKey, QJsonArray::fromStringList(m_covered)}}},
         };
         m_socket.write(QJsonDocument(request).toJson(QJsonDocument::Compact) + '\n');
     });
@@ -102,7 +104,7 @@ bool OcclusionBridge::applyReport(const QString &json) {
     QStringList outputs;
     QStringList covered;
     if (!readNames(object.value(QStringLiteral("outputs")), outputs) ||
-        !readNames(object.value(QStringLiteral("covered")), covered))
+        !readNames(object.value(m_subsetKey), covered))
         return false;
     if (outputs == m_outputs && covered == m_covered)
         return true; // identical view: nothing to relay

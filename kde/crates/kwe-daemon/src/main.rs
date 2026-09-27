@@ -125,6 +125,15 @@ struct Arguments {
     occlusion_worker: Option<PathBuf>,
     #[arg(long)]
     no_occlusion_worker: bool,
+    /// F4: display power helper (`kwe-display-power-worker`, the Qt process
+    /// that watches DPMS state through the compositor). Default: beside the
+    /// daemon executable. Spawned only while the `pause_when_display_off`
+    /// setting is on; `--no-display-power-worker` disables the automatic
+    /// detector entirely (explicit `display.power.report` calls still work).
+    #[arg(long = "display-power-worker")]
+    display_power_worker: Option<PathBuf>,
+    #[arg(long)]
+    no_display_power_worker: bool,
     /// Wallpaper Engine assets root (S1), passed to the scene worker and
     /// to scene preflight so model layers can resolve their material
     /// textures. Default: the first existing
@@ -453,6 +462,18 @@ fn main() -> Result<()> {
                 .occlusion_worker
                 .clone()
                 .or_else(default_occlusion_worker_path)
+                .map(|worker_path| OcclusionWorkerConfig {
+                    worker_path,
+                    socket: socket.clone(),
+                })
+        },
+        display_power_worker: if arguments.no_display_power_worker {
+            None
+        } else {
+            arguments
+                .display_power_worker
+                .clone()
+                .or_else(default_display_power_worker_path)
                 .map(|worker_path| OcclusionWorkerConfig {
                     worker_path,
                     socket: socket.clone(),
@@ -1041,11 +1062,13 @@ fn process_request(
             "settings.set" => {
                 match serde_json::from_value::<SettingsSetParams>(request.params.clone()) {
                     Ok(params)
-                        if params.audio_output.is_none() && params.pause_when_covered.is_none() =>
+                        if params.audio_output.is_none()
+                            && params.pause_when_covered.is_none()
+                            && params.pause_when_display_off.is_none() =>
                     {
                         json!({
                             "error": "invalid_params",
-                            "detail": "settings.set needs at least one of audio_output, pause_when_covered"
+                            "detail": "settings.set needs at least one of audio_output, pause_when_covered, pause_when_display_off"
                         })
                     }
                     Ok(params) => permissions_call(supervisor, |handle| {
@@ -1054,6 +1077,9 @@ fn process_request(
                         }
                         if let Some(enabled) = params.pause_when_covered {
                             handle.pause_when_covered_set(enabled)?;
+                        }
+                        if let Some(enabled) = params.pause_when_display_off {
+                            handle.pause_when_display_off_set(enabled)?;
                         }
                         settings_record(handle)
                     }),
@@ -1072,6 +1098,19 @@ fn process_request(
                         let covered =
                             occlusion::all_outputs_covered(&params.outputs, &params.covered);
                         supervisor_call(supervisor, |handle| handle.occlusion_report(covered))
+                    }
+                    Err(error) => {
+                        json!({"error": "invalid_params", "detail": error.to_string()})
+                    }
+                }
+            }
+            // F4: a display power verdict from the daemon's helper (or a
+            // test). Same trust posture as `occlusion.report`.
+            "display.power.report" => {
+                match serde_json::from_value::<DisplayPowerReportParams>(request.params.clone()) {
+                    Ok(params) => {
+                        let asleep = occlusion::all_outputs_asleep(&params.outputs, &params.asleep);
+                        supervisor_call(supervisor, |handle| handle.display_power_report(asleep))
                     }
                     Err(error) => {
                         json!({"error": "invalid_params", "detail": error.to_string()})
@@ -1271,6 +1310,16 @@ struct PermissionsGetParams {
 struct SettingsSetParams {
     audio_output: Option<bool>,
     pause_when_covered: Option<bool>,
+    pause_when_display_off: Option<bool>,
+}
+
+/// `display.power.report` params (F4): every output the helper knows about
+/// and the subset that is powered down (DPMS standby/suspend/off).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DisplayPowerReportParams {
+    outputs: Vec<String>,
+    asleep: Vec<String>,
 }
 
 /// `occlusion.report` params (F3): the detector's current view — every
@@ -1288,6 +1337,7 @@ fn settings_record(handle: &SupervisorHandle) -> Result<Value> {
     Ok(json!({
         "audio_output": handle.audio_output_get()?,
         "pause_when_covered": handle.pause_when_covered_get()?,
+        "pause_when_display_off": handle.pause_when_display_off_get()?,
     }))
 }
 
@@ -1671,6 +1721,14 @@ fn default_occlusion_worker_path() -> Option<PathBuf> {
     Some(directory.join("kwe-occlusion-worker"))
 }
 
+/// Default `kwe-display-power-worker` beside the daemon executable (F4);
+/// optional in the same way.
+fn default_display_power_worker_path() -> Option<PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    let directory = executable.parent()?;
+    Some(directory.join("kwe-display-power-worker"))
+}
+
 fn default_shader_helper_path() -> Option<PathBuf> {
     let executable = std::env::current_exe().ok()?;
     let directory = executable.parent()?;
@@ -1886,6 +1944,7 @@ mod tests {
             scene_assets_dir: None,
             shader_helper_path: None,
             occlusion_worker: None,
+            display_power_worker: None,
         })
         .unwrap()
     }
@@ -2099,6 +2158,70 @@ mod tests {
     /// two knobs patch independently, and `occlusion.report` feeds the
     /// supervisor's verdict — visible on `renderer.status` even without a
     /// live worker.
+    /// F4: the display-off policy is a third settings knob (default off)
+    /// and `display.power.report` feeds the supervisor's verdict; only a
+    /// report with every output asleep counts.
+    #[test]
+    fn settings_pause_when_display_off_and_display_power_report_round_trip() {
+        let service = supervisor_service();
+        let handle = service.handle();
+        let (ok, result) =
+            process_with_supervisor(r#"{"version":1,"method":"settings.get"}"#, &handle);
+        assert!(ok, "{result}");
+        assert_eq!(
+            result["pause_when_display_off"], false,
+            "default must be off"
+        );
+
+        let (ok, result) = process_with_supervisor(
+            r#"{"version":1,"method":"settings.set","params":{"pause_when_display_off":true}}"#,
+            &handle,
+        );
+        assert!(ok, "{result}");
+        assert_eq!(result["pause_when_display_off"], true);
+        assert_eq!(
+            result["pause_when_covered"], false,
+            "the other knob is untouched"
+        );
+
+        let (ok, result) = process_with_supervisor(
+            r#"{"version":1,"method":"display.power.report","params":{"outputs":["DP-1","HDMI-A-1"],"asleep":["DP-1"]}}"#,
+            &handle,
+        );
+        assert!(ok, "{result}");
+        assert_eq!(result["displays_asleep"], false);
+        let (ok, result) = process_with_supervisor(
+            r#"{"version":1,"method":"display.power.report","params":{"outputs":["DP-1"],"asleep":["DP-1"]}}"#,
+            &handle,
+        );
+        assert!(ok, "{result}");
+        assert_eq!(result["displays_asleep"], true);
+        assert_eq!(result["desktop_covered"], false);
+        assert_eq!(result["render_paused"], false, "nothing is live");
+        assert_eq!(result["display_power_detector"]["enabled"], true);
+
+        // Switching the policy off drops the verdict.
+        let (ok, result) = process_with_supervisor(
+            r#"{"version":1,"method":"settings.set","params":{"pause_when_display_off":false}}"#,
+            &handle,
+        );
+        assert!(ok, "{result}");
+        assert_eq!(result["pause_when_display_off"], false);
+        let (ok, result) =
+            process_with_supervisor(r#"{"version":1,"method":"renderer.status"}"#, &handle);
+        assert!(ok, "{result}");
+        assert_eq!(result["displays_asleep"], false);
+
+        for bad in [
+            r#"{"version":1,"method":"display.power.report","params":{"outputs":["DP-1"]}}"#,
+            r#"{"version":1,"method":"display.power.report","params":{"outputs":["DP-1"],"asleep":[],"x":1}}"#,
+        ] {
+            let (ok, result) = process_with_supervisor(bad, &handle);
+            assert!(!ok, "{bad}");
+            assert_eq!(result["error"], "invalid_params", "{bad}");
+        }
+    }
+
     #[test]
     fn settings_pause_when_covered_and_occlusion_report_round_trip() {
         let service = supervisor_service();
@@ -3090,6 +3213,7 @@ with open(args.output, "wb") as frame:
             scene_assets_dir: None,
             shader_helper_path: None,
             occlusion_worker: None,
+            display_power_worker: None,
         }
     }
 
@@ -4578,6 +4702,7 @@ args = parser.parse_args()
             scene_assets_dir: None,
             shader_helper_path: None,
             occlusion_worker: None,
+            display_power_worker: None,
         })
         .unwrap();
         let supervisor = supervisor_service.handle();

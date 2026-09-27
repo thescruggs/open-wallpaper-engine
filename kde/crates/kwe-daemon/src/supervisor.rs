@@ -148,6 +148,10 @@ pub struct SupervisorConfig {
     /// the pause policy then only reacts to explicit `occlusion.report`
     /// calls (tests, alternative detectors).
     pub occlusion_worker: Option<OcclusionWorkerConfig>,
+    /// F4: the `kwe-display-power-worker` helper and the daemon socket it
+    /// reports back to. `None` disables the automatic detector; the policy
+    /// then only reacts to explicit `display.power.report` calls.
+    pub display_power_worker: Option<OcclusionWorkerConfig>,
 }
 
 /// F3 detector launch parameters (see `occlusion.rs`).
@@ -555,10 +559,18 @@ pub struct WorkerStatus {
     /// application). Reset to `false` whenever the detector goes away, so a
     /// dead detector can never freeze the wallpaper.
     pub desktop_covered: bool,
-    /// F3: what the active worker was last told (`render_pause`); equals
-    /// `pause_when_covered && desktop_covered` once the message was queued.
+    /// F3/F4: what the active worker was last told (`render_pause`); once
+    /// the message was queued it equals `(pause_when_covered &&
+    /// desktop_covered) || (pause_when_display_off && displays_asleep)`.
     pub render_paused: bool,
     pub occlusion_detector: OcclusionDetectorStatus,
+    /// F4: the global pause-when-display-off policy switch.
+    pub pause_when_display_off: bool,
+    /// F4: the latest display power verdict (every output powered down).
+    /// Reset to `false` whenever the helper goes away, so a dead helper can
+    /// never freeze the wallpaper.
+    pub displays_asleep: bool,
+    pub display_power_detector: OcclusionDetectorStatus,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -755,6 +767,10 @@ enum ControlCommand {
     PauseWhenCoveredSet(bool, mpsc::Sender<Result<bool>>),
     /// F3: the detector's (or a test's) verdict — every output covered.
     OcclusionReport(bool, mpsc::Sender<Result<WorkerStatus>>),
+    PauseWhenDisplayOffGet(mpsc::Sender<Result<bool>>),
+    PauseWhenDisplayOffSet(bool, mpsc::Sender<Result<bool>>),
+    /// F4: the helper's (or a test's) verdict — every output powered down.
+    DisplayPowerReport(bool, mpsc::Sender<Result<WorkerStatus>>),
     QuarantinedIds(mpsc::Sender<BTreeSet<String>>),
     Shutdown,
 }
@@ -857,6 +873,21 @@ impl SupervisorHandle {
     /// the policy switch and reports the resulting status.
     pub fn occlusion_report(&self, covered: bool) -> Result<WorkerStatus> {
         self.request(|reply| ControlCommand::OcclusionReport(covered, reply))
+    }
+
+    pub fn pause_when_display_off_get(&self) -> Result<bool> {
+        self.request_value(ControlCommand::PauseWhenDisplayOffGet)
+    }
+
+    pub fn pause_when_display_off_set(&self, enabled: bool) -> Result<bool> {
+        self.request_value(|reply| ControlCommand::PauseWhenDisplayOffSet(enabled, reply))
+    }
+
+    /// F4: feed a display power verdict. `asleep` means every output is
+    /// powered down; the supervisor pauses/resumes the live worker according
+    /// to the policy switch and reports the resulting status.
+    pub fn display_power_report(&self, asleep: bool) -> Result<WorkerStatus> {
+        self.request(|reply| ControlCommand::DisplayPowerReport(asleep, reply))
     }
 
     pub fn permissions_list(&self) -> Result<BTreeMap<String, Grant>> {
@@ -1022,6 +1053,9 @@ struct SupervisorRuntime {
     /// F3: detector child + latest verdict; see `effective_render_pause`.
     occlusion: OcclusionDetector,
     desktop_covered: bool,
+    /// F4: display power helper + latest verdict.
+    display_power: OcclusionDetector,
+    displays_asleep: bool,
 }
 
 impl SupervisorRuntime {
@@ -1045,6 +1079,19 @@ impl SupervisorRuntime {
         );
         // The policy persists; the detector follows it from the first tick.
         occlusion.set_enabled(settings_store.pause_when_covered());
+        let mut display_power = OcclusionDetector::with_label(
+            "display_power",
+            config
+                .display_power_worker
+                .as_ref()
+                .map(|worker| worker.worker_path.clone()),
+            config
+                .display_power_worker
+                .as_ref()
+                .map(|worker| worker.socket.clone())
+                .unwrap_or_default(),
+        );
+        display_power.set_enabled(settings_store.pause_when_display_off());
         Self {
             config,
             store,
@@ -1064,6 +1111,8 @@ impl SupervisorRuntime {
             display_generation: 0,
             occlusion,
             desktop_covered: false,
+            display_power,
+            displays_asleep: false,
         }
     }
 
@@ -1149,6 +1198,21 @@ impl SupervisorRuntime {
                     self.sync_render_pause();
                     let _ = reply.send(Ok(self.status()));
                 }
+                Ok(ControlCommand::PauseWhenDisplayOffGet(reply)) => {
+                    let _ = reply.send(Ok(self.settings_store.pause_when_display_off()));
+                }
+                Ok(ControlCommand::PauseWhenDisplayOffSet(enabled, reply)) => {
+                    let result = self.set_pause_when_display_off(enabled);
+                    let _ = reply.send(result);
+                }
+                Ok(ControlCommand::DisplayPowerReport(asleep, reply)) => {
+                    if self.displays_asleep != asleep {
+                        eprintln!("event=display_power.verdict asleep={asleep}");
+                    }
+                    self.displays_asleep = asleep;
+                    self.sync_render_pause();
+                    let _ = reply.send(Ok(self.status()));
+                }
                 Ok(ControlCommand::QuarantinedIds(reply)) => {
                     let ids = self
                         .persisted
@@ -1162,6 +1226,7 @@ impl SupervisorRuntime {
                 Ok(ControlCommand::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                     self.stop_all(false);
                     self.occlusion.shutdown();
+                    self.display_power.shutdown();
                     return;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -1214,8 +1279,31 @@ impl SupervisorRuntime {
         self.status()
     }
 
+    /// F4 policy switch: same contract as `set_pause_when_covered`, for the
+    /// display power helper.
+    fn set_pause_when_display_off(&mut self, enabled: bool) -> Result<bool> {
+        self.settings_store.set_pause_when_display_off(enabled)?;
+        self.display_power.set_enabled(enabled);
+        if !enabled {
+            self.displays_asleep = false;
+        }
+        self.sync_render_pause();
+        Ok(self.settings_store.pause_when_display_off())
+    }
+
+    #[cfg(test)]
+    fn display_power_report_for_test(&mut self, asleep: bool) -> WorkerStatus {
+        self.displays_asleep = asleep;
+        self.sync_render_pause();
+        self.status()
+    }
+
+    /// Either reason pauses; the worker only ever sees the combined state,
+    /// so a fullscreen game ending while the displays are asleep (or the
+    /// reverse) does not resume early.
     fn effective_render_pause(&self) -> bool {
-        self.settings_store.pause_when_covered() && self.desktop_covered
+        (self.settings_store.pause_when_covered() && self.desktop_covered)
+            || (self.settings_store.pause_when_display_off() && self.displays_asleep)
     }
 
     /// Brings the active worker in line with the effective pause state.
@@ -1705,6 +1793,11 @@ impl SupervisorRuntime {
             self.desktop_covered = false;
             self.sync_render_pause();
         }
+        // F4: same rule for the display power helper.
+        if self.display_power.tick() && self.displays_asleep {
+            self.displays_asleep = false;
+            self.sync_render_pause();
+        }
         if self
             .retired
             .as_ref()
@@ -2171,6 +2264,9 @@ impl SupervisorRuntime {
             desktop_covered: self.desktop_covered,
             render_paused: active.is_some_and(|worker| worker.render_paused),
             occlusion_detector: self.occlusion.status(),
+            pause_when_display_off: self.settings_store.pause_when_display_off(),
+            displays_asleep: self.displays_asleep,
+            display_power_detector: self.display_power.status(),
         }
     }
 }
@@ -3043,6 +3139,7 @@ mod tests {
             scene_assets_dir: None,
             shader_helper_path: None,
             occlusion_worker: None,
+            display_power_worker: None,
         }
         .validate()
         .unwrap()
@@ -3847,6 +3944,35 @@ mod tests {
                 .paused
         );
         assert!(runtime.status().render_paused);
+
+        // F4: the two reasons combine. With the desktop still covered, the
+        // displays falling asleep and waking sends nothing new; once the
+        // cover goes away while they are asleep the worker stays paused,
+        // and only the wake resumes it.
+        let sent = read_lines(&next_home, 1).len();
+        assert!(runtime.set_pause_when_display_off(true).unwrap());
+        let _ = runtime.display_power_report_for_test(true);
+        let _ = runtime.occlusion_report_for_test(false);
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(read_lines(&next_home, sent).len(), sent);
+        assert!(runtime.status().render_paused);
+        assert!(runtime.status().displays_asleep);
+        let _ = runtime.display_power_report_for_test(false);
+        let lines = read_lines(&next_home, sent + 1);
+        assert!(
+            !kwe_input_protocol::decode_render_pause(lines[sent].as_bytes())
+                .unwrap()
+                .paused
+        );
+        assert!(!runtime.status().render_paused);
+
+        // Asleep again, then the policy goes off: resumes and drops the
+        // verdict.
+        let _ = runtime.display_power_report_for_test(true);
+        assert!(runtime.status().render_paused);
+        assert!(!runtime.set_pause_when_display_off(false).unwrap());
+        assert!(!runtime.status().render_paused);
+        assert!(!runtime.status().displays_asleep);
 
         runtime.stop_all(false);
         fs::remove_dir_all(root).unwrap();

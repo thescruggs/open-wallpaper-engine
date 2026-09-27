@@ -113,7 +113,9 @@ The supervisor writes a `render_pause` line — same nonblocking, latest-wins
 path as the streams above, one pending message — whenever the effective pause
 state of the ACTIVE worker changes: the global `pause_when_covered` setting is
 on AND the occlusion detector reports a fullscreen application on every
-output (maximized windows do not count). Candidates never receive it (the canary needs real frames);
+output (maximized windows do not count), OR (F4) the global
+`pause_when_display_off` setting is on AND every output is powered down.
+The worker only sees the combined state. Candidates never receive it (the canary needs real frames);
 the promoted worker is synchronized right after promotion, a rolled-back
 worker right after rollback.
 

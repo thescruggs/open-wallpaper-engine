@@ -66,6 +66,23 @@ Kirigami.ScrollablePage {
             opacity: 0.8
         }
 
+        Controls.Switch {
+            text: qsTr("Pause while the displays are off")
+            checked: settingsClient.pauseWhenDisplayOff
+            enabled: settingsClient.loaded && !settingsClient.busy
+            Accessible.description: qsTr("Pauses the wallpaper while every display is powered down by screen energy saving, and resumes when a display wakes.")
+            Controls.ToolTip.visible: hovered
+            Controls.ToolTip.text: Accessible.description
+            onToggled: settingsClient.setPauseWhenDisplayOff(checked)
+        }
+
+        Controls.Label {
+            Layout.fillWidth: true
+            text: qsTr("Stops rendering while nothing is being shown. With more than one display the wallpaper pauses only when every display is off. The last frame is kept and shown again as soon as a display wakes.")
+            wrapMode: Text.Wrap
+            opacity: 0.8
+        }
+
         Kirigami.InlineMessage {
             Layout.fillWidth: true
             type: Kirigami.MessageType.Error

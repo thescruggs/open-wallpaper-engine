@@ -18,6 +18,7 @@ public:
     bool listen(const QString &path) { return m_server.listen(path); }
     bool audioOutput = true;
     bool pauseWhenCovered = false;
+    bool pauseWhenDisplayOff = false;
     int sets = 0;
     QJsonObject lastSetParams;
     bool failNext = false;
@@ -42,6 +43,7 @@ private:
             } else if (method == QStringLiteral("settings.get")) {
                 result.insert(QStringLiteral("audio_output"), audioOutput);
                 result.insert(QStringLiteral("pause_when_covered"), pauseWhenCovered);
+                result.insert(QStringLiteral("pause_when_display_off"), pauseWhenDisplayOff);
             } else if (method == QStringLiteral("settings.set")) {
                 ++sets;
                 lastSetParams = request.value(QStringLiteral("params")).toObject();
@@ -50,8 +52,12 @@ private:
                 if (lastSetParams.contains(QStringLiteral("pause_when_covered")))
                     pauseWhenCovered =
                         lastSetParams.value(QStringLiteral("pause_when_covered")).toBool();
+                if (lastSetParams.contains(QStringLiteral("pause_when_display_off")))
+                    pauseWhenDisplayOff =
+                        lastSetParams.value(QStringLiteral("pause_when_display_off")).toBool();
                 result.insert(QStringLiteral("audio_output"), audioOutput);
                 result.insert(QStringLiteral("pause_when_covered"), pauseWhenCovered);
+                result.insert(QStringLiteral("pause_when_display_off"), pauseWhenDisplayOff);
             }
             socket->write(QJsonDocument(QJsonObject{
                               {QStringLiteral("version"), 1},
@@ -77,9 +83,27 @@ private slots:
     void init() {
         m_daemon.audioOutput = true;
         m_daemon.pauseWhenCovered = false;
+        m_daemon.pauseWhenDisplayOff = false;
         m_daemon.sets = 0;
         m_daemon.failNext = false;
         m_daemon.lastSetParams = {};
+    }
+
+    void pauseWhenDisplayOffPatchesOnlyItsOwnField() {
+        SettingsClient client(m_socketPath);
+        QTRY_VERIFY(client.loaded());
+        QVERIFY(!client.pauseWhenDisplayOff());
+
+        client.setPauseWhenDisplayOff(true);
+        QVERIFY(client.pauseWhenDisplayOff());
+        QTRY_COMPARE(m_daemon.sets, 1);
+        QTRY_VERIFY(!client.busy());
+        QVERIFY(m_daemon.pauseWhenDisplayOff);
+        QCOMPARE(m_daemon.lastSetParams.keys(),
+                 QStringList{QStringLiteral("pause_when_display_off")});
+        QVERIFY(!m_daemon.pauseWhenCovered);
+        QVERIFY(m_daemon.audioOutput);
+        QVERIFY(client.errorMessage().isEmpty());
     }
 
     void pauseWhenCoveredPatchesOnlyItsOwnField() {

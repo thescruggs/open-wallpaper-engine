@@ -24,5 +24,14 @@ if(KWE_BUILD_MANAGER)
     add_subdirectory(apps/kwe-frame-preview)
     add_subdirectory(apps/kwe-manager)
     add_subdirectory(apps/kwe-occlusion-worker)
+    # F4: optional, because it is the only target that needs libkscreen's
+    # DPMS library. Without it the daemon finds no helper beside itself and
+    # the pause-when-display-off policy simply never pauses.
+    find_package(KF6Screen QUIET)
+    if(TARGET KF6::ScreenDpms)
+        add_subdirectory(apps/kwe-display-power-worker)
+    else()
+        message(STATUS "KF6::ScreenDpms not found: kwe-display-power-worker will not be built")
+    endif()
     add_subdirectory(plasma/wallpapers/org.kde.kwe.wallpaper)
 endif()

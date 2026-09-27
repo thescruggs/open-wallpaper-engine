@@ -1762,6 +1762,7 @@ mod tests {
             scene_assets_dir: None,
             shader_helper_path: None,
             occlusion_worker: None,
+            display_power_worker: None,
         }
     }
 
@@ -2129,6 +2130,14 @@ mod tests {
             desktop_covered: false,
             render_paused: false,
             occlusion_detector: crate::occlusion::OcclusionDetectorStatus {
+                enabled: false,
+                pid: None,
+                restarts: 0,
+                disabled_reason: None,
+            },
+            pause_when_display_off: false,
+            displays_asleep: false,
+            display_power_detector: crate::occlusion::OcclusionDetectorStatus {
                 enabled: false,
                 pid: None,
                 restarts: 0,

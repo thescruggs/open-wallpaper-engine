@@ -13,6 +13,10 @@
 // One request per connection (newline-delimited JSON, like every other
 // daemon client); a change arriving while a request is in flight is sent
 // once that request completes (latest wins, never queued).
+//
+// F4 reuses the relay for kwe-display-power-worker: same report shape with
+// a different daemon method and subset key (`display.power.report` /
+// `asleep`), selected through the constructor.
 class OcclusionBridge final : public QObject {
     Q_OBJECT
     Q_CLASSINFO("D-Bus Interface", "org.kde.kwe.Occlusion1")
@@ -21,7 +25,9 @@ public:
     static constexpr int DefaultDebounceMilliseconds = 250;
 
     explicit OcclusionBridge(QString socketPath, int debounceMilliseconds = DefaultDebounceMilliseconds,
-                             QObject *parent = nullptr);
+                             QObject *parent = nullptr,
+                             QString method = QStringLiteral("occlusion.report"),
+                             QString subsetKey = QStringLiteral("covered"));
 
     QStringList outputs() const { return m_outputs; }
     QStringList covered() const { return m_covered; }
@@ -30,7 +36,8 @@ public:
     QString lastError() const { return m_lastError; }
 
     // Parses one report; returns false (and changes nothing) when the JSON
-    // is not the {"outputs":[...],"covered":[...]} shape. Exposed for tests.
+    // is not the {"outputs":[...],"<subsetKey>":[...]} shape. Exposed for
+    // tests.
     bool applyReport(const QString &json);
 
     // Forget the detector's view (KWin went away): relays an uncovered
@@ -50,6 +57,8 @@ private:
     void finish(bool ok, const QString &error);
 
     QString m_socketPath;
+    QString m_method;
+    QString m_subsetKey;
     QStringList m_outputs;
     QStringList m_covered;
     QTimer m_debounce;
