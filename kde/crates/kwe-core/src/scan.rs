@@ -592,34 +592,73 @@ fn collect_library_paths(root: &KvValue, output: &mut BTreeSet<PathBuf>) {
 fn read_workshop_subscriptions(
     root: &Path,
 ) -> Result<std::collections::BTreeMap<String, Option<u8>>, String> {
-    let manifest = root
-        .join("steamapps")
-        .join(format!("appworkshop_{WALLPAPER_ENGINE_APP_ID}.acf"));
-    let contents = match read_utf8_limited(&manifest, 8 * 1024 * 1024) {
-        Ok(value) => value,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(std::collections::BTreeMap::new());
+    // Steam writes the record to `steamapps/workshop/`; the bare `steamapps/`
+    // location is kept for layouts that still carry it there.
+    let name = format!("appworkshop_{WALLPAPER_ENGINE_APP_ID}.acf");
+    let steamapps = root.join("steamapps");
+    let mut contents = None;
+    for manifest in [
+        steamapps.join("workshop").join(&name),
+        steamapps.join(&name),
+    ] {
+        match read_utf8_limited(&manifest, 8 * 1024 * 1024) {
+            Ok(value) => {
+                contents = Some(value);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
         }
-        Err(error) => return Err(error.to_string()),
+    }
+    let Some(contents) = contents else {
+        return Ok(std::collections::BTreeMap::new());
     };
     let tree = parse_key_values(&contents).map_err(|error| error.to_string())?;
-    let workshop_items = tree
+    let app = tree
         .get_case_insensitive("appworkshop")
-        .and_then(KvValue::object)
-        .and_then(|value| {
+        .and_then(KvValue::object);
+    let section = |name: &str| {
+        app.and_then(|value| {
             value
                 .iter()
-                .find(|(key, _)| key.eq_ignore_ascii_case("workshopitems"))
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
                 .and_then(|(_, value)| value.object())
-        });
+        })
+    };
+    let valid_id = |key: &str| {
+        key.len() <= 20 && key.chars().all(|character| character.is_ascii_digit()) && key != "0"
+    };
     let mut ids = std::collections::BTreeMap::new();
-    if let Some(items) = workshop_items {
+    if let Some(items) = section("workshopitems") {
         for (key, value) in items {
-            if key.len() <= 20
-                && key.chars().all(|character| character.is_ascii_digit())
-                && key != "0"
-            {
+            if valid_id(key) {
                 ids.insert(key.clone(), workshop_progress(value));
+            }
+        }
+    }
+    // Borrowed-From: waywallen/open-wallpaper-engine@b8180ad:waywallen/plugins/
+    // org.waywallen.open-wallpaper-engine/wallpaper_engine/workshop.lua
+    // (GPL-2.0, idea only, no code copied: `subscribedby` in
+    // `WorkshopItemDetails` is what separates a subscription from a directory
+    // copied into `content/431960` by hand).
+    if let Some(details) = section("workshopitemdetails") {
+        for (key, value) in details {
+            let subscribed = value.object().is_some_and(|entry| {
+                entry
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("subscribedby"))
+                    .and_then(|(_, value)| value.string())
+                    .is_some_and(|by| !by.is_empty() && by != "0")
+            });
+            if valid_id(key) && subscribed {
+                ids.entry(key.clone()).or_insert(None);
+            }
+        }
+    } else if let Some(installed) = section("workshopitemsinstalled") {
+        // No details section to consult: everything Steam unpacked counts.
+        for key in installed.keys() {
+            if valid_id(key) {
+                ids.entry(key.clone()).or_insert(None);
             }
         }
     }
@@ -858,6 +897,142 @@ mod tests {
                 .iter()
                 .any(|item| item.workshop_state == "subscribed_missing")
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn workshop_fixture(name: &str, manifest_rel: &str, manifest: &str) -> Catalog {
+        let root = temp_fixture(name);
+        fs::write(
+            root.join("steamapps/workshop/content/431960/100/project.json"),
+            r#"{"title":"Subscribed scene","type":"scene"}"#,
+        )
+        .unwrap();
+        fs::write(root.join(manifest_rel), manifest).unwrap();
+        let catalog = scan_installed(std::slice::from_ref(&root), &ScanLimits::default());
+        let _ = fs::remove_dir_all(root);
+        catalog
+    }
+
+    const MODERN_MANIFEST: &str = r#""AppWorkshop"
+{
+	"appid"		"431960"
+	"NeedsUpdate"		"0"
+	"NeedsDownload"		"0"
+	"WorkshopItemsInstalled"
+	{
+		"100" { "size" "4096" "timeupdated" "1" "manifest" "7" }
+	}
+	"WorkshopItemDetails"
+	{
+		"100" { "manifest" "7" "timeupdated" "1" "subscribedby" "42" }
+		"200" { "manifest" "8" "timeupdated" "1" "subscribedby" "42" }
+		"300" { "manifest" "9" "timeupdated" "1" "subscribedby" "0" }
+		"not-an-id" { "subscribedby" "42" }
+	}
+}"#;
+
+    #[test]
+    fn reads_installed_workshop_manifest_from_workshop_directory() {
+        let catalog = workshop_fixture(
+            "workshop-modern",
+            "steamapps/workshop/appworkshop_431960.acf",
+            MODERN_MANIFEST,
+        );
+        assert_eq!(catalog.stats.subscribed, 1);
+        assert_eq!(catalog.stats.downloading, 0);
+        assert_eq!(catalog.stats.missing, 1);
+        let state = |id: &str| {
+            catalog
+                .items
+                .iter()
+                .find(|item| item.workshop_id == id)
+                .map(|item| item.workshop_state.as_str())
+        };
+        // The size Steam records is not a download counter.
+        assert_eq!(state("100"), Some("subscribed_installed"));
+        assert_eq!(state("200"), Some("subscribed_missing"));
+        assert_eq!(state("300"), None);
+        assert_eq!(state("not-an-id"), None);
+    }
+
+    #[test]
+    fn workshop_manifest_keys_are_case_insensitive() {
+        let catalog = workshop_fixture(
+            "workshop-case",
+            "steamapps/workshop/appworkshop_431960.acf",
+            r#""appworkshop" { "workshopitemdetails" { "100" { "SubscribedBy" "42" } } }"#,
+        );
+        assert_eq!(catalog.stats.subscribed, 1);
+    }
+
+    #[test]
+    fn installed_items_count_when_manifest_has_no_details() {
+        let catalog = workshop_fixture(
+            "workshop-no-details",
+            "steamapps/workshop/appworkshop_431960.acf",
+            r#""AppWorkshop" { "WorkshopItemsInstalled" { "100" { "size" "4096" } } }"#,
+        );
+        assert_eq!(catalog.stats.subscribed, 1);
+    }
+
+    #[test]
+    fn workshop_directory_manifest_wins_over_legacy_location() {
+        let root = temp_fixture("workshop-both");
+        fs::write(
+            root.join("steamapps/workshop/content/431960/100/project.json"),
+            r#"{"title":"Subscribed scene","type":"scene"}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("steamapps/workshop/appworkshop_431960.acf"),
+            MODERN_MANIFEST,
+        )
+        .unwrap();
+        fs::write(
+            root.join("steamapps/appworkshop_431960.acf"),
+            r#""AppWorkshop" { "WorkshopItems" { "900" "1" } }"#,
+        )
+        .unwrap();
+        let catalog = scan_installed(std::slice::from_ref(&root), &ScanLimits::default());
+        assert!(catalog.items.iter().all(|item| item.workshop_id != "900"));
+        assert_eq!(catalog.stats.subscribed, 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn malformed_workshop_manifest_leaves_items_local() {
+        let catalog = workshop_fixture(
+            "workshop-malformed",
+            "steamapps/workshop/appworkshop_431960.acf",
+            r#""AppWorkshop" { "WorkshopItemDetails" { "100" "#,
+        );
+        assert_eq!(catalog.stats.subscribed, 0);
+        assert!(
+            catalog
+                .items
+                .iter()
+                .any(|item| item.workshop_id == "100" && item.workshop_state == "local")
+        );
+        assert!(
+            catalog
+                .diagnostics
+                .iter()
+                .any(|entry| entry.code == "steam.workshop_manifest_invalid")
+        );
+    }
+
+    #[test]
+    fn workshop_manifest_symlink_is_refused() {
+        let root = temp_fixture("workshop-symlink");
+        fs::write(root.join("real.acf"), MODERN_MANIFEST).unwrap();
+        std::os::unix::fs::symlink(
+            root.join("real.acf"),
+            root.join("steamapps/workshop/appworkshop_431960.acf"),
+        )
+        .unwrap();
+        let catalog = scan_installed(std::slice::from_ref(&root), &ScanLimits::default());
+        assert_eq!(catalog.stats.subscribed, 0);
+        assert_eq!(catalog.stats.missing, 0);
         let _ = fs::remove_dir_all(root);
     }
 

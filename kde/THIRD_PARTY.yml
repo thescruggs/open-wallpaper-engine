@@ -128,11 +128,11 @@ entries:
   - id: open-wallpaper-engine
     project: waywallen/open-wallpaper-engine
     url: https://github.com/waywallen/open-wallpaper-engine
-    revision: null
+    revision: b8180ade087d510005dd322a210846c3cc539fcb
     license_observed: GPL-2.0
     use: idea
     approved_for_code_use: false
-    notes: Behavior, format, and failure-mode concepts only; no code copied and not a runtime backend.
+    notes: Behavior, format, and failure-mode concepts only; no code copied and not a runtime backend. kwe-core scan.rs takes the Workshop subscription signal (`subscribedby` in `WorkshopItemDetails` of steamapps/workshop/appworkshop_431960.acf) from waywallen/plugins/org.waywallen.open-wallpaper-engine/wallpaper_engine/workshop.lua at the linked revision, reimplemented on the in-house KeyValues parser.
 
   - id: almamu-linux-wallpaperengine
     project: Almamu/linux-wallpaperengine
