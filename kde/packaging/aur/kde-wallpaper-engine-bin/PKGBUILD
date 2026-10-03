@@ -21,6 +21,7 @@ depends=(
     'kscreen'
     'qt6-tools'
     'libkscreen'
+    'qrencode'
     'lz4'
     'freetype2'
     'fontconfig'

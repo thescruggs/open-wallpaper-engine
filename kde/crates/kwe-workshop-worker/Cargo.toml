@@ -1,0 +1,17 @@
+[package]
+name = "kwe-workshop-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "One-shot Steam Workshop worker: the only process that talks to Steam"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+libc.workspace = true
+sha2.workspace = true
+ureq.workspace = true
+base64.workspace = true

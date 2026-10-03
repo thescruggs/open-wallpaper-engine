@@ -12,6 +12,7 @@ mod playlist_session;
 mod selfcheck;
 mod settings;
 mod supervisor;
+mod workshop;
 mod workshop_cache;
 
 use std::{
@@ -48,6 +49,7 @@ use supervisor::{
     StartSpec, SupervisorConfig, SupervisorHandle, SupervisorService, TestFault, WorkerStatus,
     validate_identity_part,
 };
+use workshop::{CatalogFreshness, Dispatch, WorkshopConfig, WorkshopService};
 use workshop_cache::WorkshopCache;
 
 const API_VERSION: u32 = 1;
@@ -107,6 +109,12 @@ struct Arguments {
     /// `{"outcome":"unknown","reason":"timeout"}`.
     #[arg(long, default_value_t = 10_000, value_parser = clap::value_parser!(u64).range(100..=30_000))]
     inspector_wall_timeout_ms: u64,
+    /// Steam Workshop worker executable for `workshop.*` (default:
+    /// kwe-workshop-worker beside the daemon). Missing is not fatal:
+    /// `workshop.*` answers `worker_unavailable` and
+    /// `workshop.auth.status` reports `worker_available: false`.
+    #[arg(long = "workshop-worker")]
+    workshop_worker: Option<PathBuf>,
     /// SR-3b: killable shader-compile helper executable (default:
     /// kwe-shader-compiler beside the daemon), passed to every scene
     /// worker as `--shader-helper`. Missing/unconfigured is NOT a failure
@@ -390,6 +398,7 @@ fn main() -> Result<()> {
     };
     let playlist_state_dir = state_dir.clone();
     let apply_state_dir = state_dir.clone();
+    let workshop_state_dir = state_dir.clone();
     let startup_timeout_ms_by_kind = BTreeMap::from([
         (RendererKind::Test, arguments.renderer_startup_timeout_ms),
         (
@@ -430,6 +439,7 @@ fn main() -> Result<()> {
     // ceilings (never less contained than the renderer it stands in for)
     // and the same runtime dir the supervisor creates per-worker HOME dirs
     // under (distinct `inspect-home-*` naming avoids any collision).
+    let workshop_runtime_dir = renderer_runtime_dir.clone();
     let inspect_config = InspectConfig {
         inspector_path: arguments.inspector.or_else(default_inspector_path),
         runtime_dir: renderer_runtime_dir.clone(),
@@ -494,6 +504,22 @@ fn main() -> Result<()> {
         }
         Arc::new(RwLock::new(initial_catalog))
     };
+    let catalog_stale = Arc::new(AtomicBool::new(false));
+    let freshness =
+        CatalogFreshness::new(CatalogFreshness::default_window(), catalog_stale.clone());
+    freshness.record(&catalog_library_paths(&catalog));
+    let workshop = WorkshopService::new(
+        WorkshopConfig::new(
+            arguments
+                .workshop_worker
+                .clone()
+                .or_else(default_workshop_worker_path)
+                .unwrap_or_else(|| PathBuf::from("kwe-workshop-worker-unconfigured")),
+            &workshop_state_dir,
+            workshop_runtime_dir,
+        ),
+        catalog_stale,
+    );
     // The apply service must exist before the playlist session: the session
     // drives the same apply transaction the wallpaper.* API uses (BETA_M4c),
     // sharing its transaction lock so a playlist entry change and a user
@@ -575,6 +601,8 @@ fn main() -> Result<()> {
                     &worker_pid,
                     &apply,
                     &inspect_config,
+                    &workshop,
+                    &freshness,
                     arguments.allow_test_faults,
                 ) {
                     eprintln!("event=api.client_error detail={error}");
@@ -666,6 +694,8 @@ fn handle_client(
     worker_pid: &Arc<AtomicU32>,
     apply: &ApplyHandle,
     inspect: &InspectConfig,
+    workshop: &WorkshopService,
+    freshness: &CatalogFreshness,
     allow_test_faults: bool,
 ) -> Result<()> {
     let cloned = stream.try_clone()?;
@@ -689,6 +719,19 @@ fn handle_client(
     if request.method == "scene.inspect" {
         return dispatch_scene_inspect(stream, request, inspect);
     }
+    // Workshop RPCs spawn a network worker and may take up to ~45 s: same
+    // off-loop treatment, bounded by the service's per-family gates.
+    if request.method.starts_with("workshop.") {
+        return dispatch_workshop(stream, request, workshop);
+    }
+    // Pick up Workshop manifest changes (stat-only, rate limited) before the
+    // catalog is served.
+    if request.method == "catalog" {
+        match refresh_catalog_if_stale(catalog, roots, workshop_cache, Some(playlist), freshness) {
+            Ok(_) => {}
+            Err(error) => eprintln!("event=catalog.refresh_error detail={error}"),
+        }
+    }
     // Peer credential identification: the daemon's own audio worker is
     // recognized by pid and uid so its no-active-renderer rejections can be
     // dropped silently instead of erroring the caller's connection.
@@ -709,6 +752,9 @@ fn handle_client(
         worker_pid,
         allow_test_faults,
     )?;
+    if request.method == "rescan" && ok {
+        freshness.record(&catalog_library_paths(catalog));
+    }
     let response = Response {
         version: API_VERSION,
         id: &request.id,
@@ -716,6 +762,110 @@ fn handle_client(
         result,
     };
     write_response(&mut stream, &response)
+}
+
+/// Off-loop handling for one `workshop.*` request. `WorkshopService::prepare`
+/// validates and takes the family gate on this (accept) thread, so a busy or
+/// invalid request answers immediately and at most five worker threads
+/// (one per family) ever exist. The write timeout set on accept is per
+/// write, so the answer may be written ~45 s after the request was read; the
+/// request-collection deadline only covers the read side.
+fn dispatch_workshop(
+    mut stream: UnixStream,
+    request: Request,
+    workshop: &WorkshopService,
+) -> Result<()> {
+    let result = if request.version != API_VERSION {
+        json!({"error": "unsupported_api_version", "supported": API_VERSION})
+    } else {
+        match workshop.prepare(&request.method, &request.params) {
+            Dispatch::Immediate(value) => value,
+            Dispatch::Run(job) => {
+                let id = request.id;
+                let spawned = std::thread::Builder::new()
+                    .name("workshop-rpc".to_string())
+                    .spawn(move || {
+                        let result = job.run();
+                        let ok = result.get("error").is_none();
+                        let response = Response {
+                            version: API_VERSION,
+                            id: &id,
+                            ok,
+                            result,
+                        };
+                        if let Err(error) = write_response(&mut stream, &response) {
+                            eprintln!("event=workshop.response_error detail={error}");
+                        }
+                    });
+                // On spawn failure the closure (job, gate guard, stream) is
+                // dropped: the gate clears and the client sees EOF.
+                return spawned.map(|_| ()).context("spawn workshop thread");
+            }
+        }
+    };
+    let ok = result.get("error").is_none();
+    let response = Response {
+        version: API_VERSION,
+        id: &request.id,
+        ok,
+        result,
+    };
+    write_response(&mut stream, &response)
+}
+
+/// Library roots the last scan discovered.
+fn catalog_library_paths(catalog: &Arc<RwLock<Catalog>>) -> Vec<PathBuf> {
+    catalog
+        .read()
+        .map(|guard| guard.libraries.iter().map(|lib| lib.path.clone()).collect())
+        .unwrap_or_default()
+}
+
+/// The `rescan` RPC body: scan, merge into the workshop cache (saving when it
+/// changed), swap the catalog, refresh playlist availability. Returns the item
+/// count.
+fn rescan_catalog(
+    catalog: &Arc<RwLock<Catalog>>,
+    roots: &[PathBuf],
+    workshop_cache: &Arc<std::sync::Mutex<WorkshopCache>>,
+    playlist: Option<&PlaylistSessionHandle>,
+) -> Result<usize> {
+    let mut cache = workshop_cache
+        .lock()
+        .map_err(|_| anyhow!("workshop cache lock poisoned"))?;
+    let mut updated = scan_installed(roots, &ScanLimits::default());
+    if cache.merge_and_update(&mut updated, unix_ms()) {
+        cache.save();
+    }
+    let count = updated.stats.total;
+    *catalog
+        .write()
+        .map_err(|_| anyhow!("catalog lock poisoned"))? = updated;
+    drop(cache);
+    if let Some(playlist) = playlist
+        && !playlist.update_availability(compute_valid_ids(catalog))
+    {
+        eprintln!("event=playlist.availability_dropped detail=command queue full");
+    }
+    Ok(count)
+}
+
+/// Rescan when a Workshop manifest changed (or subscribe/unsubscribe marked
+/// the catalog stale). Stat only; rate limited by `freshness`. Returns whether
+/// a rescan ran.
+fn refresh_catalog_if_stale(
+    catalog: &Arc<RwLock<Catalog>>,
+    roots: &[PathBuf],
+    workshop_cache: &Arc<std::sync::Mutex<WorkshopCache>>,
+    playlist: Option<&PlaylistSessionHandle>,
+    freshness: &CatalogFreshness,
+) -> Result<bool> {
+    let Some(signature) = freshness.poll(&catalog_library_paths(catalog)) else {
+        return Ok(false);
+    };
+    rescan_catalog(catalog, roots, workshop_cache, playlist)?;
+    freshness.commit(signature);
+    Ok(true)
 }
 
 /// Writes one response envelope exactly as `handle_client` always has:
@@ -862,22 +1012,7 @@ fn process_request(
                 serde_json::to_value(&*guard)?
             }
             "rescan" => {
-                let mut cache = workshop_cache
-                    .lock()
-                    .map_err(|_| anyhow!("workshop cache lock poisoned"))?;
-                let mut updated = scan_installed(roots, &ScanLimits::default());
-                if cache.merge_and_update(&mut updated, unix_ms()) {
-                    cache.save();
-                }
-                let count = updated.stats.total;
-                *catalog
-                    .write()
-                    .map_err(|_| anyhow!("catalog lock poisoned"))? = updated;
-                if let Some(playlist) = playlist
-                    && !playlist.update_availability(compute_valid_ids(catalog))
-                {
-                    eprintln!("event=playlist.availability_dropped detail=command queue full");
-                }
+                let count = rescan_catalog(catalog, roots, workshop_cache, playlist)?;
                 json!({"catalog_items": count})
             }
             "playlist.list" => playlist_call(playlist, |handle| {
@@ -1727,6 +1862,13 @@ fn default_display_power_worker_path() -> Option<PathBuf> {
     let executable = std::env::current_exe().ok()?;
     let directory = executable.parent()?;
     Some(directory.join("kwe-display-power-worker"))
+}
+
+/// Default `kwe-workshop-worker` beside the daemon executable.
+fn default_workshop_worker_path() -> Option<PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    let directory = executable.parent()?;
+    Some(directory.join("kwe-workshop-worker"))
 }
 
 fn default_shader_helper_path() -> Option<PathBuf> {
@@ -5391,5 +5533,63 @@ args = parser.parse_args()
                 .as_deref(),
             Some("1")
         );
+    }
+
+    #[test]
+    fn catalog_rescans_when_a_workshop_manifest_changes() {
+        let root = temp_dir("catalog-fresh");
+        std::fs::create_dir_all(root.join("steamapps/workshop/content/431960/100")).unwrap();
+        std::fs::write(
+            root.join("steamapps/workshop/content/431960/100/project.json"),
+            br#"{"title":"Synthetic 100","type":"scene","tags":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("steamapps/libraryfolders.vdf"),
+            "\"LibraryFolders\" { }\n",
+        )
+        .unwrap();
+        let manifest = root.join("steamapps/workshop/appworkshop_431960.acf");
+        std::fs::write(
+            &manifest,
+            "\"AppWorkshop\" { \"WorkshopItems\" { \"100\" \"1\" } }\n",
+        )
+        .unwrap();
+        let roots = vec![root.clone()];
+        let catalog = Arc::new(RwLock::new(scan_installed(&roots, &ScanLimits::default())));
+        let cache = Arc::new(std::sync::Mutex::new(WorkshopCache::open(
+            &root.join("state"),
+        )));
+        let stale = Arc::new(AtomicBool::new(false));
+        let freshness = CatalogFreshness::new(Duration::from_millis(150), stale.clone());
+        freshness.record(&catalog_library_paths(&catalog));
+        let total = |c: &Arc<RwLock<Catalog>>| c.read().unwrap().stats.total;
+        let refresh =
+            || refresh_catalog_if_stale(&catalog, &roots, &cache, None, &freshness).unwrap();
+        assert_eq!(total(&catalog), 1);
+
+        std::fs::write(
+            &manifest,
+            "\"AppWorkshop\" { \"WorkshopItems\" { \"100\" \"1\" \"200\" \"1\" } }\n",
+        )
+        .unwrap();
+        // Inside the rate window: no stat, no rescan.
+        let passes = freshness.stat_passes();
+        assert!(!refresh());
+        assert_eq!(freshness.stat_passes(), passes);
+        assert_eq!(total(&catalog), 1);
+
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(refresh());
+        assert_eq!(total(&catalog), 2, "the new subscription must appear");
+
+        // Unchanged manifests: no further rescan.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!refresh());
+
+        // subscribe/unsubscribe staleness forces a rescan inside the window.
+        stale.store(true, Ordering::Release);
+        assert!(refresh());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

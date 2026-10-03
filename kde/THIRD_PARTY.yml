@@ -38,6 +38,15 @@ entries:
     approved_for_code_use: true
     notes: Linux O_NOFOLLOW/O_CLOEXEC flags, process groups, parent-death signal, bounded worker termination, and per-renderer setrlimit controls.
 
+  - id: rust-workshop-http
+    project: ureq, ureq-proto, base64, rustls, rustls-webpki, rustls-pki-types, ring, webpki-roots, untrusted, subtle, zeroize, http, httparse, bytes, log, percent-encoding, once_cell, utf8-zero, getrandom
+    url: https://crates.io/crates/ureq
+    revision: ureq 3.4.2, ureq-proto 0.6.4, base64 0.23.1, rustls 0.23.45, rustls-webpki 0.103.15, rustls-pki-types 1.15.1, ring 0.17.14, webpki-roots 1.0.9, untrusted 0.9.0, subtle 2.6.1, zeroize 1.9.0, http 1.5.0, httparse 1.10.1, bytes 1.12.1, log 0.4.34, percent-encoding 2.3.2, once_cell 1.21.4, utf8-zero 0.8.1, getrandom 0.2.17
+    license_observed: MIT OR Apache-2.0 (ureq, ureq-proto, base64, rustls-pki-types, zeroize, http, httparse, log, percent-encoding, once_cell, utf8-zero, getrandom; bytes MIT); Apache-2.0 OR ISC OR MIT (rustls); ISC (rustls-webpki, untrusted); Apache-2.0 AND ISC (ring); CDLA-Permissive-2.0 (webpki-roots); BSD-3-Clause (subtle)
+    use: dependency
+    approved_for_code_use: true
+    notes: Blocking HTTPS client (rustls, bundled Mozilla roots, no async runtime) and base64 for JWT payloads. Used only by the separate-process kwe-workshop-worker (ADR 0005); never in the daemon or plasmashell. Licenses as declared in each crate's manifest at the listed versions.
+
   - id: rust-lz4-flex
     project: lz4_flex
     url: https://crates.io/crates/lz4_flex
@@ -132,7 +141,7 @@ entries:
     license_observed: GPL-2.0
     use: idea
     approved_for_code_use: false
-    notes: Behavior, format, and failure-mode concepts only; no code copied and not a runtime backend. kwe-core scan.rs takes the Workshop subscription signal (`subscribedby` in `WorkshopItemDetails` of steamapps/workshop/appworkshop_431960.acf) from waywallen/plugins/org.waywallen.open-wallpaper-engine/wallpaper_engine/workshop.lua at the linked revision, reimplemented on the in-house KeyValues parser.
+    notes: Behavior, format, and failure-mode concepts only; no code copied and not a runtime backend. kwe-core scan.rs takes the Workshop subscription signal (`subscribedby` in `WorkshopItemDetails` of steamapps/workshop/appworkshop_431960.acf) from waywallen/plugins/org.waywallen.open-wallpaper-engine/wallpaper_engine/workshop.lua at the linked revision, reimplemented on the in-house KeyValues parser. kwe-workshop-worker (auth.rs, session.rs, workshop.rs) follows the Steam Web API protocol used by wallpaper_engine/{auth,session,api,map,subscription}.lua at the same revision — endpoints, field names, token flow and state machine — as an independent Rust implementation; no code copied. The maintainer approved use with credit on 2026-10-03; because upstream is GPL-2.0 without an 'or later' grant and this tree is GPL-3.0-or-later, code is not adapted.
 
   - id: almamu-linux-wallpaperengine
     project: Almamu/linux-wallpaperengine
@@ -388,7 +397,7 @@ entries:
     license_observed: proprietary-sdk-terms
     use: separate-process-backend
     approved_for_code_use: false
-    notes: Optional isolated Workshop bridge after distribution review.
+    notes: Not used. Superseded 2026-10-03 by Steam Web API calls from kwe-workshop-worker (ADR 0005); kept as a record of the rejected option.
 
   - id: chromium
     project: The Chromium Project (headless Chromium)

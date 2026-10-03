@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(QRENCODE REQUIRED IMPORTED_TARGET libqrencode)
+
 qt_add_executable(kwe-manager
     src/main.cpp
     src/catalogmodel.cpp
     src/catalogmodel.h
     src/daemonactivator.cpp
     src/daemonactivator.h
-    src/workshopclient.cpp
-    src/workshopclient.h
     src/videopreview.cpp
     src/videopreview.h
     src/rendererstatus.cpp
@@ -58,11 +59,22 @@ qt_add_qml_module(kwe-manager
         src/packageinstaller.h
         src/permissionsclient.cpp
         src/permissionsclient.h
+        # Workshop browsing: the daemon client (AuthState enum), the Browse
+        # list model (State enum) and the sign-in QR item.
+        src/workshopclient.cpp
+        src/workshopclient.h
+        src/remotecatalogmodel.cpp
+        src/remotecatalogmodel.h
+        src/qrcodeitem.cpp
+        src/qrcodeitem.h
     QML_FILES
         qml/Main.qml
         qml/GalleryPage.qml
         qml/PlaylistPanel.qml
         qml/SettingsPage.qml
+        qml/SteamSignInCard.qml
+        qml/RemoteItemCard.qml
+        qml/WorkshopBrowsePage.qml
         qml/WallpaperCard.qml
         qml/WallpaperDetail.qml
         qml/WallpaperSelection.qml
@@ -84,6 +96,7 @@ target_link_libraries(kwe-manager PRIVATE
     Qt6::Qml
     Qt6::Quick
     Qt6::QuickControls2
+    PkgConfig::QRENCODE
 )
 
 install(TARGETS kwe-manager RUNTIME DESTINATION bin)

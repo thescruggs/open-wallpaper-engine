@@ -822,6 +822,54 @@ RPC itself — see the breaking-change note below.)*
 - No renderer worker state is touched by `scene.inspect`; it shares nothing
   with the active/candidate worker the rest of this document describes.
 
+## Workshop *(Steam Workshop browsing)*
+
+Worker-side contract (envelope, operations, error codes, item shape):
+`docs/WORKSHOP_PROTOCOL_V1.md`. The daemon stays network-free: every
+`workshop.*` call spawns `kwe-workshop-worker` once (hardened one-shot:
+cleared environment with a private HOME, own process group, no-new-privs,
+address-space/file-size/open-files/core limits, 40 s wall clock then
+SIGKILL of the group, 4 MiB response cap).
+
+- Timing: `workshop.*` calls are answered off the accept thread on the same
+  connection and may take up to 45 s (40 s worker clock plus overhead);
+  clients use a 60 s deadline. Every other method is unaffected.
+- One operation per family may be in flight: `auth` (status, begin, poll,
+  sign_out), `query`, `details`, `previews`, `mutation` (subscribe,
+  unsubscribe). A second concurrent call in a family answers
+  `{"error":"busy"}`; other families still run.
+- Methods (params and results as in the protocol document, section 2):
+  `workshop.auth.status` (`{worker_available, signed_in, account_name}`),
+  `workshop.auth.begin` (`{challenge_url, poll_interval_ms, expires_in_ms}`),
+  `workshop.auth.poll` (`{state, challenge_url, account_name}`),
+  `workshop.auth.cancel` (`{}`), `workshop.auth.sign_out`
+  (`{signed_in:false}`), `workshop.query`, `workshop.details`,
+  `workshop.previews`, `workshop.subscribe`, `workshop.unsubscribe`.
+- The pending sign-in (client id, request id, current challenge, deadline)
+  lives in daemon memory only. `begin` replaces it, `poll` without one
+  answers `no_pending_login`, a poll after the deadline answers state
+  `expired` without contacting the worker, `signed_in`/`expired` and
+  `cancel`/`sign_out` clear it, `challenge_changed` updates it.
+- Errors: `{"error":CODE,"detail":string}`. Daemon codes: `busy`,
+  `no_pending_login`, `invalid_params` (checked before any spawn: ids are
+  1-20 digits and not 0, `page >= 1`, at most 60 preview items, bounded
+  string lengths, at most 32 tags, unknown fields rejected),
+  `worker_unavailable` (binary missing), `worker_failed` (spawn failure,
+  timeout, oversize or unparsable output, non-zero exit). Worker codes
+  (`signed_out`, `offline`, `timeout`, `rate_limited`, `steam_error`,
+  `protocol`, `bad_request`, `internal`) pass through; `detail` is capped.
+- Auth request and response bodies are never logged; the daemon never reads
+  the worker's state directory (`<state dir>/steam`, previews in
+  `<state dir>/workshop-previews`).
+- Automatic catalog rescan: after a successful subscribe/unsubscribe, and
+  whenever `steamapps/workshop/appworkshop_431960.acf` or
+  `steamapps/appworkshop_431960.acf` of any discovered library changed
+  modification time or size since the last scan (stat only, checked at most
+  once every 2 s), the next `catalog` call performs the same rescan as
+  `rescan` before answering.
+- `kwe-daemon --workshop-worker PATH` overrides the worker binary (default:
+  `kwe-workshop-worker` beside the daemon).
+
 ## Current limits
 
 - The generated and video renderers are the production-shaped workers

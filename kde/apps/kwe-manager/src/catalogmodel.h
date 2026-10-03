@@ -68,6 +68,9 @@ public:
     // title so stale entries stay identifiable.
     Q_INVOKABLE QVariantMap itemById(const QString &workshopId) const;
     bool isFavorite(const QString &workshopId) const;
+    // True when the local catalog already lists this Workshop id (the
+    // Browse view's "Subscribed" badge). Fed by replaceFromCatalog.
+    bool containsWorkshopId(const QString &workshopId) const { return m_ids.contains(workshopId); }
 
     int sceneCount() const { return m_sceneCount; }
     int totalCount() const { return m_items.size(); }
@@ -98,6 +101,7 @@ private:
     int m_missingCount = 0;
     int m_downloadingCount = 0;
     QSet<QString> m_favorites;
+    QSet<QString> m_ids;
 };
 
 class WallpaperFilterModel final : public QSortFilterProxyModel {

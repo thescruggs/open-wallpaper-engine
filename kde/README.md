@@ -204,6 +204,6 @@ This project also references the wallpaper behaviour and format design from:
 - [RainyPixel/wallpaper-engine-kde-plugin](https://github.com/RainyPixel/wallpaper-engine-kde-plugin)
 - [waywallen/open-wallpaper-engine](https://github.com/waywallen/open-wallpaper-engine)
 
-Steam Workshop subscription detection follows the approach of the waywallen plugin in [waywallen/open-wallpaper-engine](https://github.com/waywallen/open-wallpaper-engine) (GPL-2.0), which reads Steam's own `appworkshop` record; the relevant code is marked with `Borrowed-From:` comments.
+Steam Workshop support — subscription detection from Steam's own `appworkshop` record, QR-code sign-in, browsing and subscribing — follows the approach and Steam Web API protocol of the waywallen plugin in [waywallen/open-wallpaper-engine](https://github.com/waywallen/open-wallpaper-engine) (GPL-2.0). It is independently implemented here; the relevant files are marked with `Borrowed-From:` comments.
 
 See [docs/PROVENANCE.md](docs/PROVENANCE.md) for the full provenance ledger.

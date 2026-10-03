@@ -30,7 +30,7 @@ qmltypes="$module_dir/kwe-manager.qmltypes"
 
 # The registered C++ types, i.e. every class carrying QML_ELEMENT in the
 # manager's QML module sources.
-registered_types=(ApplyClient CatalogClient DaemonActivator PackageInstaller PermissionsClient)
+registered_types=(ApplyClient CatalogClient DaemonActivator PackageInstaller PermissionsClient WorkshopClient RemoteCatalogModel QrCodeItem)
 
 resolve_qmllint() {
     # Never trust a bare `qmllint`: on this distro it is Qt 5's.

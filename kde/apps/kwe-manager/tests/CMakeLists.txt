@@ -7,14 +7,6 @@ qt_add_executable(kwe-package-installer-test
 target_link_libraries(kwe-package-installer-test PRIVATE Qt6::Core Qt6::Qml Qt6::Test)
 add_test(NAME kwe-package-installer-test COMMAND kwe-package-installer-test)
 
-qt_add_executable(kwe-workshop-client-test
-    workshopclienttest.cpp
-    ../src/workshopclient.cpp
-    ../src/workshopclient.h
-)
-target_link_libraries(kwe-workshop-client-test PRIVATE Qt6::Core Qt6::Gui Qt6::Test)
-add_test(NAME kwe-workshop-client-test COMMAND kwe-workshop-client-test)
-
 qt_add_executable(kwe-daemon-activator-test
     daemonactivatortest.cpp
     ../src/daemonactivator.cpp
@@ -90,3 +82,35 @@ qt_add_executable(kwe-issue-reporter-test
 )
 target_link_libraries(kwe-issue-reporter-test PRIVATE Qt6::Core Qt6::Gui Qt6::Test)
 add_test(NAME kwe-issue-reporter-test COMMAND kwe-issue-reporter-test)
+
+# Workshop browsing: the daemon client and its sign-in state machine, the
+# Browse list model, and the sign-in QR matrix, against a fake QLocalServer.
+qt_add_executable(kwe-workshop-client-test
+    workshopclienttest.cpp
+    fakeworkshopdaemon.h
+    ../src/workshopclient.cpp
+    ../src/workshopclient.h
+)
+target_link_libraries(kwe-workshop-client-test PRIVATE Qt6::Core Qt6::Gui Qt6::Network Qt6::Qml Qt6::Test)
+add_test(NAME kwe-workshop-client-test COMMAND kwe-workshop-client-test)
+
+qt_add_executable(kwe-remote-catalog-model-test
+    remotecatalogmodeltest.cpp
+    fakeworkshopdaemon.h
+    ../src/remotecatalogmodel.cpp
+    ../src/remotecatalogmodel.h
+    ../src/workshopclient.cpp
+    ../src/workshopclient.h
+    ../src/catalogmodel.cpp
+    ../src/catalogmodel.h
+)
+target_link_libraries(kwe-remote-catalog-model-test PRIVATE Qt6::Core Qt6::Gui Qt6::Network Qt6::Qml Qt6::Test)
+add_test(NAME kwe-remote-catalog-model-test COMMAND kwe-remote-catalog-model-test)
+
+qt_add_executable(kwe-qr-code-item-test
+    qrcodeitemtest.cpp
+    ../src/qrcodeitem.cpp
+    ../src/qrcodeitem.h
+)
+target_link_libraries(kwe-qr-code-item-test PRIVATE Qt6::Core Qt6::Gui Qt6::Quick Qt6::Qml Qt6::Test PkgConfig::QRENCODE)
+add_test(NAME kwe-qr-code-item-test COMMAND kwe-qr-code-item-test)

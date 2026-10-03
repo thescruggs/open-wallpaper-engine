@@ -126,6 +126,9 @@ void CatalogModel::replaceFromCatalog(const QJsonObject &catalog) {
     }
     beginResetModel();
     m_items = std::move(replacement);
+    m_ids.clear();
+    for (const auto &entry : std::as_const(m_items))
+        m_ids.insert(entry.workshopId);
     m_sceneCount = scene;
     m_videoCount = video;
     m_webCount = web;

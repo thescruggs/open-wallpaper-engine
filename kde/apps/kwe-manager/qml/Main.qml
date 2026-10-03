@@ -34,12 +34,36 @@ Kirigami.ApplicationWindow {
         id: workshopPage
         visible: false
         title: qsTr("Workshop")
-        contentItem: GalleryPage {
-            anchors.fill: parent
-            filterModel: workshopModel
-            workshopView: true
-            emptyExplanation: qsTr("No subscribed Workshop items are installed or downloading. Subscribe in Steam, then rescan here to see download progress.")
-            onCreatePlaylistRequested: root.createPlaylistOpen = true
+
+        // Two views of the Workshop: what is subscribed locally (works
+        // offline) and the live Steam Workshop browser.
+        header: Controls.TabBar {
+            id: workshopTabs
+            Controls.TabButton {
+                text: qsTr("Subscribed")
+                icon.name: "folder-download-symbolic"
+                display: Controls.AbstractButton.TextBesideIcon
+            }
+            Controls.TabButton {
+                text: qsTr("Browse")
+                icon.name: "internet-services-symbolic"
+                display: Controls.AbstractButton.TextBesideIcon
+            }
+        }
+
+        contentItem: StackLayout {
+            currentIndex: workshopTabs.currentIndex
+
+            GalleryPage {
+                filterModel: workshopModel
+                workshopView: true
+                emptyExplanation: qsTr("No subscribed Workshop items are installed or downloading. Subscribe in Steam, then rescan here to see download progress.")
+                onCreatePlaylistRequested: root.createPlaylistOpen = true
+            }
+
+            WorkshopBrowsePage {
+                active: workshopPage.visible && workshopTabs.currentIndex === 1
+            }
         }
     }
 

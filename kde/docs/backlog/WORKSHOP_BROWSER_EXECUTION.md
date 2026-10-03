@@ -72,6 +72,15 @@ could not be observed: W0 reports modern-manifest items as
 only from the legacy shape. Capture a manifest mid-download during the
 W3 manual test and add the state then.
 
+**W1–W3 status 2026-10-03:** implemented on `SteamWorkShopBrowsing`
+against `docs/WORKSHOP_PROTOCOL_V1.md`; ADR 0005 records D1/D3/D4. The
+live spike (step 0 of W1) was not run: sign-in needs the maintainer's
+phone. Unauthenticated calls were checked against Steam; everything
+behind sign-in (token derivation, QueryFiles, Subscribe) is tested only
+against scripted responses and gets its first real run from the
+installed package. Not built: sign-out revocation at Steam (file is
+deleted locally), author names, the `downloading` state.
+
 ## 3. Task contracts
 
 Common to all: branch from `kde-owe-backend`; `./scripts/check.sh` green

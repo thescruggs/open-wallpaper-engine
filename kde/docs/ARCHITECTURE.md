@@ -11,12 +11,12 @@ access Steam, schedule playlists, or own persistent state.
 ```text
  Steam client / Workshop
           |
-   optional steam-bridge -----------+
+   kwe-workshop-worker -------------+
           |                         |
           v                         v
   +----------------+         +-------------+
   | Kirigami UI    |<------->| user daemon |
-  | browse/config  |  D-Bus  | state/policy|
+  | browse/config  |  socket | state/policy|
   +----------------+         +------+------+
                                     |
                          supervised worker API
@@ -126,13 +126,16 @@ new input and retains the surface's private last-good frame. The package was
 staged and exercised offscreen; it has not been installed or loaded into the
 live Plasma session. See `docs/ALPHA_M1E.md` and ADR 0004.
 
-### Steam bridge
+### Workshop worker
 
-Optional process that contains the Steamworks dependency and exposes only the
-small operations the daemon needs. The first implementation may use
-Steamworks.js to validate behavior, but the release decision should compare a
-small native bridge against its Node runtime/packaging cost. Steam's local VDF
-manifests remain the offline source of truth for installed content.
+`kwe-workshop-worker` is the only process that talks to Steam's Web API
+and the only one that holds the Steam sign-in credential. The daemon
+spawns it once per operation with a cleared environment, resource
+limits and a wall-clock timeout, and exchanges one bounded JSON message
+each way (`docs/WORKSHOP_PROTOCOL_V1.md`). Sign-in is Steam's QR flow;
+no password is handled and no Steamworks SDK is linked. Steam's local
+VDF manifests remain the offline source of truth for installed content.
+See ADR 0005.
 
 ## Recovery state machine
 
@@ -159,8 +162,10 @@ survival matrix remain required before the project enables desktop replacement.
 
 - Web wallpaper network and filesystem access are off until explicitly
   granted.
-- No worker receives Steam credentials, the full user environment, or broad
-  home-directory access.
+- No renderer, parser, audio or display worker receives Steam credentials,
+  the full user environment, or broad home-directory access. The Steam
+  sign-in credential exists only inside `kwe-workshop-worker` and its
+  private state file; it never crosses an RPC and is never logged (ADR 0005).
 - Paths from project metadata are canonicalized beneath the content root;
   traversal and unsafe symlink targets are rejected.
 - Wallpaper code cannot invoke shell commands or D-Bus arbitrarily.

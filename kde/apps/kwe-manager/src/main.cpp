@@ -6,6 +6,7 @@
 #include "issuereporter.h"
 #include "packageinstaller.h"
 #include "permissionsclient.h"
+#include "remotecatalogmodel.h"
 #include "workshopclient.h"
 #include "videopreview.h"
 #include "rendererstatus.h"
@@ -100,7 +101,7 @@ int main(int argc, char *argv[]) {
     }
     PackageInstaller packageInstaller(packageRoot + QStringLiteral("/org.kde.kwe.wallpaper"),
                                       packageSource);
-    WorkshopClient workshopClient;
+    WorkshopClient workshopClient(socketPath);
     VideoPreview videoPreview;
     RendererStatus rendererStatus(socketPath);
     // BETA_M2c: daemon-owned per-wallpaper permission grants. Grant state
@@ -152,6 +153,9 @@ int main(int argc, char *argv[]) {
     WallpaperFilterModel workshopFiltered;
     workshopFiltered.setSourceModel(client.sourceModel());
     workshopFiltered.setWorkshopView(true);
+    // Browse tab: remote Workshop list, with "subscribed" resolved against the
+    // local catalog.
+    RemoteCatalogModel remoteCatalog(&workshopClient, client.sourceModel());
     QQmlApplicationEngine engine;
     // Once the activated daemon socket appears, refresh the catalog right
     // away instead of waiting for the client's exponential retry backoff.
@@ -166,6 +170,7 @@ int main(int argc, char *argv[]) {
     engine.rootContext()->setContextProperty(QStringLiteral("packageInstaller"), &packageInstaller);
     engine.rootContext()->setContextProperty(QStringLiteral("packageSource"), packageSource);
     engine.rootContext()->setContextProperty(QStringLiteral("workshopClient"), &workshopClient);
+    engine.rootContext()->setContextProperty(QStringLiteral("remoteCatalog"), &remoteCatalog);
     engine.rootContext()->setContextProperty(QStringLiteral("videoPreview"), &videoPreview);
     engine.rootContext()->setContextProperty(QStringLiteral("rendererStatus"), &rendererStatus);
     engine.rootContext()->setContextProperty(QStringLiteral("webPreview"), &webPreview);
