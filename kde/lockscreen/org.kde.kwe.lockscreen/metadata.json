@@ -1,0 +1,16 @@
+{
+    "KPackageStructure": "Plasma/Shell",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "KDE Wallpaper Engine contributors"
+            }
+        ],
+        "Description": "Terminal/CRT lock screen over the live Wallpaper Engine wallpaper. Lock screen only: plasmashell keeps using org.kde.plasma.desktop.",
+        "Id": "org.kde.kwe.lockscreen",
+        "License": "GPL-3.0-or-later",
+        "Name": "KWE Terminal Lock Screen",
+        "Version": "0.1"
+    },
+    "X-Plasma-APIVersion": "2"
+}

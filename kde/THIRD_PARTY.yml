@@ -83,6 +83,23 @@ entries:
     approved_for_code_use: true
     notes: Native manager UI, reusable QML module build/deployment, wallpaper fallback UI, and local socket clients; release packaging must retain upstream notices.
 
+  - id: kde-kscreenlocker-greeter-api
+    project: KDE kscreenlocker greeter interface (lock screen shell package)
+    url: https://invent.kde.org/plasma/kscreenlocker
+    revision: kscreenlocker@6.7.5 (greeter/greeterapp.cpp, settings/shell_integration.cpp); plasma-workspace 6.7.5 lockscreen package inspected 2026-10-03
+    license_observed: GPL-2.0-or-later implementation
+    use: idea
+    approved_for_code_use: false
+    local_files:
+      - lockscreen/org.kde.kwe.lockscreen/metadata.json
+      - lockscreen/org.kde.kwe.lockscreen/contents/lockscreen/LockScreen.qml
+      - lockscreen/org.kde.kwe.lockscreen/contents/lockscreen/LockScreenUi.qml
+      - lockscreen/org.kde.kwe.lockscreen/contents/lockscreen/PasswordSync.qml
+      - lockscreen/kwe-lockscreen
+    reviewer: Claude implementation; human release review pending
+    review_date: 2026-10-03
+    notes: Package shape (Plasma/Shell, X-Plasma-APIVersion 2, lockscreenmainscript), context properties (authenticator, kscreenlocker_userName, config), root signals, and the PLASMA_DEFAULT_SHELL selection rule only; the QML is original and no KDE implementation code was copied or adapted.
+
   - id: kde-plasma-wallpaper-api
     project: KDE Plasma WallpaperItem and Plasma/Wallpaper package interface
     url: https://api.kde.org/qml-org-kde-plasma-plasmoid-wallpaperitem.html

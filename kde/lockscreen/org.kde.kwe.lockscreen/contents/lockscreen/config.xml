@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Read from kscreenlockerrc [Greeter][LnF][General]. -->
+<kcfg xmlns="http://www.kde.org/standards/kcfg/1.0"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.kde.org/standards/kcfg/1.0
+      http://www.kde.org/standards/kcfg/1.0/kcfg.xsd" >
+  <kcfgfile name=""/>
+
+  <group name="General">
+    <entry name="accent" type="String"><default>#33ff66</default></entry>
+    <entry name="secondary" type="String"><default>#00e5ff</default></entry>
+    <entry name="danger" type="String"><default>#ff3355</default></entry>
+    <entry name="font" type="String"><default>Hack</default></entry>
+    <entry name="dim" type="Double">
+      <label>Darkening over the wallpaper while the terminal is shown (0 to 1).</label>
+      <default>0.35</default>
+    </entry>
+    <entry name="idleDim" type="Double">
+      <label>Darkening over the wallpaper while idle (0 to 1).</label>
+      <default>0.1</default>
+    </entry>
+    <entry name="scanlines" type="Bool"><default>true</default></entry>
+    <entry name="poolDir" type="String">
+      <label>kwe-sddm-sync pool; only its host-name marker is read.</label>
+      <default>/var/lib/kwe-sddm/pool</default>
+    </entry>
+    <entry name="hostname" type="String"><default></default></entry>
+  </group>
+</kcfg>

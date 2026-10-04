@@ -201,4 +201,13 @@ package() {
     install -Dm644 sddm/README.md "${pkgdir}/usr/share/doc/kde-wallpaper-engine/sddm/README.md"
     install -Dm644 -t "${pkgdir}/usr/lib/systemd/user" \
         packaging/systemd/kwe-sddm-sync.service packaging/systemd/kwe-sddm-sync.timer
+
+    # Lock screen (lockscreen/README.md): a lock-screen-only Plasma/Shell
+    # package; opt-in per user with `kwe-lockscreen enable`.
+    install -Dm755 lockscreen/kwe-lockscreen "${pkgdir}/usr/bin/kwe-lockscreen"
+    _lockpkg="${pkgdir}/usr/share/plasma/shells/org.kde.kwe.lockscreen"
+    install -Dm644 lockscreen/org.kde.kwe.lockscreen/metadata.json "${_lockpkg}/metadata.json"
+    install -Dm644 -t "${_lockpkg}/contents/lockscreen" \
+        lockscreen/org.kde.kwe.lockscreen/contents/lockscreen/*
+    install -Dm644 lockscreen/README.md "${pkgdir}/usr/share/doc/kde-wallpaper-engine/lockscreen/README.md"
 }

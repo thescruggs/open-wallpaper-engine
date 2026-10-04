@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Switch the Plasma lock screen to the KWE Terminal look, or back.
+#
+# kscreenlocker_greet loads its QML from a Plasma/Shell package chosen by
+# plasmashellrc [Shell] ShellPackage, else $PLASMA_DEFAULT_SHELL. Both also
+# pick plasmashell's desktop shell, so the variable is set only for KWin
+# (which spawns the greeter) through a user drop-in on
+# plasma-kwin_wayland.service; plasmashell keeps org.kde.plasma.desktop.
+# See lockscreen/README.md.
+set -euo pipefail
+
+shell_id="org.kde.kwe.lockscreen"
+unit="plasma-kwin_wayland.service"
+dropin_dir="${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user/${unit}.d"
+dropin="${dropin_dir}/kwe-lockscreen.conf"
+greeter="/usr/lib/kscreenlocker_greet"
+# A checkout keeps the package next to this script.
+source_pkg="$(dirname "$(readlink -f "$0")")/${shell_id}"
+
+usage() {
+    cat <<USAGE
+Usage: kwe-lockscreen enable|disable|status|preview
+
+  enable   use the KWE Terminal lock screen from the next login
+  disable  go back to the Plasma lock screen from the next login
+  status   show what the next login will use
+  preview  open the lock screen in test mode now (unlock with your password)
+USAGE
+}
+
+shell_override() {
+    kreadconfig6 --file plasmashellrc --group Shell --key ShellPackage 2>/dev/null || true
+}
+
+# Prints the installed package dir; the greeter resolves the id the same way.
+installed_pkg() {
+    local IFS=: dir
+    for dir in "${XDG_DATA_HOME:-${HOME}/.local/share}" ${XDG_DATA_DIRS:-/usr/local/share:/usr/share}; do
+        if [[ -f "${dir}/plasma/shells/${shell_id}/metadata.json" ]]; then
+            echo "${dir}/plasma/shells/${shell_id}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+warn_override() {
+    local value
+    value="$(shell_override)"
+    if [[ -n "${value}" ]]; then
+        echo "warning: plasmashellrc [Shell] ShellPackage=${value} overrides this;" >&2
+        echo "         the lock screen will keep using ${value}." >&2
+    fi
+}
+
+case "${1:-}" in
+enable)
+    # An unresolvable id makes the greeter silently fall back to Plasma's
+    # lock screen, so refuse instead.
+    if ! installed_pkg >/dev/null; then
+        echo "error: ${shell_id} is not installed (install the package first)." >&2
+        exit 1
+    fi
+    mkdir -p "${dropin_dir}"
+    cat >"${dropin}" <<CONF
+# Written by kwe-lockscreen; remove with: kwe-lockscreen disable
+[Service]
+Environment=PLASMA_DEFAULT_SHELL=${shell_id}
+CONF
+    # The greeter has no host name; the theme falls back to this key.
+    kwriteconfig6 --file kscreenlockerrc --group Greeter --group LnF --group General \
+        --key hostname "$(hostname)"
+    systemctl --user daemon-reload
+    warn_override
+    echo "KWE Terminal lock screen enabled; it takes effect at your next login."
+    ;;
+disable)
+    rm -f "${dropin}"
+    rmdir --ignore-fail-on-non-empty "${dropin_dir}" 2>/dev/null || true
+    systemctl --user daemon-reload
+    echo "Plasma lock screen restored; it takes effect at your next login."
+    ;;
+status)
+    if [[ -f "${dropin}" ]]; then
+        echo "next login: ${shell_id}"
+    else
+        echo "next login: Plasma default"
+    fi
+    running="$(systemctl --user show -p Environment "${unit}" 2>/dev/null | grep -o "PLASMA_DEFAULT_SHELL=[^ ]*" || true)"
+    echo "this session: ${running:-Plasma default}"
+    warn_override
+    ;;
+preview)
+    # The greeter also accepts a package path: prefer the installed copy,
+    # else the checkout next to this script.
+    if pkg="$(installed_pkg)"; then
+        :
+    elif [[ -f "${source_pkg}/metadata.json" ]]; then
+        pkg="${source_pkg}"
+    else
+        echo "error: ${shell_id} not found (not installed, no checkout copy)." >&2
+        exit 1
+    fi
+    echo "previewing ${pkg}"
+    exec "${greeter}" --testing --shell "${pkg}"
+    ;;
+-h | --help | help)
+    usage
+    ;;
+*)
+    usage >&2
+    exit 2
+    ;;
+esac
