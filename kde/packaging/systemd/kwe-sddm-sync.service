@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+[Unit]
+Description=Refresh the KDE Wallpaper Engine SDDM login pool
+Documentation=file:///usr/share/doc/kde-wallpaper-engine/sddm/README.md
+# Renderers need the session's display/GPU environment, as for kwe-daemon.
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/kwe-sddm-sync
+Nice=15
+IOSchedulingClass=idle
+# Bounded: each bake is itself bounded; this caps a wedged run.
+TimeoutStartSec=30min

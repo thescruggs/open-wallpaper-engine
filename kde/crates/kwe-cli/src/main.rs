@@ -8,6 +8,8 @@ use std::{
     time::Duration,
 };
 
+mod bake;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use kwe_core::{
@@ -114,6 +116,43 @@ enum Command {
         /// relative or empty path itself.
         #[arg(long)]
         path: PathBuf,
+    },
+    /// Record a bounded loop of a scene or web wallpaper to an H.264 file
+    /// through the daemon's own out-of-process renderer (SDDM login pool;
+    /// see sddm/README.md). Exits nonzero when the renderer refuses the
+    /// content or produces no frame in time.
+    BakeClip {
+        #[arg(long, value_enum)]
+        kind: bake::BakeKind,
+        /// Scene entry (`scene.pkg` / directory with `scene.json`) or web
+        /// wallpaper directory.
+        #[arg(long)]
+        content: PathBuf,
+        /// Destination `.mp4`, replaced atomically on success.
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long, default_value_t = 1920, value_parser = clap::value_parser!(u32).range(16..=8192))]
+        width: u32,
+        #[arg(long, default_value_t = 1080, value_parser = clap::value_parser!(u32).range(16..=8192))]
+        height: u32,
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(1..=60))]
+        fps: u32,
+        /// Recorded length after warm-up.
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=120))]
+        seconds: u32,
+        /// Seconds of rendering discarded after the first frame.
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(0..=30))]
+        warmup: u32,
+        #[arg(long, default_value_t = 90, value_parser = clap::value_parser!(u32).range(5..=300))]
+        first_frame_timeout: u32,
+        /// Renderer binary; defaults to the one beside this `kwe`.
+        #[arg(long)]
+        renderer: Option<PathBuf>,
+        #[arg(long = "assets-dir")]
+        assets_dir: Option<PathBuf>,
+        /// Pass the renderer's stderr through.
+        #[arg(long)]
+        verbose: bool,
     },
 }
 
@@ -314,6 +353,35 @@ fn main() -> Result<()> {
             if response.get("ok") != Some(&serde_json::Value::Bool(true)) {
                 std::process::exit(2);
             }
+        }
+        Command::BakeClip {
+            kind,
+            content,
+            output,
+            width,
+            height,
+            fps,
+            seconds,
+            warmup,
+            first_frame_timeout,
+            renderer,
+            assets_dir,
+            verbose,
+        } => {
+            bake::bake_clip(&bake::BakeRequest {
+                kind,
+                content,
+                output,
+                width,
+                height,
+                fps,
+                seconds,
+                warmup,
+                first_frame_timeout,
+                renderer,
+                assets_dir,
+                verbose,
+            })?;
         }
         Command::Reports => {
             let root = reports_root();

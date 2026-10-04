@@ -36,6 +36,11 @@ url="https://github.com/thescruggs/open-wallpaper-engine"
 # The KDE stack (kde/) is GPL-3.0-or-later; the OWE renderer workers are
 # built from the GPL-2.0-only engine.
 license=('GPL-3.0-or-later' 'GPL-2.0-only')
+optdepends=(
+    'sddm: kwe-terminal login theme'
+    'qt6-multimedia: kwe-terminal login theme video playback'
+    'ffmpeg: kwe-sddm-sync clip encoding'
+)
 depends=(
     'qt6-base'
     'qt6-declarative'
@@ -188,4 +193,12 @@ package() {
 
     install -Dm644 packaging/org.kde.kwe.desktop "${pkgdir}/usr/share/applications/org.kde.kwe.desktop"
     install -Dm644 packaging/systemd/kwe-daemon.service "${pkgdir}/usr/lib/systemd/user/kwe-daemon.service"
+
+    # SDDM login theme + its pool refresher (sddm/README.md).
+    install -Dm755 sddm/kwe-sddm-sync "${pkgdir}/usr/bin/kwe-sddm-sync"
+    install -Dm644 -t "${pkgdir}/usr/share/sddm/themes/kwe-terminal" \
+        sddm/kwe-terminal/Main.qml sddm/kwe-terminal/metadata.desktop sddm/kwe-terminal/theme.conf
+    install -Dm644 sddm/README.md "${pkgdir}/usr/share/doc/kde-wallpaper-engine/sddm/README.md"
+    install -Dm644 -t "${pkgdir}/usr/lib/systemd/user" \
+        packaging/systemd/kwe-sddm-sync.service packaging/systemd/kwe-sddm-sync.timer
 }

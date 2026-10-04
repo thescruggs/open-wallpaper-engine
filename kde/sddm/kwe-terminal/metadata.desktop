@@ -1,0 +1,12 @@
+[SddmGreeterTheme]
+Name=KWE Terminal
+Description=Terminal/CRT login over a random Wallpaper Engine clip from the KDE Wallpaper Engine login pool
+Author=KDE Wallpaper Engine contributors
+License=GPL-3.0-or-later
+Type=sddm-theme
+Version=0.1
+MainScript=Main.qml
+ConfigFile=theme.conf
+Theme-Id=kwe-terminal
+Theme-API=2.0
+QtVersion=6

@@ -265,6 +265,7 @@ dependencies = [
  "anyhow",
  "clap",
  "kwe-core",
+ "kwe-frame-protocol",
  "libc",
  "serde_json",
 ]

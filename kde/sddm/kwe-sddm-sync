@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Refresh the SDDM login pool for the kwe-terminal greeter theme.
+#
+# The greeter runs as `sddm` before any session, so it cannot run a
+# renderer. This script (run as the desktop user) keeps a cache of
+# loop-ready H.264 clips — video wallpapers transcoded, scene/web
+# wallpapers recorded through `kwe bake-clip` — and copies a random subset
+# into the pool directory the greeter reads. The greeter then picks one at
+# random on every start. See sddm/README.md.
+set -euo pipefail
+
+pool_dir="${KWE_SDDM_POOL:-/var/lib/kwe-sddm/pool}"
+cache_dir="${XDG_CACHE_HOME:-${HOME}/.cache}/kwe/sddm-clips"
+pool_size=8        # clips copied into the pool per run
+max_bake=4         # new clips rendered per run (bounds GPU time)
+clip_seconds=20    # loop length after the crossfade
+fade_seconds=1.5   # seamless-loop crossfade
+fps=30
+size=""            # WxH; detected from kscreen-doctor when empty
+max_width=2560     # cap for detected sizes; the greeter crop-scales up
+kinds="scene,video,web"
+ratings="Everyone"
+verbose=0
+kwe_bin="${KWE_BIN:-kwe}"   # override to test an uninstalled build
+
+usage() {
+    cat <<EOF
+Usage: kwe-sddm-sync [options]
+       sudo kwe-sddm-sync --setup USER
+
+  --pool-size N     clips placed in the pool (default ${pool_size})
+  --max-bake N      new clips rendered this run (default ${max_bake})
+  --seconds N       loop length (default ${clip_seconds})
+  --size WxH        clip size (default: current primary output mode)
+  --max-width N     cap a detected size, keeping aspect (default ${max_width})
+  --kinds LIST      comma list of scene,video,web (default ${kinds})
+  --ratings LIST    allowed project contentrating values, comma list
+                    (default ${ratings}; "any" disables the filter)
+  --clear-cache     delete cached clips first
+  --verbose         show renderer/encoder output
+  --setup USER      (root) create ${pool_dir} owned by USER
+EOF
+}
+
+die() { echo "kwe-sddm-sync: $*" >&2; exit 1; }
+log() { echo "kwe-sddm-sync: $*" >&2; }
+
+setup() {
+    local user="$1"
+    [[ ${EUID} -eq 0 ]] || die "--setup must run as root"
+    id -u "${user}" >/dev/null 2>&1 || die "no such user: ${user}"
+    install -d -m 0755 -o root -g root "$(dirname "${pool_dir}")"
+    install -d -m 0755 -o "${user}" -g "$(id -gn "${user}")" "${pool_dir}"
+    log "pool ${pool_dir} is ready for ${user}"
+    log "next: as ${user}, run 'kwe-sddm-sync' and enable 'systemctl --user enable --now kwe-sddm-sync.timer'"
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --pool-size) pool_size="$2"; shift 2 ;;
+        --max-bake) max_bake="$2"; shift 2 ;;
+        --seconds) clip_seconds="$2"; shift 2 ;;
+        --size) size="$2"; shift 2 ;;
+        --max-width) max_width="$2"; shift 2 ;;
+        --kinds) kinds="$2"; shift 2 ;;
+        --ratings) ratings="$2"; shift 2 ;;
+        --clear-cache) rm -rf "${cache_dir}"; shift ;;
+        --verbose) verbose=1; shift ;;
+        --setup) setup "${2:?--setup needs a user}"; exit 0 ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage >&2; exit 2 ;;
+    esac
+done
+
+for tool in "${kwe_bin}" ffmpeg ffprobe jq; do
+    command -v "${tool}" >/dev/null || die "${tool} is required"
+done
+[[ -d ${pool_dir} && -w ${pool_dir} ]] \
+    || die "${pool_dir} is missing or not writable; run: sudo kwe-sddm-sync --setup ${USER}"
+
+detect_size() {
+    # Primary (else first enabled) output's current mode, in device pixels.
+    command -v kscreen-doctor >/dev/null || return 1
+    kscreen-doctor -j 2>/dev/null | jq -r '
+        [.outputs[] | select(.enabled)] | (map(select(.priority == 1)) + .)[0] as $o
+        | $o.modes[] | select(.id == $o.currentModeId)
+        | "\(.size.width)x\(.size.height)"' 2>/dev/null | head -n1
+}
+explicit_size="${size}"
+[[ -n ${size} ]] || size="$(detect_size || true)"
+[[ ${size} =~ ^([0-9]+)x([0-9]+)$ ]] || size="1920x1080"
+width="${size%x*}"
+height="${size#*x}"
+# Native super-ultrawide/4K modes make large clips that the greeter decodes
+# in software; a detected size is scaled down to max_width.
+if [[ -z ${explicit_size} ]] && (( width > max_width )); then
+    height=$(( height * max_width / width ))
+    width=${max_width}
+fi
+# libx264 + yuv420p need even dimensions.
+width=$(( width / 2 * 2 ))
+height=$(( height / 2 * 2 ))
+log "clip size ${width}x${height}"
+
+mkdir -p "${cache_dir}"
+work="$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/kwe-sddm-sync.XXXXXX")"
+trap 'rm -rf "${work}"' EXIT
+
+slug() {
+    # Filesystem- and QML-safe title fragment the greeter shows as the label.
+    printf '%s' "$1" | iconv -f utf-8 -t ascii//TRANSLIT 2>/dev/null \
+        | tr -cs 'A-Za-z0-9' '-' | sed 's/^-*//; s/-*$//' | cut -c1-48
+}
+
+# Catalog → "kind<TAB>id<TAB>entry<TAB>root<TAB>title", filtered by kind and
+# rating. Rating comes from project.json (`contentrating`); a project with no
+# rating counts as "Everyone", matching Wallpaper Engine's default.
+"${kwe_bin}" scan --compact 2>/dev/null > "${work}/catalog.json" || die "kwe scan failed"
+jq -r --arg kinds "${kinds}" '
+    ($kinds | split(",")) as $k
+    | .items[]
+    | select(.kind as $kind | $k | index($kind))
+    | select(.workshop_state != "subscribed_missing")
+    | [.kind, .workshop_id, (.entry_file // ""), .content_root, (.title // "")]
+    | @tsv' "${work}/catalog.json" > "${work}/candidates.tsv"
+
+: > "${work}/eligible.tsv"
+while IFS=$'\t' read -r kind id entry root title; do
+    [[ -n ${entry} && -e ${entry} ]] || continue
+    if [[ ${ratings} != any ]]; then
+        rating="$(jq -r '.contentrating // "Everyone"' "${root}/project.json" 2>/dev/null || echo unknown)"
+        [[ ",${ratings}," == *",${rating},"* ]] || continue
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\n' "${kind}" "${id}" "${entry}" "${root}" "${title}" >> "${work}/eligible.tsv"
+done < "${work}/candidates.tsv"
+eligible=$(wc -l < "${work}/eligible.tsv")
+(( eligible > 0 )) || die "no eligible wallpapers (kinds=${kinds}, ratings=${ratings})"
+log "${eligible} eligible wallpapers"
+
+quiet=(-v error)
+(( verbose )) && quiet=(-v warning)
+
+# Seamless loop: drop the first F seconds and crossfade the clip's tail into
+# its own head, so the last frame flows into the first.
+loop_fade() {
+    local input="$1" output="$2" total="$3"
+    local offset
+    offset=$(awk -v t="${total}" -v f="${fade_seconds}" 'BEGIN { printf "%.3f", t - 2 * f }')
+    ffmpeg "${quiet[@]}" -nostdin -y -i "${input}" -filter_complex "
+        [0:v]split[a][b];
+        [a]trim=start=${fade_seconds},setpts=PTS-STARTPTS[body];
+        [b]trim=end=${fade_seconds},setpts=PTS-STARTPTS[head];
+        [body][head]xfade=transition=fade:duration=${fade_seconds}:offset=${offset},format=yuv420p[v]" \
+        -map '[v]' -an -c:v libx264 -preset slow -crf 21 -movflags +faststart "${output}"
+}
+
+bake_one() {
+    local kind="$1" id="$2" entry="$3" root="$4" out="$5"
+    local raw="${work}/raw-${id}.mp4"
+    local total
+    total=$(awk -v s="${clip_seconds}" -v f="${fade_seconds}" 'BEGIN { t = s + f; printf "%d", (t == int(t)) ? t : int(t) + 1 }')
+    case "${kind}" in
+        video)
+            # Crop-to-fill and cap length; audio is dropped (silent greeter).
+            ffmpeg "${quiet[@]}" -nostdin -y -t "${total}" -i "${entry}" \
+                -vf "scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},fps=${fps}" \
+                -an -c:v libx264 -preset veryfast -crf 18 "${raw}" || return 1
+            ;;
+        scene|web)
+            local content="${entry}"
+            [[ ${kind} == web ]] && content="${root}"
+            local extra=()
+            (( verbose )) && extra+=(--verbose)
+            "${kwe_bin}" bake-clip --kind "${kind}" --content "${content}" --output "${raw}" \
+                --width "${width}" --height "${height}" --fps "${fps}" \
+                --seconds "${total}" "${extra[@]}" || return 1
+            ;;
+        *) return 1 ;;
+    esac
+    local dur
+    dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "${raw}" 2>/dev/null || echo 0)
+    if awk -v d="${dur}" -v f="${fade_seconds}" 'BEGIN { exit !(d > 4 * f) }'; then
+        loop_fade "${raw}" "${out}.part.mp4" "${dur}" || return 1
+    else
+        mv "${raw}" "${out}.part.mp4"
+    fi
+    mv "${out}.part.mp4" "${out}"
+    rm -f "${raw}"
+}
+
+# Bake up to max_bake missing clips from a random walk over the library.
+# Failed ids are remembered so a refused wallpaper is not retried each run.
+failed_list="${cache_dir}/failed-${width}x${height}"
+touch "${failed_list}"
+baked=0
+while IFS=$'\t' read -r kind id entry root title; do
+    (( baked < max_bake )) || break
+    clip="${cache_dir}/${kind}-${id}-${width}x${height}.mp4"
+    [[ -s ${clip} ]] && continue
+    grep -qx "${id}" "${failed_list}" && continue
+    log "baking ${kind} ${id}: ${title}"
+    if bake_one "${kind}" "${id}" "${entry}" "${root}" "${clip}"; then
+        printf '%s\n' "${title}" > "${clip%.mp4}.title"
+        baked=$((baked + 1))
+    else
+        log "  skipped ${id} (renderer or encoder refused it)"
+        printf '%s\n' "${id}" >> "${failed_list}"
+        rm -f "${clip}" "${clip}.part.mp4"
+    fi
+done < <(shuf "${work}/eligible.tsv")
+log "baked ${baked} new clip(s)"
+
+# Rebuild the pool from a random subset of cached clips at this size.
+# Pool names: <kind>-<id>--<Title-Slug>.mp4 (+ .jpg poster for the instant
+# before the decoder's first frame). The greeter reads the label from the
+# name, so it never parses anything but a directory listing.
+mapfile -t cached < <(find "${cache_dir}" -maxdepth 1 -name "*-${width}x${height}.mp4" | shuf -n "${pool_size}")
+(( ${#cached[@]} > 0 )) || die "no clips cached yet; check renderer output with --verbose"
+staging="${pool_dir}/.staging"
+rm -rf "${staging}"
+mkdir -m 0755 "${staging}"
+for clip in "${cached[@]}"; do
+    base="$(basename "${clip}" "-${width}x${height}.mp4")"
+    title="$(cat "${clip%.mp4}.title" 2>/dev/null || echo "${base}")"
+    name="${base}--$(slug "${title}")"
+    cp --reflink=auto "${clip}" "${staging}/${name}.mp4"
+    ffmpeg -v error -nostdin -y -i "${clip}" -frames:v 1 -q:v 3 "${staging}/${name}.jpg" || true
+done
+chmod 0644 "${staging}"/*
+find "${pool_dir}" -maxdepth 1 -type f \( -name '*.mp4' -o -name '*.jpg' \) -delete
+mv "${staging}"/* "${pool_dir}/"
+rmdir "${staging}"
+log "pool: ${#cached[@]} clip(s) in ${pool_dir}"
