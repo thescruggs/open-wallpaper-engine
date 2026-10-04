@@ -23,7 +23,10 @@ Rectangle {
     readonly property color danger: cfg("danger", "#ff3355")
     readonly property string mono: cfg("font", "Hack")
     readonly property real unit: Math.max(12, Math.min(width / 110, height / 48))
-    readonly property string host: sddm.hostName || "localhost"
+    // The daemon supplies sddm.hostName; preview (--test-mode) has none, so
+    // fall back to the marker kwe-sddm-sync writes, then theme.conf.
+    readonly property string host: sddm.hostName || poolHost || cfg("hostname", "localhost")
+    property string poolHost: ""
 
     // Picked pool entry, parsed from "<kind>-<id>--<Title-Slug>.mp4".
     property url clipUrl: ""
@@ -100,6 +103,14 @@ Rectangle {
         showHidden: false
         // Ready can arrive before the rows do; pick on the first non-empty count.
         onCountChanged: if (count > 0 && root.clipUrl == "") root.pickClip()
+    }
+
+    FolderListModel {
+        // "<hostname>.host": a name-only marker; nothing is read from it.
+        folder: pool.folder
+        nameFilters: ["*.host"]
+        showDirs: false
+        onCountChanged: if (count > 0) root.poolHost = String(get(0, "fileBaseName"))
     }
 
     Instantiator {
@@ -313,7 +324,7 @@ Rectangle {
         id: terminal
 
         visible: root.isPrimary
-        property real baseX: root.width * 0.08
+        property real baseX: (root.width - width) / 2
         x: baseX
         anchors.verticalCenter: parent.verticalCenter
         width: Math.min(root.unit * 46, root.width - root.unit * 4)

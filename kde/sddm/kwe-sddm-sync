@@ -227,8 +227,11 @@ for clip in "${cached[@]}"; do
     cp --reflink=auto "${clip}" "${staging}/${name}.mp4"
     ffmpeg -v error -nostdin -y -i "${clip}" -frames:v 1 -q:v 3 "${staging}/${name}.jpg" || true
 done
+# Hostname marker for the greeter's preview mode (see Main.qml `host`).
+host="$(slug "$(cat /etc/hostname 2>/dev/null || uname -n)")"
+[[ -n ${host} ]] && : > "${staging}/${host}.host"
 chmod 0644 "${staging}"/*
-find "${pool_dir}" -maxdepth 1 -type f \( -name '*.mp4' -o -name '*.jpg' \) -delete
+find "${pool_dir}" -maxdepth 1 -type f \( -name '*.mp4' -o -name '*.jpg' -o -name '*.host' \) -delete
 mv "${staging}"/* "${pool_dir}/"
 rmdir "${staging}"
 log "pool: ${#cached[@]} clip(s) in ${pool_dir}"
