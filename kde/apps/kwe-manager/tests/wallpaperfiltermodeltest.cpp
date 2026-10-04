@@ -59,14 +59,21 @@ private slots:
         QVERIFY(m_filter.selectableIdsBetween(QStringLiteral("10"), QStringLiteral("999")).isEmpty());
     }
 
-    void playlistOnlyShowsMembersAndTracksChanges() {
+    void playlistFilterShowsMembersOrTheRestAndTracksChanges() {
         m_filter.setPlaylistIds({QStringLiteral("30"), QStringLiteral("50")});
         QCOMPARE(m_filter.rowCount(), 5);  // filter off: membership alone hides nothing
-        m_filter.setPlaylistOnly(true);
+        m_filter.setPlaylistFilter(QStringLiteral("in"));
         QCOMPARE(m_filter.selectableIds(), (QStringList{QStringLiteral("30"), QStringLiteral("50")}));
         m_filter.setPlaylistIds({QStringLiteral("50")});
         QCOMPARE(m_filter.rowCount(), 1);
-        m_filter.setPlaylistOnly(false);
+        // The complement: everything not yet in the playlist.
+        m_filter.setPlaylistFilter(QStringLiteral("out"));
+        QCOMPARE(m_filter.rowCount(), 4);
+        QCOMPARE(m_filter.selectableIds(), (QStringList{QStringLiteral("10"), QStringLiteral("30")}));
+        m_filter.setPlaylistIds({QStringLiteral("50"), QStringLiteral("10")});
+        QCOMPARE(m_filter.selectableIds(), QStringList{QStringLiteral("30")});
+        m_filter.setPlaylistFilter(QStringLiteral("bogus"));  // unknown values mean off
+        QCOMPARE(m_filter.playlistFilter(), QStringLiteral("all"));
         QCOMPARE(m_filter.rowCount(), 5);
     }
 };

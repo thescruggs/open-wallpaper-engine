@@ -229,21 +229,24 @@ void WallpaperFilterModel::setWorkshopView(bool value) {
     emit workshopViewChanged();
 }
 
-void WallpaperFilterModel::setPlaylistOnly(bool value) {
-    if (m_playlistOnly == value) return;
+void WallpaperFilterModel::setPlaylistFilter(const QString &value) {
+    const QString mode = value == QStringLiteral("in") || value == QStringLiteral("out")
+        ? value : QStringLiteral("all");
+    if (m_playlistFilter == mode) return;
     beginFilterChange();
-    m_playlistOnly = value;
+    m_playlistFilter = mode;
     endFilterChange(Direction::Rows);
-    emit playlistOnlyChanged();
+    emit playlistFilterChanged();
 }
 
 void WallpaperFilterModel::setPlaylistIds(const QStringList &value) {
     if (m_playlistIdList == value) return;
     // Membership only affects which rows show while the filter is on.
-    if (m_playlistOnly) beginFilterChange();
+    const bool filtering = m_playlistFilter != QStringLiteral("all");
+    if (filtering) beginFilterChange();
     m_playlistIdList = value;
     m_playlistIds = QSet<QString>(value.cbegin(), value.cend());
-    if (m_playlistOnly) endFilterChange(Direction::Rows);
+    if (filtering) endFilterChange(Direction::Rows);
     emit playlistIdsChanged();
 }
 
@@ -299,6 +302,7 @@ bool WallpaperFilterModel::filterAcceptsRow(int sourceRow, const QModelIndex &so
     // downloading, or awaiting download); local-only items stay on the
     // Installed page.
     const bool workshopMatches = !m_workshopView || workshopState != QStringLiteral("local");
-    const bool playlistMatches = !m_playlistOnly || m_playlistIds.contains(id);
+    const bool playlistMatches = m_playlistFilter == QStringLiteral("all")
+        || m_playlistIds.contains(id) == (m_playlistFilter == QStringLiteral("in"));
     return kindMatches && favoriteMatches && searchMatches && workshopMatches && playlistMatches;
 }

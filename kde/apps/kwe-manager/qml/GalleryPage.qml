@@ -49,7 +49,7 @@ Kirigami.Page {
         filterModel.playlistIds = entries
         if (currentPlaylist === "") {
             playlistEditMode = false
-            filterModel.playlistOnly = false
+            filterModel.playlistFilter = "all"
         }
     }
 
@@ -83,7 +83,7 @@ Kirigami.Page {
             return
         playlistSelector.currentIndex = index
         syncPlaylist()
-        filterModel.playlistOnly = false
+        filterModel.playlistFilter = "all"
         playlistEditMode = true
     }
 
@@ -175,14 +175,20 @@ Kirigami.Page {
             }
             Controls.ToolButton {
                 visible: playlistSelector.currentText !== ""
-                checked: galleryPage.filterModel.playlistOnly
-                text: qsTr("In playlist")
+                // Cycles all -> in playlist -> not in playlist -> all.
+                readonly property string mode: galleryPage.filterModel.playlistFilter
+                checked: mode !== "all"
+                text: mode === "in" ? qsTr("In playlist")
+                    : mode === "out" ? qsTr("Not in playlist")
+                    : qsTr("All wallpapers")
                 icon.name: "view-filter-symbolic"
                 display: Controls.AbstractButton.TextBesideIcon
-                Accessible.name: qsTr("Show only wallpapers in the selected playlist")
+                Accessible.name: mode === "in" ? qsTr("Showing only wallpapers in the selected playlist; activate to show those not in it")
+                    : mode === "out" ? qsTr("Showing only wallpapers not in the selected playlist; activate to show all")
+                    : qsTr("Showing all wallpapers; activate to show only those in the selected playlist")
                 Controls.ToolTip.visible: hovered
                 Controls.ToolTip.text: Accessible.name
-                onClicked: galleryPage.filterModel.playlistOnly = !galleryPage.filterModel.playlistOnly
+                onClicked: galleryPage.filterModel.playlistFilter = mode === "all" ? "in" : mode === "in" ? "out" : "all"
             }
 
             Controls.ToolButton {

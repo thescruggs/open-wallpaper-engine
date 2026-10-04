@@ -112,8 +112,9 @@ class WallpaperFilterModel final : public QSortFilterProxyModel {
     Q_PROPERTY(QString sortMode READ sortMode WRITE setSortMode NOTIFY sortModeChanged)
     Q_PROPERTY(bool favoritesOnly READ favoritesOnly WRITE setFavoritesOnly NOTIFY favoritesOnlyChanged)
     Q_PROPERTY(bool workshopView READ workshopView WRITE setWorkshopView NOTIFY workshopViewChanged)
-    // Playlist edit mode: optionally show only the given playlist's members.
-    Q_PROPERTY(bool playlistOnly READ playlistOnly WRITE setPlaylistOnly NOTIFY playlistOnlyChanged)
+    // Filter against the selected playlist's members: "all" (off), "in"
+    // (members only) or "out" (everything not yet in it).
+    Q_PROPERTY(QString playlistFilter READ playlistFilter WRITE setPlaylistFilter NOTIFY playlistFilterChanged)
     Q_PROPERTY(QStringList playlistIds READ playlistIds WRITE setPlaylistIds NOTIFY playlistIdsChanged)
 
 public:
@@ -129,9 +130,9 @@ public:
     void setSortMode(const QString &value);
     void setFavoritesOnly(bool value);
     void setWorkshopView(bool value);
-    bool playlistOnly() const { return m_playlistOnly; }
+    QString playlistFilter() const { return m_playlistFilter; }
     QStringList playlistIds() const { return m_playlistIdList; }
-    void setPlaylistOnly(bool value);
+    void setPlaylistFilter(const QString &value);
     void setPlaylistIds(const QStringList &value);
     // Ids of the rows currently shown that a playlist can play, in view
     // order; the second form is the inclusive range between two shown ids.
@@ -145,7 +146,7 @@ signals:
     void sortModeChanged();
     void favoritesOnlyChanged();
     void workshopViewChanged();
-    void playlistOnlyChanged();
+    void playlistFilterChanged();
     void playlistIdsChanged();
 
 protected:
@@ -157,7 +158,7 @@ private:
     QString m_sortMode = QStringLiteral("title");
     bool m_favoritesOnly = false;
     bool m_workshopView = false;
-    bool m_playlistOnly = false;
+    QString m_playlistFilter = QStringLiteral("all");
     QStringList m_playlistIdList;
     QSet<QString> m_playlistIds;
 
