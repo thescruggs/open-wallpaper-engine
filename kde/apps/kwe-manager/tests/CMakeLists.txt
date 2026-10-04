@@ -114,3 +114,11 @@ qt_add_executable(kwe-qr-code-item-test
 )
 target_link_libraries(kwe-qr-code-item-test PRIVATE Qt6::Core Qt6::Gui Qt6::Quick Qt6::Qml Qt6::Test PkgConfig::QRENCODE)
 add_test(NAME kwe-qr-code-item-test COMMAND kwe-qr-code-item-test)
+
+qt_add_executable(kwe-wallpaper-filter-model-test
+    wallpaperfiltermodeltest.cpp
+    ../src/catalogmodel.cpp
+    ../src/catalogmodel.h
+)
+target_link_libraries(kwe-wallpaper-filter-model-test PRIVATE Qt6::Core Qt6::Gui Qt6::Test)
+add_test(NAME kwe-wallpaper-filter-model-test COMMAND kwe-wallpaper-filter-model-test)

@@ -161,6 +161,41 @@ private slots:
         QTRY_VERIFY(m_daemon.stored.isEmpty());
     }
 
+    void batchEditsChangeManyEntriesWithOneUpsertEach() {
+        PlaylistController controller(m_socketPath);
+        QSignalSpy changedSpy(&controller, &PlaylistController::changed);
+        QTRY_VERIFY(changedSpy.count() >= 1);
+        controller.create(QStringLiteral("Batch"));
+        controller.addMany(QStringLiteral("Batch"),
+                           {QStringLiteral("1"), QStringLiteral("2"), QStringLiteral("2"),
+                            QString(), QStringLiteral("3")});
+        QCOMPARE(controller.entries(QStringLiteral("Batch")),
+                 (QStringList{QStringLiteral("1"), QStringLiteral("2"), QStringLiteral("3")}));
+        QVERIFY(controller.contains(QStringLiteral("Batch"), QStringLiteral("2")));
+
+        // Adding what is already there changes nothing and sends nothing.
+        const int before = changedSpy.count();
+        controller.addMany(QStringLiteral("Batch"), {QStringLiteral("1"), QStringLiteral("3")});
+        QCOMPARE(changedSpy.count(), before);
+
+        controller.removeMany(QStringLiteral("Batch"), {QStringLiteral("1"), QStringLiteral("3"), QStringLiteral("9")});
+        QCOMPARE(controller.entries(QStringLiteral("Batch")), QStringList{QStringLiteral("2")});
+        QVERIFY(!controller.contains(QStringLiteral("Batch"), QStringLiteral("1")));
+        controller.removeMany(QStringLiteral("Batch"), {QStringLiteral("9")});
+        QCOMPARE(controller.entries(QStringLiteral("Batch")), QStringList{QStringLiteral("2")});
+
+        QTRY_VERIFY(m_daemon.stored.size() == 1
+                    && m_daemon.stored.first().value(QStringLiteral("entries")).toArray().size() == 1);
+
+        // The entry limit truncates a large batch and says so.
+        QStringList many;
+        for (int i = 0; i < 1100; ++i)
+            many.push_back(QStringLiteral("id%1").arg(i));
+        controller.addMany(QStringLiteral("Batch"), many);
+        QCOMPARE(controller.entries(QStringLiteral("Batch")).size(), 1024);
+        QVERIFY(!controller.errorMessage().isEmpty());
+    }
+
     void moveEntryReordersAndPersists() {
         PlaylistController controller(m_socketPath);
         QSignalSpy changedSpy(&controller, &PlaylistController::changed);

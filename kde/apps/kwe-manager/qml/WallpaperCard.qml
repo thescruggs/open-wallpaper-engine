@@ -30,6 +30,16 @@ Item {
     required property string diagnosticSummary
     required property var requestedPermissions
 
+    // Playlist edit mode (GalleryPage): the card shows a checkbox and a click
+    // adds the wallpaper to, or removes it from, the playlist being edited.
+    property bool selectionMode: false
+    property var playlistMembers: ({})
+    readonly property bool inPlaylist: playlistMembers[workshopId] === true
+    // Same rule the daemon uses for what a playlist can play.
+    readonly property bool playlistSelectable: (workshopState === "local" || workshopState === "subscribed_installed")
+        && kind !== "invalid"
+    signal playlistToggleRequested(string workshopId, bool extendRange)
+
     width: cardRoot.cellWidth
     height: cardRoot.cellHeight
 
@@ -43,17 +53,27 @@ Item {
         Accessible.name: qsTr("%1, %2 wallpaper, %3")
             .arg(cardRoot.title).arg(cardRoot.kind)
             .arg(WallpaperSelection.compatibilityLabel(cardRoot.compatibility))
-        onClicked: WallpaperSelection.select(cardRoot.title, cardRoot.workshopId, cardRoot.kind, cardRoot.compatibility, cardRoot.compatibilityDetail, cardRoot.previewUrl, cardRoot.tags, cardRoot.entryUrl, cardRoot.contentRoot, cardRoot.diagnosticSummary, cardRoot.requestedPermissions)
+        Accessible.description: !cardRoot.selectionMode ? ""
+            : !cardRoot.playlistSelectable ? qsTr("Cannot be added to a playlist")
+            : cardRoot.inPlaylist ? qsTr("In the playlist") : qsTr("Not in the playlist")
+        Accessible.checkable: cardRoot.selectionMode
+        Accessible.checked: cardRoot.selectionMode && cardRoot.inPlaylist
+        // Keyboard activation lands here in both modes; pointer clicks in
+        // selection mode go through the overlay below so Shift is known.
+        onClicked: cardRoot.selectionMode
+            ? (cardRoot.playlistSelectable ? cardRoot.playlistToggleRequested(cardRoot.workshopId, false) : undefined)
+            : WallpaperSelection.select(cardRoot.title, cardRoot.workshopId, cardRoot.kind, cardRoot.compatibility, cardRoot.compatibilityDetail, cardRoot.previewUrl, cardRoot.tags, cardRoot.entryUrl, cardRoot.contentRoot, cardRoot.diagnosticSummary, cardRoot.requestedPermissions)
 
         background: Rectangle {
             radius: Kirigami.Units.cornerRadius
             color: card.down || card.checked ? Kirigami.Theme.alternateBackgroundColor
                  : card.hovered ? Kirigami.Theme.hoverColor
                  : Kirigami.Theme.backgroundColor
-            border.width: card.activeFocus ? 2 : 1
+            border.width: card.activeFocus || (cardRoot.selectionMode && cardRoot.inPlaylist) ? 2 : 1
             // Kirigami 6.28 no longer provides Theme.separatorColor; tint the
             // text color instead for the idle 1px card border.
             border.color: card.activeFocus ? Kirigami.Theme.focusColor
+                : cardRoot.selectionMode && cardRoot.inPlaylist ? Kirigami.Theme.highlightColor
                 : Qt.rgba(Kirigami.Theme.textColor.r, Kirigami.Theme.textColor.g,
                           Kirigami.Theme.textColor.b, 0.2)
         }
@@ -86,6 +106,27 @@ Item {
                           : "preferences-desktop-wallpaper-symbolic"
                     opacity: 0.55
                     visible: previewImage.status !== Image.Ready
+                }
+                // Membership marker. Display only: the overlay MouseArea
+                // takes the click for the whole card.
+                Rectangle {
+                    visible: cardRoot.selectionMode
+                    anchors.top: parent.top
+                    anchors.left: parent.left
+                    anchors.margins: Kirigami.Units.smallSpacing
+                    width: membershipBox.implicitWidth + Kirigami.Units.smallSpacing
+                    height: membershipBox.implicitHeight + Kirigami.Units.smallSpacing
+                    radius: Kirigami.Units.cornerRadius
+                    color: Kirigami.Theme.backgroundColor
+                    opacity: cardRoot.playlistSelectable ? 0.92 : 0.6
+                    Controls.CheckBox {
+                        id: membershipBox
+                        anchors.centerIn: parent
+                        checked: cardRoot.inPlaylist
+                        enabled: cardRoot.playlistSelectable
+                        focusPolicy: Qt.NoFocus
+                        Accessible.ignored: true
+                    }
                 }
             }
 
@@ -142,6 +183,17 @@ Item {
                     color: Kirigami.Theme.positiveTextColor
                 }
             }
+        }
+    }
+    MouseArea {
+        anchors.fill: card
+        enabled: cardRoot.selectionMode
+        visible: enabled
+        cursorShape: cardRoot.playlistSelectable ? Qt.PointingHandCursor : Qt.ForbiddenCursor
+        onClicked: mouse => {
+            card.forceActiveFocus()
+            if (cardRoot.playlistSelectable)
+                cardRoot.playlistToggleRequested(cardRoot.workshopId, (mouse.modifiers & Qt.ShiftModifier) !== 0)
         }
     }
 }

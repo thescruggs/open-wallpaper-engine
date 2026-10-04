@@ -386,6 +386,54 @@ void PlaylistController::removeEntry(const QString &name, const QString &worksho
     }
 }
 
+void PlaylistController::addMany(const QString &name, const QStringList &workshopIds) {
+    if (!m_names.contains(name)) {
+        m_error = tr("Select a valid playlist and wallpaper first.");
+        emit changed();
+        return;
+    }
+    auto &entries = m_entries[name];
+    QSet<QString> present(entries.cbegin(), entries.cend());
+    bool added = false;
+    bool full = false;
+    for (const QString &id : workshopIds) {
+        if (id.isEmpty() || id.size() > 128 || present.contains(id))
+            continue;
+        if (entries.size() >= MaxEntries) {
+            full = true;
+            break;
+        }
+        entries.push_back(id);
+        present.insert(id);
+        added = true;
+    }
+    if (full)
+        m_error = tr("Playlist entry limit reached; not every wallpaper was added.");
+    else
+        m_error.clear();
+    if (added) {
+        ++m_pendingEdits;
+        m_client.putPlaylist(playlistObject(name));
+    }
+    if (added || full)
+        emit changed();
+}
+
+void PlaylistController::removeMany(const QString &name, const QStringList &workshopIds) {
+    if (!m_entries.contains(name))
+        return;
+    const QSet<QString> doomed(workshopIds.cbegin(), workshopIds.cend());
+    auto &entries = m_entries[name];
+    const auto before = entries.size();
+    entries.removeIf([&doomed](const QString &id) { return doomed.contains(id); });
+    if (entries.size() == before)
+        return;
+    m_error.clear();
+    ++m_pendingEdits;
+    m_client.putPlaylist(playlistObject(name));
+    emit changed();
+}
+
 void PlaylistController::moveEntry(const QString &name, int from, int to) {
     if (!m_entries.contains(name))
         return;

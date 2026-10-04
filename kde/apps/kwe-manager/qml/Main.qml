@@ -14,6 +14,8 @@ Kirigami.ApplicationWindow {
     title: qsTr("KDE Wallpaper Engine")
 
     property bool createPlaylistOpen: false
+    // The gallery that asked for the new playlist; it enters edit mode on it.
+    property var createPlaylistFor: null
 
     pageStack.initialPage: installedPage
 
@@ -22,11 +24,15 @@ Kirigami.ApplicationWindow {
         visible: false
         title: qsTr("Installed Wallpapers")
         contentItem: GalleryPage {
+            id: installedGallery
             anchors.fill: parent
             filterModel: wallpaperModel
             workshopView: false
             emptyExplanation: qsTr("Change the search or type filter, or ask Steam to install Workshop items.")
-            onCreatePlaylistRequested: root.createPlaylistOpen = true
+            onCreatePlaylistRequested: {
+                root.createPlaylistFor = installedGallery
+                root.createPlaylistOpen = true
+            }
         }
     }
 
@@ -55,10 +61,14 @@ Kirigami.ApplicationWindow {
             currentIndex: workshopTabs.currentIndex
 
             GalleryPage {
+                id: subscribedGallery
                 filterModel: workshopModel
                 workshopView: true
                 emptyExplanation: qsTr("No subscribed Workshop items are installed or downloading. Subscribe in Steam, then rescan here to see download progress.")
-                onCreatePlaylistRequested: root.createPlaylistOpen = true
+                onCreatePlaylistRequested: {
+                    root.createPlaylistFor = subscribedGallery
+                    root.createPlaylistOpen = true
+                }
             }
 
             WorkshopBrowsePage {
@@ -120,9 +130,12 @@ Kirigami.ApplicationWindow {
         visible: root.createPlaylistOpen
         standardButtons: Controls.Dialog.Ok | Controls.Dialog.Cancel
         onAccepted: {
-            playlistController.create(nameField.text)
+            const name = nameField.text.trim()
+            playlistController.create(name)
             nameField.clear()
             root.createPlaylistOpen = false
+            if (root.createPlaylistFor !== null)
+                root.createPlaylistFor.beginEditing(name)
         }
         onRejected: root.createPlaylistOpen = false
         contentItem: Controls.TextField {

@@ -112,6 +112,9 @@ class WallpaperFilterModel final : public QSortFilterProxyModel {
     Q_PROPERTY(QString sortMode READ sortMode WRITE setSortMode NOTIFY sortModeChanged)
     Q_PROPERTY(bool favoritesOnly READ favoritesOnly WRITE setFavoritesOnly NOTIFY favoritesOnlyChanged)
     Q_PROPERTY(bool workshopView READ workshopView WRITE setWorkshopView NOTIFY workshopViewChanged)
+    // Playlist edit mode: optionally show only the given playlist's members.
+    Q_PROPERTY(bool playlistOnly READ playlistOnly WRITE setPlaylistOnly NOTIFY playlistOnlyChanged)
+    Q_PROPERTY(QStringList playlistIds READ playlistIds WRITE setPlaylistIds NOTIFY playlistIdsChanged)
 
 public:
     explicit WallpaperFilterModel(QObject *parent = nullptr);
@@ -126,6 +129,14 @@ public:
     void setSortMode(const QString &value);
     void setFavoritesOnly(bool value);
     void setWorkshopView(bool value);
+    bool playlistOnly() const { return m_playlistOnly; }
+    QStringList playlistIds() const { return m_playlistIdList; }
+    void setPlaylistOnly(bool value);
+    void setPlaylistIds(const QStringList &value);
+    // Ids of the rows currently shown that a playlist can play, in view
+    // order; the second form is the inclusive range between two shown ids.
+    Q_INVOKABLE QStringList selectableIds() const;
+    Q_INVOKABLE QStringList selectableIdsBetween(const QString &first, const QString &second) const;
 
 signals:
     void searchTextChanged();
@@ -134,6 +145,8 @@ signals:
     void sortModeChanged();
     void favoritesOnlyChanged();
     void workshopViewChanged();
+    void playlistOnlyChanged();
+    void playlistIdsChanged();
 
 protected:
     bool filterAcceptsRow(int sourceRow, const QModelIndex &sourceParent) const override;
@@ -144,4 +157,9 @@ private:
     QString m_sortMode = QStringLiteral("title");
     bool m_favoritesOnly = false;
     bool m_workshopView = false;
+    bool m_playlistOnly = false;
+    QStringList m_playlistIdList;
+    QSet<QString> m_playlistIds;
+
+    bool selectableRow(int row) const;
 };

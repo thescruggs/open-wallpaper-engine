@@ -40,6 +40,13 @@ public:
     Q_INVOKABLE void remove(const QString &name);
     Q_INVOKABLE void add(const QString &name, const QString &workshopId);
     Q_INVOKABLE void removeEntry(const QString &name, const QString &workshopId);
+    // Batch edits for the gallery's playlist edit mode: one daemon upsert
+    // however many wallpapers change.
+    Q_INVOKABLE void addMany(const QString &name, const QStringList &workshopIds);
+    Q_INVOKABLE void removeMany(const QString &name, const QStringList &workshopIds);
+    Q_INVOKABLE bool contains(const QString &name, const QString &workshopId) const {
+        return m_entries.value(name).contains(workshopId);
+    }
     Q_INVOKABLE void moveEntry(const QString &name, int from, int to);
     Q_INVOKABLE void play(const QString &name);
     Q_INVOKABLE void stop();

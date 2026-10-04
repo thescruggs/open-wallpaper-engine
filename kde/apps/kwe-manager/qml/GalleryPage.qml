@@ -27,6 +27,84 @@ Kirigami.Page {
 
     signal createPlaylistRequested()
 
+    // Playlist edit mode: cards show a checkbox and a click toggles
+    // membership in the selected playlist. `playlistMembers` is the
+    // reactive copy of the playlist's entries the cards bind to.
+    property bool playlistEditMode: false
+    readonly property string currentPlaylist: playlistSelector.currentText
+    property var playlistMembers: ({})
+    property int playlistCount: 0
+    // Shift-click applies the state the last plain click produced to every
+    // shown card between the two.
+    property string rangeAnchorId: ""
+    property bool rangeAnchorAdded: true
+
+    function syncPlaylist() {
+        const entries = currentPlaylist !== "" ? playlistController.entries(currentPlaylist) : []
+        const members = {}
+        for (const id of entries)
+            members[id] = true
+        playlistMembers = members
+        playlistCount = entries.length
+        filterModel.playlistIds = entries
+        if (currentPlaylist === "") {
+            playlistEditMode = false
+            filterModel.playlistOnly = false
+        }
+    }
+
+    function togglePlaylist(workshopId, extendRange) {
+        if (currentPlaylist === "")
+            return
+        if (extendRange && rangeAnchorId !== "" && rangeAnchorId !== workshopId) {
+            const ids = filterModel.selectableIdsBetween(rangeAnchorId, workshopId)
+            if (ids.length > 0) {
+                if (rangeAnchorAdded)
+                    playlistController.addMany(currentPlaylist, ids)
+                else
+                    playlistController.removeMany(currentPlaylist, ids)
+                rangeAnchorId = workshopId
+                return
+            }
+        }
+        rangeAnchorAdded = playlistMembers[workshopId] !== true
+        rangeAnchorId = workshopId
+        if (rangeAnchorAdded)
+            playlistController.addMany(currentPlaylist, [workshopId])
+        else
+            playlistController.removeMany(currentPlaylist, [workshopId])
+    }
+
+    // Called after "New playlist": select it and go straight to choosing
+    // its wallpapers.
+    function beginEditing(name) {
+        const index = playlistController.names.indexOf(name)
+        if (index < 0)
+            return
+        playlistSelector.currentIndex = index
+        syncPlaylist()
+        filterModel.playlistOnly = false
+        playlistEditMode = true
+    }
+
+    onCurrentPlaylistChanged: {
+        rangeAnchorId = ""
+        syncPlaylist()
+    }
+    onPlaylistEditModeChanged: rangeAnchorId = ""
+    Component.onCompleted: syncPlaylist()
+
+    Connections {
+        target: playlistController
+        function onChanged() { galleryPage.syncPlaylist() }
+    }
+
+    Shortcut {
+        sequences: [StandardKey.Cancel]
+        enabled: galleryPage.playlistEditMode && galleryPage.visible
+        onActivated: galleryPage.playlistEditMode = false
+    }
+
     padding: 0
 
     header: Controls.ToolBar {
@@ -80,8 +158,31 @@ Kirigami.Page {
             }
             Controls.Label {
                 visible: playlistSelector.currentText !== ""
-                text: qsTr("%1 items").arg(playlistController.entries(playlistSelector.currentText).length)
+                text: qsTr("%1 items").arg(galleryPage.playlistCount)
                 opacity: 0.75
+            }
+            Controls.ToolButton {
+                visible: playlistSelector.currentText !== ""
+                // Not `checkable`: a user toggle would break the binding and
+                // the Done button in the selection bar could not reset it.
+                checked: galleryPage.playlistEditMode
+                text: checked ? qsTr("Done") : qsTr("Edit playlist")
+                icon.name: checked ? "dialog-ok-apply-symbolic" : "document-edit-symbolic"
+                display: Controls.AbstractButton.TextBesideIcon
+                Accessible.name: checked ? qsTr("Finish editing the playlist")
+                                         : qsTr("Choose the wallpapers in the selected playlist")
+                onClicked: galleryPage.playlistEditMode = !galleryPage.playlistEditMode
+            }
+            Controls.ToolButton {
+                visible: playlistSelector.currentText !== ""
+                checked: galleryPage.filterModel.playlistOnly
+                text: qsTr("In playlist")
+                icon.name: "view-filter-symbolic"
+                display: Controls.AbstractButton.TextBesideIcon
+                Accessible.name: qsTr("Show only wallpapers in the selected playlist")
+                Controls.ToolTip.visible: hovered
+                Controls.ToolTip.text: Accessible.name
+                onClicked: galleryPage.filterModel.playlistOnly = !galleryPage.filterModel.playlistOnly
             }
 
             Controls.ToolButton {
@@ -121,6 +222,47 @@ Kirigami.Page {
     ColumnLayout {
         anchors.fill: parent
         spacing: 0
+
+        Controls.ToolBar {
+            Layout.fillWidth: true
+            visible: galleryPage.playlistEditMode
+            Accessible.name: qsTr("Playlist selection")
+            contentItem: RowLayout {
+                spacing: Kirigami.Units.smallSpacing
+                Kirigami.Icon {
+                    source: "document-edit-symbolic"
+                    implicitWidth: Kirigami.Units.iconSizes.smallMedium
+                    implicitHeight: implicitWidth
+                }
+                Controls.Label {
+                    Layout.fillWidth: true
+                    elide: Text.ElideRight
+                    textFormat: Text.PlainText
+                    text: qsTr("Editing “%1” · %2 in playlist. Click a wallpaper to add or remove it; Shift-click to do the same for a range.")
+                        .arg(galleryPage.currentPlaylist).arg(galleryPage.playlistCount)
+                }
+                Controls.ToolButton {
+                    text: qsTr("Select all")
+                    icon.name: "edit-select-all-symbolic"
+                    display: Controls.AbstractButton.TextBesideIcon
+                    enabled: galleryPage.filterModel.count > 0
+                    Accessible.name: qsTr("Add every wallpaper shown to the playlist")
+                    Controls.ToolTip.visible: hovered
+                    Controls.ToolTip.text: Accessible.name
+                    onClicked: playlistController.addMany(galleryPage.currentPlaylist, galleryPage.filterModel.selectableIds())
+                }
+                Controls.ToolButton {
+                    text: qsTr("Deselect all")
+                    icon.name: "edit-select-none-symbolic"
+                    display: Controls.AbstractButton.TextBesideIcon
+                    enabled: galleryPage.filterModel.count > 0 && galleryPage.playlistCount > 0
+                    Accessible.name: qsTr("Remove every wallpaper shown from the playlist")
+                    Controls.ToolTip.visible: hovered
+                    Controls.ToolTip.text: Accessible.name
+                    onClicked: playlistController.removeMany(galleryPage.currentPlaylist, galleryPage.filterModel.selectableIds())
+                }
+            }
+        }
 
         Kirigami.InlineMessage {
             Layout.fillWidth: true
@@ -397,6 +539,9 @@ Kirigami.Page {
                         cellWidth: grid.cellWidth
                         cellHeight: grid.cellHeight
                         workshopView: galleryPage.workshopView
+                        selectionMode: galleryPage.playlistEditMode
+                        playlistMembers: galleryPage.playlistMembers
+                        onPlaylistToggleRequested: (workshopId, extendRange) => galleryPage.togglePlaylist(workshopId, extendRange)
                     }
 
                     Kirigami.PlaceholderMessage {

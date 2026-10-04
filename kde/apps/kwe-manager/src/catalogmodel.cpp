@@ -229,6 +229,60 @@ void WallpaperFilterModel::setWorkshopView(bool value) {
     emit workshopViewChanged();
 }
 
+void WallpaperFilterModel::setPlaylistOnly(bool value) {
+    if (m_playlistOnly == value) return;
+    beginFilterChange();
+    m_playlistOnly = value;
+    endFilterChange(Direction::Rows);
+    emit playlistOnlyChanged();
+}
+
+void WallpaperFilterModel::setPlaylistIds(const QStringList &value) {
+    if (m_playlistIdList == value) return;
+    // Membership only affects which rows show while the filter is on.
+    if (m_playlistOnly) beginFilterChange();
+    m_playlistIdList = value;
+    m_playlistIds = QSet<QString>(value.cbegin(), value.cend());
+    if (m_playlistOnly) endFilterChange(Direction::Rows);
+    emit playlistIdsChanged();
+}
+
+// Mirrors the daemon's playlist availability rule: installed content that
+// parsed as a project.
+bool WallpaperFilterModel::selectableRow(int row) const {
+    const auto proxy = index(row, 0);
+    const auto state = data(proxy, CatalogModel::WorkshopStateRole).toString();
+    return (state == QStringLiteral("local") || state == QStringLiteral("subscribed_installed"))
+        && data(proxy, CatalogModel::KindRole).toString() != QStringLiteral("invalid");
+}
+
+QStringList WallpaperFilterModel::selectableIds() const {
+    QStringList ids;
+    for (int row = 0; row < rowCount(); ++row) {
+        if (selectableRow(row))
+            ids.push_back(data(index(row, 0), CatalogModel::WorkshopIdRole).toString());
+    }
+    return ids;
+}
+
+QStringList WallpaperFilterModel::selectableIdsBetween(const QString &first, const QString &second) const {
+    int from = -1;
+    int to = -1;
+    for (int row = 0; row < rowCount() && (from < 0 || to < 0); ++row) {
+        const auto id = data(index(row, 0), CatalogModel::WorkshopIdRole).toString();
+        if (id == first) from = row;
+        if (id == second) to = row;
+    }
+    if (from < 0 || to < 0)
+        return {};
+    QStringList ids;
+    for (int row = qMin(from, to); row <= qMax(from, to); ++row) {
+        if (selectableRow(row))
+            ids.push_back(data(index(row, 0), CatalogModel::WorkshopIdRole).toString());
+    }
+    return ids;
+}
+
 bool WallpaperFilterModel::filterAcceptsRow(int sourceRow, const QModelIndex &sourceParent) const {
     const auto index = sourceModel()->index(sourceRow, 0, sourceParent);
     const auto title = sourceModel()->data(index, CatalogModel::TitleRole).toString();
@@ -245,5 +299,6 @@ bool WallpaperFilterModel::filterAcceptsRow(int sourceRow, const QModelIndex &so
     // downloading, or awaiting download); local-only items stay on the
     // Installed page.
     const bool workshopMatches = !m_workshopView || workshopState != QStringLiteral("local");
-    return kindMatches && favoriteMatches && searchMatches && workshopMatches;
+    const bool playlistMatches = !m_playlistOnly || m_playlistIds.contains(id);
+    return kindMatches && favoriteMatches && searchMatches && workshopMatches && playlistMatches;
 }
