@@ -450,11 +450,16 @@ mod tests {
         let dir = state_dir("fill");
         fs::create_dir_all(&dir).unwrap();
         let mut cache = WorkshopCache::open(&dir);
-        let (id, cached) = entry("100", "Real Title", now_ms());
+        let seen_before = now_ms();
+        let (id, cached) = entry("100", "Real Title", seen_before);
         cache.items.insert(id.clone(), cached);
         let mut catalog = empty_catalog();
         catalog.items.push(missing_item(&id));
-        cache.merge_and_update(&mut catalog, now_ms());
+        // A later scan time, fixed so the assertion below cannot race the
+        // clock (it used to compare against a second now_ms() reading and
+        // failed whenever a millisecond boundary fell in between).
+        let scan_time = seen_before + 1_000;
+        cache.merge_and_update(&mut catalog, scan_time);
         let item = &catalog.items[0];
         assert_eq!(item.title, "Real Title");
         assert_eq!(item.kind, ProjectKind::Scene);
@@ -466,10 +471,7 @@ mod tests {
         );
         // Live subscription entries stay alive even while missing.
         let touched = cache.items[&id].last_seen_unix_ms;
-        assert!(
-            touched >= now_ms(),
-            "entries seen in a scan must be touched"
-        );
+        assert_eq!(touched, scan_time, "entries seen in a scan must be touched");
     }
 
     #[test]
