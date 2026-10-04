@@ -43,16 +43,57 @@ pub fn host_allowed(host: &str) -> bool {
         || (host.ends_with(".akamaihd.net") && host.starts_with("steam"))
 }
 
-fn extension_for(content_type: &str) -> Option<&'static str> {
-    let mime = content_type.split(';').next()?.trim().to_ascii_lowercase();
-    match mime.as_str() {
-        "image/jpeg" | "image/jpg" => Some("jpg"),
-        "image/png" => Some("png"),
-        "image/gif" => Some("gif"),
-        "image/webp" => Some("webp"),
-        "image/bmp" => Some("bmp"),
+/// The image type by its leading bytes. Steam serves some previews as
+/// `application/octet-stream`, so the header alone would drop real images;
+/// the content has to look like an image either way.
+fn extension_for(content_type: &str, body: &[u8]) -> Option<&'static str> {
+    let mime = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if !(mime.starts_with("image/") || mime == "application/octet-stream" || mime.is_empty()) {
+        return None;
+    }
+    match body {
+        [0xFF, 0xD8, 0xFF, ..] => Some("jpg"),
+        [0x89, b'P', b'N', b'G', ..] => Some("png"),
+        [b'G', b'I', b'F', b'8', ..] => Some("gif"),
+        [
+            b'R',
+            b'I',
+            b'F',
+            b'F',
+            _,
+            _,
+            _,
+            _,
+            b'W',
+            b'E',
+            b'B',
+            b'P',
+            ..,
+        ] => Some("webp"),
+        [b'B', b'M', ..] => Some("bmp"),
         _ => None,
     }
+}
+
+/// Edge of the square the grid thumbnail is scaled to fit in.
+const THUMB_EDGE: u32 = 512;
+
+/// Steam's image hosts resize on request; a grid card needs a few tens of
+/// kilobytes, not the original upload. `None` when the URL already carries
+/// a query or the host is not known to resize.
+fn thumbnail_url(url: &str) -> Option<String> {
+    let host = https_host(url)?;
+    let resizes = host == "steamusercontent.com" || host.ends_with(".steamusercontent.com");
+    (resizes && !url.contains('?')).then(|| {
+        format!(
+            "{url}?imw={THUMB_EDGE}&imh={THUMB_EDGE}&ima=fit&impolicy=Letterbox&imcolor=%23000000&letterbox=false"
+        )
+    })
 }
 
 fn stem(id: &str, url: &str) -> String {
@@ -105,7 +146,27 @@ impl PreviewCache {
         remaining: Duration,
     ) -> Result<PathBuf, &'static str> {
         let deadline = Instant::now() + remaining;
-        let mut current = url.to_string();
+        Self::validate(url)?;
+        let Some(thumbnail) = thumbnail_url(url) else {
+            return self.fetch_from(transport, id, url, url, deadline);
+        };
+        match self.fetch_from(transport, id, url, &thumbnail, deadline) {
+            // The host would not resize this one: take the original.
+            Err("status") => self.fetch_from(transport, id, url, url, deadline),
+            other => other,
+        }
+    }
+
+    /// Fetches `from` and stores it under the cache name of `url`.
+    fn fetch_from(
+        &self,
+        transport: &dyn Transport,
+        id: &str,
+        url: &str,
+        from: &str,
+        deadline: Instant,
+    ) -> Result<PathBuf, &'static str> {
+        let mut current = from.to_string();
         for _ in 0..=MAX_REDIRECTS {
             Self::validate(&current)?;
             let left = deadline.saturating_duration_since(Instant::now());
@@ -124,11 +185,14 @@ impl PreviewCache {
             if !response.ok() {
                 return Err("status");
             }
-            let ext = extension_for(response.header("content-type").unwrap_or_default())
-                .ok_or("not_image")?;
             if response.body.is_empty() || response.body.len() > self.file_cap {
                 return Err("size");
             }
+            let ext = extension_for(
+                response.header("content-type").unwrap_or_default(),
+                &response.body,
+            )
+            .ok_or("not_image")?;
             return self
                 .write(&stem(id, url), ext, &response.body)
                 .map_err(|_| "write");

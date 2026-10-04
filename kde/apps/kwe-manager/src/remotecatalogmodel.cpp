@@ -98,6 +98,7 @@ void RemoteCatalogModel::setTags(const QStringList &tags) {
 
 void RemoteCatalogModel::invalidate() {
   ++m_generation;
+  m_previewQueue.clear();
   setLoadingMore(false);
 }
 
@@ -220,33 +221,52 @@ void RemoteCatalogModel::handlePageError(const QString &code, const QString &mes
 }
 
 void RemoteCatalogModel::requestPreviews(const QStringList &ids) {
+  m_previewQueue.append(ids);
+  pumpPreviews();
+}
+
+// Sends queued thumbnail requests, a few small batches at a time. An id the
+// daemon did not answer for (slow image, busy worker) goes back on the queue
+// for a bounded number of attempts.
+void RemoteCatalogModel::pumpPreviews() {
   if (!m_client)
     return;
-  for (qsizetype start = 0; start < ids.size(); start += PreviewBatch) {
+  while (m_previewCalls < PreviewCallsInFlight && !m_previewQueue.isEmpty()) {
     QJsonArray batch;
-    for (qsizetype i = start; i < qMin<qsizetype>(ids.size(), start + PreviewBatch); ++i) {
-      const int row = rowOf(ids.at(i));
-      if (row < 0)
+    QStringList asked;
+    while (!m_previewQueue.isEmpty() && asked.size() < PreviewBatch) {
+      const QString id = m_previewQueue.takeFirst();
+      const int row = rowOf(id);
+      if (row < 0 || !m_rows.at(row).previewUrl.isEmpty() || asked.contains(id))
         continue;
-      batch.push_back(QJsonObject{{QStringLiteral("id"), ids.at(i)},
+      ++m_rows[row].previewAttempts;
+      asked.push_back(id);
+      batch.push_back(QJsonObject{{QStringLiteral("id"), id},
                                   {QStringLiteral("url"), m_rows.at(row).previewRemote}});
     }
     if (batch.isEmpty())
-      continue;
+      break;
+    ++m_previewCalls;
     m_client->call(QStringLiteral("workshop.previews"),
                    QJsonObject{{QStringLiteral("items"), batch}}, this,
-                   [this](const WorkshopClient::Reply &reply) {
-                     if (!reply.ok)
-                       return;  // silent: the card keeps its icon fallback
-                     const QJsonObject files = reply.result.value(QStringLiteral("files")).toObject();
-                     for (auto it = files.begin(); it != files.end(); ++it) {
-                       const int row = rowOf(it.key());
-                       const QString path = it.value().toString();
-                       if (row < 0 || path.isEmpty())
+                   [this, asked](const WorkshopClient::Reply &reply) {
+                     --m_previewCalls;
+                     const QJsonObject files =
+                         reply.ok ? reply.result.value(QStringLiteral("files")).toObject()
+                                  : QJsonObject{};
+                     for (const QString &id : asked) {
+                       const int row = rowOf(id);
+                       if (row < 0)
                          continue;
-                       m_rows[row].previewUrl = QUrl::fromLocalFile(path);
-                       emit dataChanged(index(row), index(row), {PreviewUrlRole});
+                       const QString path = files.value(id).toString();
+                       if (!path.isEmpty()) {
+                         m_rows[row].previewUrl = QUrl::fromLocalFile(path);
+                         emit dataChanged(index(row), index(row), {PreviewUrlRole});
+                       } else if (m_rows.at(row).previewAttempts < PreviewAttempts) {
+                         m_previewQueue.push_back(id);
+                       }  // else: the card keeps its icon fallback
                      }
+                     pumpPreviews();
                    },
                    BusyRetries);
   }

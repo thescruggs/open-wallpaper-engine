@@ -156,9 +156,13 @@ private slots:
     };
     m_model->refresh();
     QTRY_COMPARE(m_model->state(), RemoteCatalogModel::Ready);
-    QTRY_COMPARE(m_daemon.count("workshop.previews"), 1);
+    // 301 never gets a file: it is asked for again, a bounded number of times.
+    QTRY_COMPARE(m_daemon.count("workshop.previews"), 3);
+    QTest::qWait(50);
+    QCOMPARE(m_daemon.count("workshop.previews"), 3);
     const auto items = m_daemon.paramsLog.last().value("items").toArray();
-    QCOMPARE(items.size(), 2);  // 303 already had a file
+    QCOMPARE(items.size(), 1);  // 302 arrived and 303 already had a file
+    QCOMPARE(items.first().toObject().value("id").toString(), QStringLiteral("301"));
     QTRY_COMPARE(m_model->data(m_model->index(1), RemoteCatalogModel::PreviewUrlRole).toUrl(),
                  QUrl::fromLocalFile("/tmp/fake/302.jpg"));
     QVERIFY(m_model->data(m_model->index(0), RemoteCatalogModel::PreviewUrlRole).toUrl().isEmpty());
@@ -174,8 +178,9 @@ private slots:
       return Fake::errorAnswer("offline");
     };
     m_model->refresh();
-    QTRY_COMPARE(m_daemon.count("workshop.previews"), 1);
+    QTRY_COMPARE(m_daemon.count("workshop.previews"), 3);
     QTest::qWait(50);
+    QCOMPARE(m_daemon.count("workshop.previews"), 3);  // retries are bounded
     QCOMPARE(m_model->state(), RemoteCatalogModel::Ready);
     QVERIFY(m_model->errorMessage().isEmpty());
   }

@@ -843,6 +843,44 @@ fn previews_evict_least_recently_modified_down_to_the_cap() {
 }
 
 #[test]
+fn previews_ask_for_a_thumbnail_and_accept_images_served_as_octet_stream() {
+    let env = Env::new("pv-thumb");
+    let url = format!("{IMG_HOST}/fake/2");
+    let fake = Fake::new(vec![raw(
+        200,
+        &[("content-type", "application/octet-stream")],
+        b"\xFF\xD8\xFFfake",
+    )]);
+    let out = preview_call(&env.worker(&fake), &[("7", &url)]);
+    let path = out["result"]["files"]["7"].as_str().unwrap();
+    assert!(path.ends_with(".jpg"));
+    let seen = fake.seen.borrow();
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0].url.starts_with(&format!("{url}?imw=512&imh=512&")));
+}
+
+#[test]
+fn previews_fall_back_to_the_original_when_the_host_will_not_resize() {
+    let env = Env::new("pv-thumb-fallback");
+    let url = format!("{IMG_HOST}/fake/3");
+    let fake = Fake::new(vec![raw(404, &[], b""), png_ok(b"\x89PNGok")]);
+    let out = preview_call(&env.worker(&fake), &[("8", &url)]);
+    assert!(out["result"]["files"].get("8").is_some());
+    let seen = fake.seen.borrow();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[1].url, url);
+}
+
+#[test]
+fn previews_refuse_non_image_bytes_whatever_the_header_says() {
+    let env = Env::new("pv-sniff");
+    let url = format!("{IMG_HOST}/fake/4");
+    let fake = Fake::new(vec![raw(200, &[("content-type", "image/png")], b"<html>")]);
+    let out = preview_call(&env.worker(&fake), &[("9", &url)]);
+    assert_eq!(out["result"]["files"], json!({}));
+}
+
+#[test]
 fn previews_follow_redirects_only_to_allowed_hosts() {
     let env = Env::new("pv-redir");
     let fake = Fake::new(vec![

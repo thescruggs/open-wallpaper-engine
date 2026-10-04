@@ -56,7 +56,11 @@ public:
   };
 
   static constexpr int MaxRows = 2000;
-  static constexpr int PreviewBatch = 60;
+  // Small batches, a few at a time: thumbnails appear as they arrive and a
+  // slow image never holds back a whole page.
+  static constexpr int PreviewBatch = 8;
+  static constexpr int PreviewCallsInFlight = 3;
+  static constexpr int PreviewAttempts = 3;
 
   RemoteCatalogModel(WorkshopClient *client, CatalogModel *local, QObject *parent = nullptr);
 
@@ -111,6 +115,7 @@ private:
     double score = 0;
     qint64 timeUpdated = 0;
     bool pending = false;
+    int previewAttempts = 0;
   };
   struct PendingChange {
     bool unsubscribe = false;
@@ -123,6 +128,7 @@ private:
   void handlePage(const QJsonObject &result, int page);
   void handlePageError(const QString &code, const QString &message, int page);
   void requestPreviews(const QStringList &ids);
+  void pumpPreviews();
   void mutate(const QString &workshopId, bool unsubscribe);
   void onLocalCatalogChanged();
   void reconcileLocal();
@@ -138,6 +144,8 @@ private:
   QPointer<WorkshopClient> m_client;
   QPointer<CatalogModel> m_local;
   QVector<Row> m_rows;
+  QStringList m_previewQueue;
+  int m_previewCalls = 0;
   QHash<QString, int> m_index;
   QHash<QString, PendingChange> m_changes;
   QTimer m_pendingTimer;

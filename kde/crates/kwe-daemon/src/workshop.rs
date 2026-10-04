@@ -17,7 +17,7 @@ use std::{
     process::{Child, Command as ProcessCommand, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -48,6 +48,7 @@ const MAX_LOGIN_LIFETIME: Duration = Duration::from_secs(3600);
 const MAX_SEARCH_BYTES: usize = 256;
 const MAX_TAG_BYTES: usize = 64;
 const MAX_TAGS: usize = 16;
+const MAX_PREVIEW_CALLS: usize = 3;
 const MAX_PAGE: u32 = 100_000;
 const MAX_PREVIEW_ITEMS: usize = 60;
 /// 60 items must still fit the worker's 64 KiB request line.
@@ -136,7 +137,8 @@ struct PendingLogin {
 struct Inner {
     config: WorkshopConfig,
     pending: Mutex<Option<PendingLogin>>,
-    gates: [AtomicBool; 5],
+    /// Calls in flight per family.
+    gates: [AtomicUsize; 5],
     /// Shared with `CatalogFreshness`: set after a successful
     /// subscribe/unsubscribe.
     catalog_stale: Arc<AtomicBool>,
@@ -150,7 +152,7 @@ struct GateGuard {
 
 impl Drop for GateGuard {
     fn drop(&mut self) {
-        self.inner.gates[self.family as usize].store(false, Ordering::Release);
+        self.inner.gates[self.family as usize].fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -218,7 +220,7 @@ impl WorkshopService {
             inner: Arc::new(Inner {
                 config,
                 pending: Mutex::new(None),
-                gates: std::array::from_fn(|_| AtomicBool::new(false)),
+                gates: std::array::from_fn(|_| AtomicUsize::new(0)),
                 catalog_stale,
             }),
         }
@@ -234,14 +236,21 @@ impl WorkshopService {
     }
 
     fn acquire(&self, family: Family) -> Option<GateGuard> {
-        if self.inner.gates[family as usize].swap(true, Ordering::AcqRel) {
-            None
-        } else {
-            Some(GateGuard {
+        // Thumbnails arrive in small batches so the grid fills progressively;
+        // a few may run side by side. Everything else is one at a time.
+        let limit = match family {
+            Family::Previews => MAX_PREVIEW_CALLS,
+            _ => 1,
+        };
+        self.inner.gates[family as usize]
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                (held < limit).then_some(held + 1)
+            })
+            .ok()
+            .map(|_| GateGuard {
                 inner: self.inner.clone(),
                 family,
             })
-        }
     }
 
     fn lock_pending(&self) -> std::sync::MutexGuard<'_, Option<PendingLogin>> {
