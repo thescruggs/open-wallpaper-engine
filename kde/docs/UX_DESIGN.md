@@ -117,7 +117,8 @@ Every state has an icon and text:
 | `worker_unavailable` / `not_configured` | information | Not available in this session (`--no-led-worker`) | — |
 | `starting`, `connecting` | spinner | Starting LED sync… / Restarting… / Restoring your lighting… / Looking for OpenRGB… | — |
 | `server_absent` (normal) | information | OpenRGB's SDK server is not running; LED sync is optional; OpenRGB → SDK Server → Start Server, or `openrgb --server`; connects by itself | Check again |
-| `active` | success | Syncing N devices with OpenRGB; M found; SDK protocol version | — |
+| `active` / `waiting_for_source` | information | Connected to OpenRGB — waiting for a wallpaper (ambient modes) / waiting for audio (spectrum); devices keep their own lighting until then; M found | — |
+| `active` | success | Syncing N devices with OpenRGB (N = worker `driven_count`; estimated from the list for an older worker); M found; SDK protocol version | — |
 | `off` / `paused` | pause | Paused while a fullscreen app covers the desktop or the displays are off | — |
 | `off` / none | stop | Mode is Off; devices keep their own lighting | — |
 | `degraded` | warning | LED sync is having trouble: reason in plain words; keeps retrying | Check again |

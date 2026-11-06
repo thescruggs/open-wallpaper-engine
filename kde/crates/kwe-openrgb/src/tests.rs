@@ -705,3 +705,275 @@ fn rgb_hex_parsing() {
     assert_eq!(Rgb::parse_hex("zzzzzz"), None);
     assert_eq!(Rgb::new(1, 2, 3).to_string(), "#010203");
 }
+
+// ---- review fixes A: restore never loses a remembered mode ---------------
+
+fn active_modes(s: &StubServer) -> Vec<i32> {
+    s.controllers().iter().map(|c| c.active_mode).collect()
+}
+
+fn wait_modes(s: &StubServer, want: &[i32]) -> bool {
+    let end = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < end {
+        if active_modes(s) == want {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    active_modes(s) == want
+}
+
+/// MUST-FIX 3: a connection lost before/while restoring must not discard
+/// the remembered modes; the next connection restores the originals.
+#[test]
+fn restore_all_keeps_modes_when_the_connection_is_lost() {
+    let s = stub(StubConfig::default());
+    let port = s.port();
+    let mut c = connected(&s);
+    c.take_control(ControllerId::new(0)).unwrap();
+    c.take_control(ControllerId::new(1)).unwrap();
+    assert!(wait_modes(&s, &[0, 0]));
+    let mut in_direct = s.controllers();
+    drop(s); // the server goes away with both devices in Direct
+    let reports = c.restore_all();
+    assert_eq!(reports.len(), 2, "{reports:?}");
+    assert!(reports.iter().all(|r| r.result.is_err() && r.retained));
+    assert_eq!(c.saved_mode_count(), 2, "remembered modes kept");
+    let carried = c.take_saved_modes();
+    // It comes back (same port) with the devices still in Direct.
+    for d in &mut in_direct {
+        d.active_mode = 0;
+    }
+    let s = StubServer::start_on(
+        port,
+        StubConfig {
+            controllers: in_direct,
+            ..StubConfig::default()
+        },
+    )
+    .unwrap();
+    let mut c = connected(&s);
+    c.adopt_saved_modes(carried);
+    let reports = c.restore_all();
+    assert!(reports.iter().all(|r| r.result.is_ok()), "{reports:?}");
+    assert_eq!(c.saved_mode_count(), 0);
+    assert!(wait_modes(&s, &[2, 2]), "{:?}", active_modes(&s));
+}
+
+/// MUST-FIX 3: `restore(id)` on a lost connection keeps the entry.
+#[test]
+fn restore_one_keeps_mode_on_error() {
+    let s = stub(StubConfig::default());
+    let mut c = connected(&s);
+    c.take_control(ControllerId::new(1)).unwrap();
+    drop(s);
+    assert!(c.restore(ControllerId::new(1)).is_err());
+    assert_eq!(c.saved_mode_count(), 1);
+}
+
+/// MUST-FIX 3 (reviewer's race): a stream of device-list notifications
+/// while restoring never drops a remembered mode; a later quiet restore
+/// brings every original back.
+#[test]
+fn restore_all_under_a_notification_storm_never_drops_a_mode() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let s = Arc::new(stub(StubConfig::default()));
+    let mut retained_runs = 0;
+    for _ in 0..60 {
+        let mut c = connected(&s);
+        for i in 0..2 {
+            c.take_control(ControllerId::new(i)).unwrap();
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let storm = {
+            let (s, stop) = (s.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    s.notify_device_list_updated();
+                    std::thread::sleep(Duration::from_micros(50));
+                }
+            })
+        };
+        std::thread::sleep(Duration::from_millis(2));
+        let reports = c.restore_all();
+        stop.store(true, Ordering::Relaxed);
+        storm.join().unwrap();
+        let retained = reports.iter().filter(|r| r.retained).count();
+        for r in &reports {
+            assert!(
+                r.result.is_ok() || r.retained,
+                "a failed restore dropped its mode: {r:?}"
+            );
+        }
+        assert_eq!(c.saved_mode_count(), retained, "{reports:?}");
+        if retained > 0 {
+            retained_runs += 1;
+            // Quiet again: the kept modes restore.
+            std::thread::sleep(Duration::from_millis(20));
+            let _ = c.poll_events();
+            let again = c.restore_all();
+            assert!(again.iter().all(|r| r.result.is_ok()), "{again:?}");
+        }
+        assert_eq!(c.saved_mode_count(), 0);
+        assert!(wait_modes(&s, &[2, 2]), "{:?}", active_modes(&s));
+    }
+    eprintln!("storm runs with a retained (not dropped) mode: {retained_runs}/60");
+}
+
+/// NIT: two controllers with an identical DeviceKey are remembered and
+/// restored separately (by occurrence order).
+#[test]
+fn identical_devices_are_saved_and_restored_separately() {
+    let mut a = sample_controller("Twin", &[("A", 2)]);
+    let mut b = a.clone();
+    a.active_mode = 1; // Static
+    b.active_mode = 2; // Rainbow
+    let s = stub(StubConfig {
+        controllers: vec![a, b],
+        ..StubConfig::default()
+    });
+    let mut c = connected(&s);
+    assert_eq!(c.slot(ControllerId::new(1)).unwrap().1, 1);
+    c.take_control(ControllerId::new(0)).unwrap();
+    c.take_control(ControllerId::new(1)).unwrap();
+    assert_eq!(c.saved_mode_count(), 2);
+    assert!(wait_modes(&s, &[0, 0]));
+    let reports = c.restore_all();
+    assert!(reports.iter().all(|r| r.result.is_ok()), "{reports:?}");
+    assert!(wait_modes(&s, &[1, 2]), "{:?}", active_modes(&s));
+}
+
+/// Belt and braces: a device already in Direct is remembered with its
+/// colours, and restore re-sends them after re-selecting Direct.
+#[test]
+fn direct_origin_is_restored_with_its_colours() {
+    let mut d = sample_controller("Strip", &[("A", 3)]);
+    d.active_mode = 0;
+    d.colors = vec![Rgb::new(1, 2, 3), Rgb::new(4, 5, 6), Rgb::new(7, 8, 9)];
+    let s = stub(StubConfig {
+        controllers: vec![d.clone()],
+        ..StubConfig::default()
+    });
+    let mut c = connected(&s);
+    c.take_control(ControllerId::new(0)).unwrap();
+    assert_eq!(c.saved_modes()[0].colors, d.colors);
+    assert_eq!(
+        c.saved_modes()[0].control,
+        Some(ControlMode {
+            index: 0,
+            name: "Direct".into()
+        })
+    );
+    c.update_leds(ControllerId::new(0), &[Rgb::new(255, 0, 0); 3])
+        .unwrap();
+    let reports = c.restore_all();
+    assert!(reports.iter().all(|r| r.result.is_ok()), "{reports:?}");
+    let end = Instant::now() + Duration::from_secs(5);
+    while s.controllers()[0].colors != d.colors && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(s.controllers()[0].colors, d.colors);
+    // A non-Direct original keeps no colours.
+    let s = stub(StubConfig::default());
+    let mut c = connected(&s);
+    c.take_control(ControllerId::new(0)).unwrap();
+    assert!(c.saved_modes()[0].colors.is_empty());
+}
+
+/// Adoption forgets a mode the user replaced after the switch (the device
+/// is no longer in the recorded control mode); keeps one still in it.
+#[test]
+fn stale_remembered_modes_are_dropped_on_adoption() {
+    let s = stub(StubConfig::default());
+    let mut c = connected(&s);
+    c.take_control(ControllerId::new(0)).unwrap();
+    c.take_control(ControllerId::new(1)).unwrap();
+    let carried = c.take_saved_modes();
+    drop(c);
+    // The user switches the strip to Static by hand; the keyboard stays
+    // in Direct.
+    let mut list = s.controllers();
+    list[1].active_mode = 1;
+    s.set_controllers(list);
+    let mut c = connected(&s);
+    c.adopt_saved_modes(carried);
+    let stale = c.drop_stale_saved_modes();
+    assert_eq!(stale.len(), 1);
+    assert_eq!(stale[0].key.name, "Stub Strip");
+    assert_eq!(c.saved_mode_count(), 1);
+    assert_eq!(c.saved_modes()[0].key.name, "Stub Keyboard");
+}
+
+/// A mode that no longer exists is reported and forgotten (ModeGone).
+#[test]
+fn vanished_mode_is_reported_and_forgotten() {
+    let s = stub(StubConfig::default());
+    let mut c = connected(&s);
+    c.take_control(ControllerId::new(0)).unwrap();
+    let mut list = s.controllers();
+    list[0].modes.truncate(2); // Rainbow (index 2) is gone
+    s.set_controllers(list);
+    s.notify_device_list_updated();
+    std::thread::sleep(Duration::from_millis(50));
+    let reports = c.restore_all();
+    assert_eq!(reports[0].result, Err(Error::ModeGone));
+    assert!(!reports[0].retained);
+    assert_eq!(c.saved_mode_count(), 0);
+}
+
+/// Refuses to take a device it could not give back.
+#[test]
+fn take_control_refuses_without_a_valid_active_mode() {
+    let mut d = sample_controller("Odd", &[("A", 1)]);
+    d.active_mode = 99;
+    let s = stub(StubConfig {
+        controllers: vec![d],
+        ..StubConfig::default()
+    });
+    let mut c = connected(&s);
+    assert!(c.take_control(ControllerId::new(0)).is_err());
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(!s.received_ids().contains(&packet_id::SET_CUSTOM_MODE));
+}
+
+/// R4: one enumeration retains at most MAX_ENUMERATION_BYTES (estimated)
+/// no matter how many maximal packets a hostile listener sends.
+#[test]
+fn enumeration_total_bytes_are_budgeted() {
+    let big = |name: &str| {
+        let mut c = sample_controller(name, &[("A", 8192)]);
+        for l in &mut c.leds {
+            l.name = "x".repeat(470);
+        }
+        c.colors = vec![Rgb::default(); 8192];
+        c
+    };
+    let one = big("probe");
+    let packet = encode_controller(&one, 5).len();
+    assert!(packet < limits::MAX_PACKET_BYTES as usize, "{packet}");
+    let per = one.approx_heap_bytes();
+    let fits = limits::MAX_ENUMERATION_BYTES / per;
+    assert!((2..8).contains(&fits), "{per} bytes per controller");
+    let cfg = |n: usize| StubConfig {
+        controllers: (0..n).map(|i| big(&format!("d{i}"))).collect(),
+        ..StubConfig::default()
+    };
+    let ok = stub(cfg(fits));
+    let mut c = Client::connect(&config(ok.port())).unwrap();
+    c.refresh().expect("within budget");
+    let over = stub(cfg(fits + 1));
+    let mut c = Client::connect(&config(over.port())).unwrap();
+    let err = c.refresh().unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::LimitExceeded {
+                what: "enumeration bytes",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(c.controllers().is_empty());
+}

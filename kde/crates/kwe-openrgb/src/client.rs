@@ -78,18 +78,49 @@ pub struct PollOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestoreReport {
     pub device: DeviceKey,
+    /// See [`SavedMode::occurrence`].
+    pub occurrence: u32,
     pub result: Result<()>,
+    /// The remembered mode is still held (the restore failed for a reason
+    /// other than [`Error::drops_saved_mode`]) and will be tried again.
+    pub retained: bool,
+}
+
+/// The per-LED mode `SetCustomMode` put a device in, as re-read right
+/// after the switch. Lets a later process tell "still in our mode" (restore
+/// the original) from "the user picked something else since" (forget it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlMode {
+    pub index: usize,
+    pub name: String,
 }
 
 /// A device's mode as it was before [`Client::take_control`] switched it
-/// to per-LED control. Exportable so a caller that loses its connection can
-/// carry the originals into the next one ([`Client::adopt_saved_modes`])
-/// instead of re-saving the per-LED mode it left behind.
+/// to per-LED control. Exportable so a caller that loses its connection (or
+/// its process) can carry the originals into the next one
+/// ([`Client::adopt_saved_modes`]) instead of re-saving the per-LED mode it
+/// left behind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SavedMode {
     pub key: DeviceKey,
+    /// Disambiguates controllers whose [`DeviceKey`] is identical: 0 for the
+    /// first such controller in the server's list order, 1 for the second...
+    pub occurrence: u32,
     pub index: usize,
     pub mode: Mode,
+    /// The LED colours at save time, kept only when the saved mode is
+    /// [`Mode::is_direct`] (that mode shows the last colours sent, so they
+    /// are part of the user's lighting); empty otherwise. Restore re-sends
+    /// them when the LED count still matches.
+    pub colors: Vec<Rgb>,
+    /// Filled in once the switch to per-LED control was observed.
+    pub control: Option<ControlMode>,
+}
+
+impl SavedMode {
+    fn same_slot(&self, key: &DeviceKey, occurrence: u32) -> bool {
+        self.occurrence == occurrence && self.key == *key
+    }
 }
 
 pub struct Client {
@@ -247,8 +278,18 @@ impl Client {
             });
         }
         let mut list = Vec::with_capacity(count as usize);
+        let mut retained = 0usize;
         for index in 0..count {
-            list.push(self.fetch_controller(ControllerId::new(index), budget_end)?);
+            let controller = self.fetch_controller(ControllerId::new(index), budget_end)?;
+            retained = retained.saturating_add(controller.approx_heap_bytes());
+            if retained > limits::MAX_ENUMERATION_BYTES {
+                return Err(Error::LimitExceeded {
+                    what: "enumeration bytes",
+                    value: retained as u64,
+                    max: limits::MAX_ENUMERATION_BYTES as u64,
+                });
+            }
+            list.push(controller);
         }
         Ok(list)
     }
@@ -308,32 +349,99 @@ impl Client {
         }
     }
 
-    /// Switches the device to its per-LED (direct/custom) mode, first
-    /// remembering its current mode for [`Client::restore`] (once per
-    /// device until restored), then re-reads the controller.
-    pub fn take_control(&mut self, id: ControllerId) -> Result<()> {
+    /// The device's [`DeviceKey`] and its occurrence among controllers
+    /// with an identical key (list order). `None` for an unknown id.
+    pub fn slot(&self, id: ControllerId) -> Option<(DeviceKey, u32)> {
+        let controller = self.controller(id)?;
+        let key = controller.key();
+        let occurrence = self.controllers[..id.index() as usize]
+            .iter()
+            .filter(|c| c.key() == key)
+            .count() as u32;
+        Some((key, occurrence))
+    }
+
+    fn find_slot(&self, key: &DeviceKey, occurrence: u32) -> Option<ControllerId> {
+        self.controllers
+            .iter()
+            .filter(|c| c.key() == *key)
+            .nth(occurrence as usize)
+            .map(|c| c.id)
+    }
+
+    /// True when a pre-control mode is remembered for this device.
+    pub fn has_saved_mode(&self, id: ControllerId) -> bool {
+        self.slot(id).is_some_and(|(key, occurrence)| {
+            self.saved.iter().any(|s| s.same_slot(&key, occurrence))
+        })
+    }
+
+    /// What [`Client::take_control`] would remember for this device:
+    /// `Ok(None)` when a mode is already remembered (nothing new to save).
+    /// Lets a caller persist the entry *before* the device is switched.
+    /// Errors exactly where `take_control` would refuse: the device reports
+    /// no valid active mode, or `MAX_CONTROLLERS` modes are remembered.
+    pub fn mode_to_save(&mut self, id: ControllerId) -> Result<Option<SavedMode>> {
         self.sync()?;
+        let (key, occurrence) = self.slot(id).ok_or(Error::UnknownController(id.index()))?;
+        if self.saved.iter().any(|s| s.same_slot(&key, occurrence)) {
+            return Ok(None);
+        }
+        if self.saved.len() >= limits::MAX_CONTROLLERS as usize {
+            return Err(Error::LimitExceeded {
+                what: "remembered modes",
+                value: self.saved.len() as u64 + 1,
+                max: u64::from(limits::MAX_CONTROLLERS),
+            });
+        }
         let controller = self
             .controller(id)
             .ok_or(Error::UnknownController(id.index()))?;
-        let key = controller.key();
-        let to_save = controller.active_mode().map(|(index, mode)| SavedMode {
-            key: key.clone(),
+        let (index, mode) = controller.active_mode().ok_or(Error::InvalidArgument(
+            "device reports no valid active mode to remember",
+        ))?;
+        Ok(Some(SavedMode {
+            key,
+            occurrence,
             index,
             mode: mode.clone(),
-        });
-        if let Some(saved) = to_save
-            && !self.saved.iter().any(|s| s.key == key)
-            && self.saved.len() < limits::MAX_CONTROLLERS as usize
-        {
-            self.saved.push(saved);
+            colors: if mode.is_direct() {
+                controller.colors.clone()
+            } else {
+                Vec::new()
+            },
+            control: None,
+        }))
+    }
+
+    /// Switches the device to its per-LED (direct/custom) mode, first
+    /// remembering its current mode for [`Client::restore`] (once per
+    /// device until restored), then re-reads the controller. Refuses (and
+    /// sends nothing) when the current mode cannot be remembered — a device
+    /// is never taken over without a way to give it back.
+    pub fn take_control(&mut self, id: ControllerId) -> Result<()> {
+        if let Some(entry) = self.mode_to_save(id)? {
+            self.saved.push(entry);
         }
+        let (key, occurrence) = self.slot(id).ok_or(Error::UnknownController(id.index()))?;
         self.send(id.index(), packet_id::SET_CUSTOM_MODE, &[])?;
         let deadline = Instant::now() + self.config.io_timeout;
         let updated = self.fetch_controller(id, deadline)?;
         if updated.key() != key {
             self.list_dirty = true;
             return Err(Error::DeviceListChanged);
+        }
+        let control = updated.active_mode().map(|(index, m)| ControlMode {
+            index,
+            name: m.name.clone(),
+        });
+        if let Some(entry) = self
+            .saved
+            .iter_mut()
+            .find(|s| s.same_slot(&key, occurrence))
+            && entry.control.is_none()
+        {
+            entry.control = control;
         }
         self.controllers[id.index() as usize] = updated;
         Ok(())
@@ -425,42 +533,89 @@ impl Client {
         std::mem::take(&mut self.saved)
     }
 
-    /// Seeds remembered modes, typically taken from a previous connection.
-    /// An entry for a device that already has one is ignored (the first
-    /// saved mode wins, like [`Client::take_control`]); the set stays
-    /// capped at `MAX_CONTROLLERS`. No I/O.
+    /// Seeds remembered modes, typically taken from a previous connection
+    /// or process. An entry for a device that already has one is ignored
+    /// (the first saved mode wins, like [`Client::take_control`]); the set
+    /// stays capped at `MAX_CONTROLLERS`. No I/O.
     pub fn adopt_saved_modes(&mut self, modes: Vec<SavedMode>) {
         for m in modes {
             if self.saved.len() >= limits::MAX_CONTROLLERS as usize {
                 break;
             }
-            if !self.saved.iter().any(|s| s.key == m.key) {
+            if !self.saved.iter().any(|s| s.same_slot(&m.key, m.occurrence)) {
                 self.saved.push(m);
             }
         }
     }
 
+    /// Forgets remembered modes the user has evidently replaced: the device
+    /// is present but no longer in the per-LED mode this client (or an
+    /// earlier process) switched it to ([`SavedMode::control`]). Restoring
+    /// those would overwrite lighting chosen after the switch. Entries for
+    /// absent devices or without a recorded control mode are kept. Uses the
+    /// current device list; no I/O. Returns the forgotten entries.
+    pub fn drop_stale_saved_modes(&mut self) -> Vec<SavedMode> {
+        if self.list_dirty {
+            return Vec::new();
+        }
+        let mut stale = Vec::new();
+        let mut kept = Vec::with_capacity(self.saved.len());
+        for entry in std::mem::take(&mut self.saved) {
+            let current = self
+                .find_slot(&entry.key, entry.occurrence)
+                .and_then(|id| self.controller(id))
+                .and_then(|c| c.active_mode().map(|(i, m)| (i, m.name.clone())));
+            let is_stale = match (&entry.control, current) {
+                (Some(control), Some((index, name))) => {
+                    control.index != index || control.name != name
+                }
+                _ => false,
+            };
+            if is_stale {
+                stale.push(entry);
+            } else {
+                kept.push(entry);
+            }
+        }
+        self.saved = kept;
+        stale
+    }
+
     /// Restores this device's remembered mode. `Ok(false)` when nothing
-    /// was saved for it.
+    /// was saved for it. The entry is forgotten only after a successful
+    /// restore or when it can never apply again
+    /// ([`Error::drops_saved_mode`]); any other error keeps it.
     pub fn restore(&mut self, id: ControllerId) -> Result<bool> {
         self.sync()?;
-        let key = self
-            .controller(id)
-            .ok_or(Error::UnknownController(id.index()))?
-            .key();
-        let Some(pos) = self.saved.iter().position(|s| s.key == key) else {
+        let (key, occurrence) = self.slot(id).ok_or(Error::UnknownController(id.index()))?;
+        let Some(saved) = self
+            .saved
+            .iter()
+            .find(|s| s.same_slot(&key, occurrence))
+            .cloned()
+        else {
             return Ok(false);
         };
-        let saved = self.saved.remove(pos);
-        self.restore_saved(&saved)?;
-        Ok(true)
+        let result = self.restore_with_retry(&saved);
+        if result.is_ok() || result.as_ref().is_err_and(Error::drops_saved_mode) {
+            self.saved.retain(|s| !s.same_slot(&key, occurrence));
+        }
+        result.map(|()| true)
     }
 
     /// Best-effort restore of every remembered mode (re-enumerating first
     /// when the device list changed). Devices are matched by
-    /// [`DeviceKey`], not index. Clears the remembered set.
+    /// [`DeviceKey`] + occurrence, not index. Restored entries and entries
+    /// that can never apply again are forgotten; every other failure keeps
+    /// its entry ([`RestoreReport::retained`]) for a later attempt.
     pub fn restore_all(&mut self) -> Vec<RestoreReport> {
-        if self.saved.is_empty() {
+        self.restore_all_until(&|| false)
+    }
+
+    /// [`Client::restore_all`] that stops starting new restores once `stop`
+    /// returns true; entries not attempted stay remembered and unreported.
+    pub fn restore_all_until(&mut self, stop: &dyn Fn() -> bool) -> Vec<RestoreReport> {
+        if self.saved.is_empty() || stop() {
             return Vec::new();
         }
         if !self.poisoned {
@@ -469,33 +624,62 @@ impl Client {
         if self.list_dirty && !self.poisoned {
             let _ = self.refresh();
         }
-        let saved = std::mem::take(&mut self.saved);
-        saved
-            .into_iter()
-            .map(|s| RestoreReport {
-                result: self.restore_saved(&s),
-                device: s.key,
-            })
-            .collect()
+        let entries = self.saved.clone();
+        let mut reports = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if stop() {
+                break;
+            }
+            let result = if self.poisoned {
+                Err(Error::Disconnected)
+            } else {
+                self.restore_with_retry(&entry)
+            };
+            let forget = result.is_ok() || result.as_ref().is_err_and(Error::drops_saved_mode);
+            if forget {
+                self.saved
+                    .retain(|s| !s.same_slot(&entry.key, entry.occurrence));
+            }
+            reports.push(RestoreReport {
+                device: entry.key,
+                occurrence: entry.occurrence,
+                result,
+                retained: !forget,
+            });
+        }
+        reports
+    }
+
+    /// One restore; a device-list change in between is answered with one
+    /// re-enumeration and one retry.
+    fn restore_with_retry(&mut self, saved: &SavedMode) -> Result<()> {
+        match self.restore_saved(saved) {
+            Err(Error::DeviceListChanged) => {
+                self.refresh()?;
+                self.restore_saved(saved)
+            }
+            other => other,
+        }
     }
 
     fn restore_saved(&mut self, saved: &SavedMode) -> Result<()> {
         self.sync()?;
-        let controller = self
-            .controllers
-            .iter()
-            .find(|c| c.key() == saved.key)
+        let id = self
+            .find_slot(&saved.key, saved.occurrence)
             .ok_or(Error::DeviceGone)?;
-        let id = controller.id;
+        let controller = self
+            .controller(id)
+            .ok_or(Error::UnknownController(id.index()))?;
         match controller.modes.get(saved.index) {
             Some(m) if m.name == saved.mode.name => {}
-            _ => {
-                return Err(Error::InvalidArgument(
-                    "saved mode no longer exists on this device",
-                ));
-            }
+            _ => return Err(Error::ModeGone),
         }
-        self.update_mode(id, saved.index, &saved.mode)
+        let colors_fit = !saved.colors.is_empty() && saved.colors.len() == controller.leds.len();
+        self.update_mode(id, saved.index, &saved.mode)?;
+        if colors_fit {
+            self.update_leds(id, &saved.colors)?;
+        }
+        Ok(())
     }
 
     fn ensure_live(&self) -> Result<()> {

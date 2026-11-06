@@ -42,7 +42,8 @@ the code is `crates/kwe-led-worker` (binary + library) and the wire types are
 | `--frame PATH` | none | absolute, ≤4096 B, no `.`/`..` | initial frame file |
 | `--disable-device ID` | none | 16 lowercase hex; repeatable | initially disabled device |
 | `--probe` | | | print one `led_probe` JSON line and exit (below) |
-| `--timeout-ms N` | 1000 | 1..=30000 | `--probe` I/O timeout |
+| `--timeout-ms N` | 1000 | 1..=30000 | `--probe` I/O timeout (enumeration additionally ≤ 2 s) |
+| `--saved-modes PATH` | none | absolute, ≤4096 B, no `.`/`..` | persist remembered device modes (below); without it they live in memory only |
 | `--standalone` | off | | development: stdin EOF does not stop |
 | `--synthetic-audio` | off | | development: internal 32-band test audio (2 Hz bass pulse + sweeping peak) |
 | `--duration-s N` | none | 1..=3600 | stop (and restore) after N s |
@@ -164,7 +165,8 @@ heartbeat older than ~15 s while the process lives means it is wedged.
 |---|---|
 | `seq` | +1 per emitted line; a gap means the reader missed lines the worker replaced while unread (harmless: every line is a full snapshot) |
 | `state` | see below |
-| `reason` | `null`, or for `degraded`: `timeout`, `disconnected`, `io_error`, `protocol_error`, `unsupported_version`, `device_error`, `error`; on the final `stopped` line: `signal`, `led_stop`, `stdin_eof`, `duration` |
+| `reason` | `null`, or for `degraded`: `timeout`, `disconnected`, `io_error`, `protocol_error`, `unsupported_version`, `device_error`, `error`; for `active`: `waiting_for_source` (connected, nothing driven); on the final `stopped` line: `signal`, `led_stop`, `stdin_eof`, `duration` |
+| `driven_count` | devices this worker is sending colours to now; 0 while waiting for a source, in mode `off`, and while not connected. *Additive (review fixes A)*: decodes as 0 from an older worker |
 | `mode`, `brightness`, `rate_hz` | the settings in effect |
 | `server.reachable` | connected right now |
 | `server.protocol` / `server_protocol` | negotiated version / the server's own highest (while connected) |
@@ -185,6 +187,7 @@ heartbeat older than ~15 s while the process lives means it is wedged.
 | `connecting` | first line only, before the first probe finished | spinner |
 | `server_absent` | connection refused on loopback — **normal and quiet** | "OpenRGB SDK server is not running — enable it in OpenRGB (SDK Server tab) or run `openrgb --server`" |
 | `active` | connected + enumerated; enabled devices are driven (zero devices is still `active`, `device_count: 0`) | device list |
+| `active` + reason `waiting_for_source` | connected, but the mode has no source (no valid frame for `ambient`/`ambient+pulse`, no fresh audio for `spectrum`): **no device is taken over**; anything taken earlier was released | "waiting for a wallpaper / for audio" |
 | `off` | connected, mode `off`: every device restored, no LED packets | "Paused" |
 | `degraded` | connection dropped or refused for another reason (`reason`); re-probing | reason text + Retry (`led_reprobe`) |
 | `stopped` | final line only | — |
@@ -197,9 +200,23 @@ inventory stays available to the UI.
 ### Device ids
 
 `device_id(name, vendor, serial, location)` = FNV-1a 64 over the four
-strings joined by NUL, as 16 lowercase hex digits (pinned by a unit test).
-Stable across processes, restarts, and controller re-ordering (OpenRGB
-indexes are not stable). Persist these in settings (`led.devices`).
+strings joined by NUL, as 16 lowercase hex digits (pinned by a unit test),
+**with `location` hashed as empty when the device reports a non-empty
+serial** (review fixes A). Persist these in settings (`led.disabled_devices`).
+
+- Stable across processes, restarts, and controller re-ordering (OpenRGB
+  indexes are not stable).
+- With a serial: also stable across replug/reboot.
+- **Without a serial the id includes `location`** (e.g. `/dev/hidrawN`,
+  which can change on replug/reboot): such a device then gets a new id and
+  a disabled one comes back enabled. Known limit — without a serial the
+  location is the only thing telling identical units apart.
+- Units with the same name, vendor and serial (or, serial-less, the same
+  location) share one id: disabling one disables all of them. Internally
+  the worker still drives, remembers and restores each controller
+  separately (full key + occurrence in list order).
+- Changed from the L2 derivation for devices with a serial; nothing had
+  shipped, but a stored id for such a device no longer matches.
 
 ## `--probe`
 
@@ -211,6 +228,9 @@ packets):
  "status":"ok","reachable":true,"server_protocol":5,"negotiated_protocol":5,
  "device_count":2,"devices":[ ...same objects as status devices[]... ]}
 ```
+
+Bounded for `kwe diagnose` (which kills it at 5 s): connect 250 ms, version
+exchange `--timeout-ms` (1 s), enumeration ≤ 2 s → ≈ 3.3 s worst case.
 
 `status` ∈ `ok` (exit 0), `server_absent` (exit 3, `reachable:false`),
 `error` (exit 1, with `reason` and `error` text). Same top-level fields as
@@ -232,44 +252,115 @@ daemon parses one device shape.
   connection → `degraded` with a truthful `reason` → first re-probe after
   `backoff-min`, then the doubling backoff; once probes are refused it
   settles into quiet `server_absent`.
+- While not connected the worker does no LED work and **reads no frame
+  file**; its main loop sleeps until the next probe, the 5 s status
+  heartbeat, or a control line / termination signal (which wake it at once).
+  Measured (release build, all threads, 10 s): 6 voluntary context switches
+  disconnected, 14 in mode `off`, 44 connected and waiting for a source —
+  was 201 in each case (50 ms polling).
+- A tick that connects does not drive: driving starts on the next tick.
 - The server's device-list-changed notification triggers a re-enumeration;
   per-device errors (`device_error`) are counted and logged (rate-limited)
   without dropping the connection.
 
 ### Sink
 
+- **Nothing is taken over without a source** (review fixes A). The mode
+  must have something real to show: a valid frame snapshot (≤ 2 s old) for
+  `ambient` / `ambient+pulse`, audio (≤ 0.5 s old, plus the 2 s hold) for
+  `spectrum`. Until then the state is `active` + `waiting_for_source`,
+  `driven_count: 0`, and no device packet is sent. `ambient+pulse` with a
+  frame but stale audio drives steady ambient.
+- When the source goes away the last colours are held for 2 s, then every
+  device is **released**: its remembered mode restored exactly as for mode
+  `off` (never driven to black). It is taken again when a source returns.
 - All controllers by default; `disabled_devices` excludes by `id`. A device
   is taken into its per-LED mode (`SetCustomMode`) on first use; its previous
-  mode is remembered by the client.
+  mode is remembered first — a device whose current mode cannot be
+  remembered (no valid active mode, or 128 already remembered) is not taken
+  at all.
 - One `UpdateLEDs` (whole device) per enabled device per tick at most.
   Unchanged colours are not re-sent, except a keepalive every 2 s.
+- One tick starts device operations (take-over, restore) for at most 0.5 s
+  and stops between devices on a stop request; the rest continue next tick
+  (round-robin, no device starves).
 - Disabling a controlled device at runtime restores its previous mode at the
   next tick; it then receives no packets at all.
 - Mode `off` restores every device at the next tick; the worker stays alive
   (and connected).
+- A restore that fails for any reason other than "device gone" / "that mode
+  no longer exists" **keeps** the remembered mode (retried next tick, carried
+  across a dropped connection, persisted); a device-list change during a
+  restore is answered with one re-enumeration and one retry. Gone
+  device/mode: reported (`event=led.update_error ... op=restore`) and
+  forgotten.
 - Remembered modes **survive a dropped connection**: when the server returns
-  with devices still in the worker's per-LED mode, the originals are restored
-  on stop, not the per-LED mode (`Client::adopt_saved_modes`).
-- Known limit: after a worker *crash* (no restore ran) a respawned worker
-  sees the per-LED mode as the "previous" mode. Nothing is persisted.
+  with devices still in the worker's per-LED mode, the originals are restored,
+  not the per-LED mode (`Client::adopt_saved_modes`). An adopted entry whose
+  device is present but no longer in the per-LED mode the worker switched it
+  to (recorded at take-over) is forgotten (logged): the user changed the
+  lighting since, and restoring would overwrite that.
+- A device whose current mode is already OpenRGB's per-LED `Direct` (no
+  remembered entry) is remembered as `Direct` **plus its current colours**;
+  restore re-selects Direct and re-sends those colours. There is no better
+  "previous" to know: Direct has no stored lighting of its own, it shows
+  whatever was last sent (e.g. an OpenRGB profile). The name is the
+  protocol-level signal: `SetCustomMode` itself selects the mode by that
+  name; mode flag bit meanings are not in the published protocol text.
+
+### Remembered modes file (`--saved-modes`)
+
+- Written **before** the first `SetCustomMode` for a device (the device is
+  skipped that tick if the write fails), rewritten whenever the remembered
+  set changes (take-over records the observed per-LED mode; restores remove
+  entries), and **removed** once every remembered mode is restored. So the
+  file is always a superset of the devices left in the per-LED mode.
+- Adopted on start (before the first connection) like modes carried across
+  a dropped connection; matched by `DeviceKey {name, vendor, serial,
+  location}` + occurrence. Entries whose device or mode no longer exists are
+  dropped after a restore reports it.
+- Atomic: `.<name>.tmp` in the same directory (`O_NOFOLLOW`, 0600), fsync,
+  `rename`. ≤ 8 MiB: if larger, Direct colours are dropped first (the mode
+  is still restored), then entries.
+- Versioned JSON: `{"version":1,"type":"kwe_led_saved_modes","entries":[
+  {"name","vendor","serial","location","occurrence","index","mode":{...every
+  OpenRGB mode field..., "colors":"rrggbb..."},"colors":"rrggbb...",
+  "control":{"index","name"}|null}]}`.
+- Missing = nothing to restore. Corrupt, oversized, foreign version/type,
+  symlink, or not a regular file: ignored with **one** log line
+  (`event=led.saved_modes detail=ignored reason=...`) and removed (the next
+  write replaces it) — never a crash, never an exit.
+- Without the flag (standalone/dev) remembered modes live in memory only
+  and a SIGKILLed worker leaves its devices in the per-LED mode.
+- Known limits: after an unclean death without the file (or with a file
+  the user deleted) the next worker remembers what it finds; a restore on
+  stop that timed out leaves entries that the next worker re-applies (only
+  if the device is still in the recorded per-LED mode).
 
 ### Stop and restore
 
-On SIGTERM, SIGINT, `led_stop`, or stdin EOF: the main loop notices within
-50 ms (or after the in-flight OpenRGB operation, ≤ 1.5 s with a stalled
-server), restores every remembered mode on a helper thread bounded to
-**1.5 s** (with no live connection but remembered modes it makes one bounded
-reconnect attempt first), writes the final `stopped` line (flush ≤ 300 ms),
-and exits 0. Worst case ≈ 3.3 s by construction; measured SIGTERM → exit
-1–51 ms with a healthy server (release build, 3 runs) and ≈ 0.55 s with a
-server stalling its replies (integration test, 3 runs; the test bound is
-4 s). **L3: use a ≥ 4 s SIGTERM grace before
-SIGKILL** (the audio worker's 1 s is too short for the stalled-server case).
+On SIGTERM, SIGINT, `led_stop`, or stdin EOF the main loop is woken at once
+(signals are taken by a dedicated `sigwait` thread, so the loop can sleep
+until its next deadline). A tick in progress checks the stop request between
+connect and enumerate, between devices, and before restoring, so at most
+**one** bounded OpenRGB operation is still in flight (≤ 1.5 s: one
+enumeration; a request/reply is ≤ 0.5 s). Then every remembered mode is
+restored on a helper thread bounded to **1.5 s** (with no live connection
+but remembered modes it makes one bounded reconnect attempt first; the
+saved-modes file then holds exactly what is still unrestored), the final
+`stopped` line is written (flush ≤ 300 ms), and it exits 0.
+
+**Documented worst case: 3.35 s** (1.5 + 1.5 + 0.3 s + scheduling slack);
+L3's 4 s SIGTERM grace covers it. Measured: 70 ms with a server stalling
+its replies, 452 ms with a slow server taking over 24 devices at 400 ms
+each (was 9.66 s before review fixes A), < 0.5 s idle with no server
+(integration tests; bound asserted 3.35 s / 0.5 s).
 
 ### Ambient source
 
-- Read only while the mode is `ambient` or `ambient+pulse`, once per tick
-  (never faster than `rate_hz`).
+- Read only while connected and the mode is `ambient` or `ambient+pulse`,
+  once per tick (never faster than `rate_hz`; 4 Hz while waiting for a
+  source).
 - **Open per tick, no mapping.** Each tick: `open(O_RDONLY|O_NOFOLLOW|
   O_CLOEXEC|O_NONBLOCK)`, `fstat` (regular file, ≥64 B, ≤512 MiB, size must
   equal the header's), seqlock read with `pread`, `close`. Rationale: a held
@@ -290,9 +381,10 @@ SIGKILL** (the audio worker's 1 s is too short for the stalled-server case).
   centres, read as one `pread` per grid row (≤ 36 row reads, ≤ 36 × width × 4
   bytes). BGRA premultiplied → RGB as composited over black.
 - Missing / invalid / cleared (`led_frame null`) source: the last colours
-  are **held for 2 s**, then **faded to black** (time constant 1 s). A
-  frame-path switch keeps the held grid, so a wallpaper switch does not
-  blink. A replaced file (new inode) is picked up on the next tick.
+  are **held for 2 s**, then the devices are **released** (see Sink; the
+  L2 fade to black is gone). A frame-path switch keeps the held grid, so a
+  wallpaper switch does not blink. A replaced file (new inode) is picked up
+  on the next tick.
 
 ### Modes and mapping (pure functions in `src/mapping.rs`, `src/color.rs`)
 
@@ -308,7 +400,7 @@ SIGKILL** (the audio worker's 1 s is too short for the stalled-server case).
 - `ambient+pulse`: ambient colour × `0.2 + 0.8·bass`; without fresh audio
   the factor is 1 (plain ambient).
 - Smoothing (exponential, per LED): ambient τ = 0.25 s; spectrum attack
-  30 ms / release 200 ms; pulse attack 30 ms / release 250 ms; fade τ = 1 s.
+  30 ms / release 200 ms; pulse attack 30 ms / release 250 ms.
 - Brightness cap applied last (linear scale of the sRGB bytes).
 - Ticks are scheduled from the actual tick start (`next = now + 1/rate`),
   so a late tick never causes a catch-up burst. Rate changes apply at once.
@@ -325,15 +417,20 @@ SIGKILL** (the audio worker's 1 s is too short for the stalled-server case).
 | frame grid | 64×36 samples, ≤ 36 row reads, 4 seqlock attempts |
 | OpenRGB I/O | connect 250 ms, request 500 ms, enumerate 1.5 s; client caps in `OPENRGB_CLIENT.md` |
 | probe backoff | 1 s doubling to 60 s |
-| restore on stop | 1.5 s; final flush 0.3 s |
-| stderr | token bucket: burst 20 lines, then 1 per 6 s, `suppressed=N` appended; lines ≤ 512 chars |
+| restore on stop | 1.5 s; final flush 0.3 s; SIGTERM → exit ≤ 3.35 s |
+| device operations per tick | started within 0.5 s; stop checked between devices |
+| idle ticks | none while disconnected (sleep to next probe); 4 Hz waiting for a source; 1 Hz in mode `off` |
+| remembered-modes file | ≤ 8 MiB, ≤ 128 entries |
+| stderr | token bucket: burst 20 lines, then 1 per 6 s, `suppressed=N` appended; lines ≤ 512 chars; control characters escaped (server strings cannot forge lines) |
 
 ## stderr diagnostics
 
 `event=led.<name> key=value ...`, rate-limited as above. Events:
 `led.state` (state/reason transitions only), `led.frame` (frame-state
 transitions), `led.update_error`, `led.stdin_rejected`, `led.restore` (only
-when a restore failed or timed out), `led.fatal`.
+when a restore failed or timed out), `led.saved_modes` (file ignored /
+adopted / write failed / stale entry forgotten), `led.fatal`. Device names
+are logged with `{:?}` quoting.
 
 ## Tests
 
@@ -350,3 +447,11 @@ mode off, server absent then appearing (one log line), server dying and
 returning (original modes kept), protocol error and stalled server →
 `degraded`, frame missing / replaced / truncated / switched / cleared,
 garbage and oversized stdin, `--probe`, and a CPU regression guard.
+Review fixes A added: no source never takes or blanks a device (all three
+modes), source appearing/vanishing (driven → released), SIGKILL then the
+next worker with the same `--saved-modes` restores the originals, file
+adopted without a source / corrupt file ignored with one line, SIGTERM
+during a slow take-over of 24 devices (bound 3.35 s), idle context switches
+with no server (≤ 30 in 4 s), and a newline in a device name cannot forge a
+log line; `src/saved.rs` unit tests (atomic 0600 round trip, every unusable
+file kind, size bound).

@@ -32,7 +32,9 @@ pub mod stub;
 #[cfg(test)]
 mod tests;
 
-pub use client::{Client, ClientConfig, DEFAULT_PORT, PollOutcome, RestoreReport, SavedMode};
+pub use client::{
+    Client, ClientConfig, ControlMode, DEFAULT_PORT, PollOutcome, RestoreReport, SavedMode,
+};
 pub use error::Error;
 pub use model::{
     Controller, ControllerId, DeviceKey, Led, MatrixMap, Mode, Rgb, Segment, Zone, zone_type,
@@ -70,6 +72,13 @@ pub mod limits {
     /// deadline bounds the time either way.
     pub const MAX_SKIPPED_PER_REPLY: usize = 4096;
     pub const MAX_CLIENT_NAME_BYTES: usize = 64;
+    /// Estimated in-memory size of every controller parsed by one
+    /// enumeration ([`crate::Controller::approx_heap_bytes`]). Without it a
+    /// hostile loopback listener could make one refresh retain
+    /// `MAX_CONTROLLERS` × `MAX_PACKET_BYTES` (512 MiB). A large real setup
+    /// (dozens of devices, full-size keyboards with named LEDs) is well
+    /// under 1 MiB.
+    pub const MAX_ENUMERATION_BYTES: usize = 16 * 1024 * 1024;
     /// Upper bound for every configurable timeout.
     pub const MAX_TIMEOUT_MS: u64 = 30_000;
 }

@@ -31,6 +31,10 @@ ColumnLayout {
     // Controllers OpenRGB reported minus the listed ones the user excluded
     // (ids of devices that are not connected right now do not count).
     readonly property int syncedCount: {
+        // Exact count from the worker; the estimate below only serves an
+        // older worker that does not report it.
+        if (ledSync.drivenCount >= 0)
+            return ledSync.drivenCount;
         const disabled = ledSync.disabledDevices;
         let excluded = 0;
         for (const device of ledSync.devices) {
@@ -89,6 +93,15 @@ ColumnLayout {
                      title: qsTr("OpenRGB's SDK server is not running"),
                      detail: qsTr("LED sync is optional. To use it, open OpenRGB and choose SDK Server → Start Server, or start OpenRGB with “openrgb --server”. LED sync connects by itself once the server is running.") };
         case "active":
+            if (reason === "waiting_for_source")
+                return { icon: "dialog-information", busy: false, checkAgain: false,
+                         title: ledSync.mode === "spectrum" ? qsTr("Connected to OpenRGB — waiting for audio")
+                                                            : qsTr("Connected to OpenRGB — waiting for a wallpaper"),
+                         detail: (ledSync.mode === "spectrum"
+                                  ? qsTr("Spectrum mode lights your devices once audio arrives.")
+                                  : qsTr("Your devices keep their own lighting until a wallpaper is showing."))
+                             + " " + (ledSync.deviceCount === 1 ? qsTr("1 device found.")
+                                      : qsTr("%1 devices found.").arg(ledSync.deviceCount)) };
             if (ledSync.deviceCount === 0)
                 return { icon: "dialog-information", busy: false, checkAgain: false,
                          title: qsTr("Connected to OpenRGB, but it reports no devices"),

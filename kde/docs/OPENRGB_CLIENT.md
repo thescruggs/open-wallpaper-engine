@@ -96,6 +96,7 @@ the live probe**): little-endian integers; colour = R, G, B, pad;
 | unrelated packets skipped while waiting for one reply | 4096 (`MAX_SKIPPED_PER_REPLY`; the per-reply deadline bounds time) |
 | unrelated packets drained per poll | 64 |
 | remembered modes | 128 |
+| retained bytes per enumeration (estimate) | 16 MiB (`MAX_ENUMERATION_BYTES`) |
 
 Every count is also checked against the bytes left in the payload before
 anything is allocated.
@@ -115,7 +116,7 @@ anything is allocated.
 | `LimitExceeded {what, value, max}` | a count/length over its cap | usable |
 | `UnsupportedVersion {server, min, max}` | negotiation refused | n/a (connect fails) |
 | `DeviceListChanged` | ids stale; call `refresh()` | usable |
-| `UnknownController(i)` / `DeviceGone` / `InvalidArgument(..)` | caller-side | usable |
+| `UnknownController(i)` / `DeviceGone` / `ModeGone` / `InvalidArgument(..)` | caller-side (`DeviceGone`/`ModeGone`: restore only; the remembered mode is forgotten) | usable |
 
 `Error::is_server_absent()` and `Error::is_connection_lost()` classify.
 No path panics on server input (mutation and truncation tests).
@@ -139,6 +140,40 @@ No path panics on server input (mutation and truncation tests).
 - `cargo run -p kwe-openrgb --features stub --example stub_server -- [--port N]`
   — prints `{"port":N}`, runs until stdin EOF, then prints the received
   packet ids, client names, and final active modes (for smoke scripts).
+
+## Changes in review fixes A (2026-11-06)
+
+- **Restore never discards a remembered mode on a transient error.**
+  `restore(id)` / `restore_all()` forget an entry only after a successful
+  restore or `Error::drops_saved_mode()` (`DeviceGone`, new `ModeGone`);
+  every other failure (lost connection, timeout, a device-list change that
+  persists after one re-enumerate + retry) keeps it, and
+  `RestoreReport::retained` says so. Before, the entry was removed before
+  the attempt (reviewer: 300/300 lost under a notification storm; here 42/60
+  storm runs exercised the keep path, 0 lost).
+- `restore_all_until(stop)`: stops starting restores when `stop()` is true
+  (entries not attempted stay remembered, unreported).
+- `SavedMode` gained `occurrence` (controllers with an identical
+  `DeviceKey` are remembered/restored separately, by list order), `colors`
+  (current LED colours, only when the remembered mode is `Direct` —
+  `Mode::is_direct()`; restore re-sends them after `UpdateMode` when the
+  LED count still matches) and `control: Option<ControlMode>` (the per-LED
+  mode observed right after `SetCustomMode`). `RestoreReport` gained
+  `occurrence` and `retained`.
+- `mode_to_save(id)` (what `take_control` would remember, so a caller can
+  persist it before the switch), `slot(id)`, `has_saved_mode(id)`,
+  `drop_stale_saved_modes()` (forgets adopted entries whose device is
+  present but no longer in the recorded control mode: the user changed it).
+- `take_control` **refuses** (sends nothing) when the current mode cannot
+  be remembered: no valid active mode (`InvalidArgument`) or 128 already
+  remembered (`LimitExceeded {what: "remembered modes"}`).
+- New bound `limits::MAX_ENUMERATION_BYTES` = 16 MiB: estimated in-memory
+  size of all controllers parsed by one `refresh`
+  (`Controller::approx_heap_bytes`); over it → `LimitExceeded {what:
+  "enumeration bytes"}` (connection stays usable, list empty). A hostile
+  loopback listener could otherwise make one refresh retain 128 × 4 MiB.
+  A large real setup is well under 1 MiB.
+- Stub: `Fault::StallAfterCustomMode(d)` (slow-but-alive server).
 
 ## Changes in L2 (2026-11-05)
 

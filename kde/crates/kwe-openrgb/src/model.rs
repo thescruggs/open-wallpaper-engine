@@ -100,6 +100,14 @@ pub struct Mode {
 const MODE_MIN_BYTES: usize = 2 + 9 * 4 + 2;
 
 impl Mode {
+    /// True for OpenRGB's per-LED `Direct` mode — the mode the server picks
+    /// first for `SetCustomMode` (it selects by this name). It has no stored
+    /// lighting of its own: what it shows is the colour array last sent, so
+    /// remembering it as a "previous" mode also needs those colours.
+    pub fn is_direct(&self) -> bool {
+        self.name.eq_ignore_ascii_case("direct")
+    }
+
     fn read(r: &mut Reader<'_>, version: u32) -> Result<Self> {
         let name = r.string("mode name")?;
         let value = r.i32("mode value")?;
@@ -360,6 +368,54 @@ impl Controller {
     pub fn active_mode(&self) -> Option<(usize, &Mode)> {
         let idx = usize::try_from(self.active_mode).ok()?;
         self.modes.get(idx).map(|m| (idx, m))
+    }
+
+    /// Estimated heap + inline size of this parsed controller, counted
+    /// against [`crate::limits::MAX_ENUMERATION_BYTES`]. Deliberately an
+    /// over-estimate of what is retained (strings at their length, every
+    /// element at its in-memory size).
+    pub fn approx_heap_bytes(&self) -> usize {
+        use std::mem::size_of;
+        let strings = [
+            &self.name,
+            &self.vendor,
+            &self.description,
+            &self.version,
+            &self.serial,
+            &self.location,
+        ]
+        .iter()
+        .map(|s| s.len())
+        .sum::<usize>();
+        let modes: usize = self
+            .modes
+            .iter()
+            .map(|m| size_of::<Mode>() + m.name.len() + m.colors.len() * size_of::<Rgb>())
+            .sum();
+        let zones: usize = self
+            .zones
+            .iter()
+            .map(|z| {
+                size_of::<Zone>()
+                    + z.name.len()
+                    + z.matrix.as_ref().map_or(0, |m| m.cells.len() * 4)
+                    + z.segments
+                        .iter()
+                        .map(|s| size_of::<Segment>() + s.name.len())
+                        .sum::<usize>()
+            })
+            .sum();
+        let leds: usize = self
+            .leds
+            .iter()
+            .map(|l| size_of::<Led>() + l.name.len())
+            .sum();
+        size_of::<Controller>()
+            + strings
+            + modes
+            + zones
+            + leds
+            + self.colors.len() * size_of::<Rgb>()
     }
 
     /// Offset of `zone`'s first LED in the controller-wide LED array.

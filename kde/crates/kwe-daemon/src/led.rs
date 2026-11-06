@@ -46,8 +46,9 @@ use serde::Serialize;
 use crate::settings::LedSettings;
 use crate::supervisor::{PipeWrite, set_nonblocking, try_write_input};
 
-/// SIGTERM → SIGKILL grace. The worker's worst case is ≈ 3.3 s by
-/// construction (one in-flight OpenRGB op 1.5 s + restore 1.5 s + flush
+/// SIGTERM → SIGKILL grace. The worker's documented worst case is 3.35 s
+/// (one in-flight bounded OpenRGB operation ≤ 1.5 s — stop is checked
+/// between connect phases and between devices — + restore 1.5 s + flush
 /// 0.3 s); `LED_PROTOCOL_V1.md` requires ≥ 4 s.
 pub const STOP_GRACE: Duration = Duration::from_secs(4);
 /// Restart budget, same shape as the audio/occlusion workers.
@@ -304,7 +305,14 @@ pub struct LedManager {
     tee: LedTeeCounters,
     status_lines_rejected: u64,
     timings: Timings,
+    /// `--saved-modes` for the worker (inside the daemon's state
+    /// directory): remembered pre-control device modes survive a worker
+    /// that died without restoring them.
+    saved_modes: Option<PathBuf>,
 }
+
+/// File name of the worker's remembered-modes file in the state directory.
+pub const SAVED_MODES_FILE: &str = "led-saved-modes.json";
 
 impl LedManager {
     pub fn new(config: Option<LedWorkerConfig>, settings: LedSettings) -> Self {
@@ -328,7 +336,15 @@ impl LedManager {
             tee: LedTeeCounters::default(),
             status_lines_rejected: 0,
             timings: Timings::default(),
+            saved_modes: None,
         }
+    }
+
+    /// Passes `<state_dir>/led-saved-modes.json` to every spawned worker
+    /// (`--saved-modes`). Without it the worker remembers modes in memory
+    /// only.
+    pub fn set_state_dir(&mut self, state_dir: &Path) {
+        self.saved_modes = Some(state_dir.join(SAVED_MODES_FILE));
     }
 
     /// The mode the worker should run: `off` while paused.
@@ -572,7 +588,9 @@ impl LedManager {
         match latest.state {
             State::Connecting => ("connecting", None),
             State::ServerAbsent => ("server_absent", None),
-            State::Active => ("active", None),
+            // `waiting_for_source` passes through: connected, nothing
+            // driven until the mode has a frame / audio.
+            State::Active => ("active", latest.reason.clone()),
             State::Off => (
                 "off",
                 (self.paused && self.settings.mode != Mode::Off).then(|| "paused".to_string()),
@@ -820,6 +838,9 @@ impl LedManager {
             .stderr(Stdio::inherit());
         if let Some(port) = config.port {
             command.arg("--port").arg(port.to_string());
+        }
+        if let Some(path) = &self.saved_modes {
+            command.arg("--saved-modes").arg(path);
         }
         for id in &self.settings.disabled_devices {
             command.arg("--disable-device").arg(id);

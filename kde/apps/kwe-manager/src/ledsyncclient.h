@@ -41,6 +41,9 @@ class LedSyncClient final : public QObject {
     Q_PROPERTY(int sdkPort READ sdkPort NOTIFY statusChanged)
     Q_PROPERTY(bool audioFresh READ audioFresh NOTIFY statusChanged)
     Q_PROPERTY(int deviceCount READ deviceCount NOTIFY statusChanged)
+    // Devices the worker drives right now (`driven_count`); -1 when the
+    // worker does not report it (older worker).
+    Q_PROPERTY(int drivenCount READ drivenCount NOTIFY statusChanged)
     Q_PROPERTY(bool devicesTruncated READ devicesTruncated NOTIFY statusChanged)
     // [{id, name, vendor, leds, controlled}], at most what the daemon lists.
     Q_PROPERTY(QVariantList devices READ devices NOTIFY statusChanged)
@@ -76,6 +79,7 @@ public:
     int sdkPort() const { return m_sdkPort; }
     bool audioFresh() const { return m_audioFresh; }
     int deviceCount() const { return m_deviceCount; }
+    int drivenCount() const { return m_drivenCount; }
     bool devicesTruncated() const { return m_devicesTruncated; }
     QVariantList devices() const { return m_devices; }
     bool enabled() const;
@@ -157,6 +161,7 @@ private:
     int m_sdkPort = 0;
     bool m_audioFresh = false;
     int m_deviceCount = 0;
+    int m_drivenCount = -1;
     bool m_devicesTruncated = false;
     QVariantList m_devices;
 

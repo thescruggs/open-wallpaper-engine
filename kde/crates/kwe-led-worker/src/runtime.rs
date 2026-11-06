@@ -17,8 +17,6 @@ use kwe_led_protocol::{
 
 use crate::engine::Engine;
 
-/// Main-loop wake granularity: bounds SIGTERM latency between ticks.
-pub const WAKE: Duration = Duration::from_millis(50);
 /// At most one status line per this interval.
 pub const STATUS_MIN_INTERVAL: Duration = Duration::from_millis(250);
 /// A status line is emitted at least this often (with fresh counters).
@@ -49,6 +47,8 @@ pub struct Inbox {
     pub reprobe: bool,
     pub stop: bool,
     pub eof: bool,
+    /// SIGTERM/SIGINT arrived (set by the signal thread, see `main.rs`).
+    pub terminate: bool,
     pub lines: u64,
     pub rejected: u64,
     pub ignored: u64,
@@ -126,6 +126,14 @@ impl Shared {
 
     fn eof(&self) {
         lock(&self.inbox).eof = true;
+        self.wake.notify_all();
+    }
+
+    /// Records a termination signal and wakes the main loop at once (the
+    /// loop sleeps until its next deadline, which can be a minute away
+    /// while OpenRGB is absent).
+    pub fn terminate(&self) {
+        lock(&self.inbox).terminate = true;
         self.wake.notify_all();
     }
 }
@@ -311,9 +319,16 @@ fn material(status: &StatusLine) -> String {
     serde_json::to_string(&s).unwrap_or_default()
 }
 
-/// Runs until SIGTERM/SIGINT (`terminated`), `led_stop`, stdin EOF (unless
-/// standalone), or the duration; then restores devices within
-/// [`RESTORE_DEADLINE`], writes the final `stopped` line, and returns.
+/// Runs until SIGTERM/SIGINT (`terminated`, or [`Shared::terminate`]),
+/// `led_stop`, stdin EOF (unless standalone), or the duration; then restores
+/// devices within [`RESTORE_DEADLINE`], writes the final `stopped` line, and
+/// returns.
+///
+/// The loop sleeps until the earliest of: the engine's next tick
+/// ([`Engine::next_tick`] — the next probe while OpenRGB is absent), the
+/// status heartbeat, a rate-limited pending status line, the duration end,
+/// and (`--synthetic-audio`, connected only) the next synthetic frame. Any
+/// control line, stdin EOF, or termination signal wakes it immediately.
 pub fn run(
     mut engine: Engine,
     shared: Arc<Shared>,
@@ -334,10 +349,18 @@ pub fn run(
     let mut last_emit: Option<Instant> = None;
     let mut force_emit = false;
     let mut next_synth = start;
+    let standalone = opts.standalone;
+    let stopping = || {
+        if terminated.load(Ordering::Acquire) {
+            return true;
+        }
+        let inbox = lock(&shared.inbox);
+        inbox.terminate || inbox.stop || (inbox.eof && !standalone)
+    };
     let stop_reason: &'static str = loop {
         let now = Instant::now();
         // Drain the inbox.
-        let (config, frame, audio, status_request, reprobe, stop, eof, note, counts) = {
+        let (config, frame, audio, status_request, reprobe, stop, eof, signal, note, counts) = {
             let mut inbox = lock(&shared.inbox);
             (
                 inbox.config.take(),
@@ -347,6 +370,7 @@ pub fn run(
                 std::mem::take(&mut inbox.reprobe),
                 inbox.stop,
                 inbox.eof,
+                inbox.terminate,
                 inbox.reject_note.take(),
                 (inbox.lines, inbox.rejected, inbox.ignored),
             )
@@ -358,7 +382,7 @@ pub fn run(
         if let Some(note) = note {
             engine.log(now, "stdin_rejected", &format!("detail={note:?}"));
         }
-        if terminated.load(Ordering::Acquire) {
+        if signal || terminated.load(Ordering::Acquire) {
             break "signal";
         }
         if stop {
@@ -367,42 +391,39 @@ pub fn run(
         if eof && !opts.standalone {
             break "stdin_eof";
         }
-        if opts
-            .duration
-            .is_some_and(|d| now.saturating_duration_since(start) >= d)
-        {
+        let end = opts.duration.map(|d| start + d);
+        if end.is_some_and(|e| now >= e) {
             break "duration";
         }
         if let Some(patch) = config {
-            let before = engine.settings().tick_interval();
             engine.apply_config(patch);
-            let after = engine.settings().tick_interval();
-            if after < before {
-                // Faster rate: do not wait out the old, longer interval.
-                next_tick = next_tick.min(now + after);
-            }
+            // Mode/rate/device changes take effect at once, not after the
+            // previous (possibly idle-length) interval.
+            next_tick = next_tick.min(now);
         }
         if let Some(path) = frame {
             engine.set_frame_path(path);
+            next_tick = next_tick.min(now);
         }
         if let Some((t, l, r)) = audio {
             engine.set_audio(t, &l, &r);
         }
-        if opts.synthetic_audio && now >= next_synth {
+        if opts.synthetic_audio && engine.is_connected() && now >= next_synth {
             let (l, r) = synthetic_bands(now.saturating_duration_since(start).as_secs_f32(), 32);
             engine.set_audio(now, &l, &r);
             next_synth = now + Duration::from_millis(33);
         }
         if reprobe {
             engine.reprobe(now);
+            next_tick = next_tick.min(now);
         }
         force_emit |= status_request;
 
         if now >= next_tick {
-            engine.tick(now);
+            engine.tick(now, &stopping);
             // Measured from the actual tick start, so a late tick never
             // causes a catch-up burst: rate ≤ rate_hz, latest-wins.
-            next_tick = now + engine.settings().tick_interval();
+            next_tick = engine.next_tick(now);
         }
 
         // Status: on material change / request / heartbeat, rate-limited.
@@ -423,13 +444,24 @@ pub fn run(
                 force_emit = false;
             }
         } else {
-            pending = force_emit;
+            // A material change or request waiting out the rate limit.
+            pending = force_emit || material(&engine.status(now, seq + 1)) != last_material;
         }
 
-        let mut wait = next_tick.saturating_duration_since(now).min(WAKE);
-        if pending && let Some(t) = last_emit {
-            wait = wait.min((t + STATUS_MIN_INTERVAL).saturating_duration_since(now));
+        let mut wake_at = next_tick;
+        if let Some(t) = last_emit {
+            wake_at = wake_at.min(t + STATUS_HEARTBEAT);
+            if pending {
+                wake_at = wake_at.min(t + STATUS_MIN_INTERVAL);
+            }
         }
+        if let Some(e) = end {
+            wake_at = wake_at.min(e);
+        }
+        if opts.synthetic_audio && engine.is_connected() {
+            wake_at = wake_at.min(next_synth);
+        }
+        let wait = wake_at.saturating_duration_since(now);
         if !wait.is_zero() {
             let inbox = lock(&shared.inbox);
             let idle = inbox.config.is_none()
@@ -437,8 +469,9 @@ pub fn run(
                 && !inbox.status_request
                 && !inbox.reprobe
                 && !inbox.stop
+                && !inbox.terminate
                 && !(inbox.eof && !opts.standalone);
-            if idle {
+            if idle && !terminated.load(Ordering::Acquire) {
                 drop(shared.wake.wait_timeout(inbox, wait));
             }
         }

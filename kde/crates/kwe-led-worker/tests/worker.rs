@@ -359,7 +359,7 @@ fn ambient_colours_reach_every_zone_type_and_eof_restores() {
 }
 
 #[test]
-fn spectrum_reacts_to_audio_lines_and_decays_without_them() {
+fn spectrum_reacts_to_audio_lines_and_releases_without_them() {
     let stub = StubServer::start(StubConfig {
         controllers: vec![
             sample_controller("Strip", &[("A", 8)]),
@@ -369,12 +369,11 @@ fn spectrum_reacts_to_audio_lines_and_decays_without_them() {
     })
     .unwrap();
     let mut w = Worker::spawn(stub.port(), &["--mode", "spectrum"]);
-    w.wait_status("active", |s| {
+    let st = w.wait_status("waiting for audio", |s| {
         s.state == State::Active && s.devices.len() == 2
     });
-    assert!(wait_until(WAIT, || {
-        all_near(&colors(&stub, 0), BLACK, 0) && all_near(&colors(&stub, 1), BLACK, 0)
-    }));
+    assert_eq!(st.reason.as_deref(), Some("waiting_for_source"));
+    assert_eq!(count(&stub, 0, packet_id::SET_CUSTOM_MODE), 0);
 
     // Loud bass: the bass end of the strip and the single-zone pulse light.
     let lit = |stub: &StubServer| {
@@ -392,14 +391,21 @@ fn spectrum_reacts_to_audio_lines_and_decays_without_them() {
         colors(&stub, 0),
         colors(&stub, 1)
     );
-    let st = w.wait_new_status("audio fresh", |s| {
-        s.audio.fresh && s.audio.bands == Some(16)
+    let st = w.wait_status("audio fresh, driving", |s| {
+        s.audio.fresh && s.audio.bands == Some(16) && s.driven_count == 2
     });
-    assert!(st.counters.audio_frames > 0 || st.audio.fresh);
+    assert!(st.reason.is_none());
 
-    // Audio stops → stale after 500 ms → release to black.
-    assert!(wait_until(WAIT, || all_near(&colors(&stub, 0), BLACK, 2)));
-    assert!(wait_until(WAIT, || all_near(&colors(&stub, 1), BLACK, 2)));
+    // Audio stops → decays, then (after the hold) both devices are given
+    // back to their own mode instead of being left dark.
+    assert!(wait_until(WAIT, || stub
+        .controllers()
+        .iter()
+        .all(|c| c.active_mode == 2)));
+    let st = w.wait_new_status("released", |s| {
+        s.reason.as_deref() == Some("waiting_for_source") && s.driven_count == 0
+    });
+    assert!(st.devices.iter().all(|d| !d.controlled));
 }
 
 #[test]
@@ -524,7 +530,7 @@ fn disabled_device_gets_no_packets_and_runtime_toggle_restores() {
 #[test]
 fn sigterm_restores_every_device_and_exits_zero() {
     let stub = StubServer::start(StubConfig::default()).unwrap();
-    let mut w = Worker::spawn(stub.port(), &["--mode", "spectrum"]);
+    let mut w = Worker::spawn(stub.port(), &["--mode", "spectrum", "--synthetic-audio"]);
     w.wait_status("controlled", |s| {
         s.devices.len() == 2 && s.devices.iter().all(|d| d.controlled)
     });
@@ -563,7 +569,7 @@ fn sigterm_restores_every_device_and_exits_zero() {
 #[test]
 fn led_stop_and_mode_off_restore_but_off_keeps_running() {
     let stub = StubServer::start(StubConfig::default()).unwrap();
-    let mut w = Worker::spawn(stub.port(), &["--mode", "spectrum"]);
+    let mut w = Worker::spawn(stub.port(), &["--mode", "spectrum", "--synthetic-audio"]);
     w.wait_status("controlled", |s| {
         s.devices.iter().all(|d| d.controlled) && s.devices.len() == 2
     });
@@ -602,7 +608,7 @@ fn led_stop_and_mode_off_restore_but_off_keeps_running() {
 #[test]
 fn server_absent_is_quiet_then_appears() {
     let port = quiet_port(1);
-    let mut w = Worker::spawn(port, &["--mode", "spectrum"]);
+    let mut w = Worker::spawn(port, &["--mode", "spectrum", "--synthetic-audio"]);
     let st = w.wait_status("server_absent", |s| s.state == State::ServerAbsent);
     assert!(!st.server.reachable && st.reason.is_none());
     // Several backoff periods (100..400 ms): still one state log line, no
@@ -631,7 +637,7 @@ fn server_absent_is_quiet_then_appears() {
 fn server_dying_mid_run_then_returning_keeps_original_modes() {
     let stub = StubServer::start(StubConfig::default()).unwrap();
     let port = stub.port();
-    let mut w = Worker::spawn(port, &["--mode", "spectrum"]);
+    let mut w = Worker::spawn(port, &["--mode", "spectrum", "--synthetic-audio"]);
     w.wait_status("controlled", |s| {
         s.devices.len() == 2 && s.devices.iter().all(|d| d.controlled)
     });
@@ -726,27 +732,28 @@ fn frame_missing_replaced_truncated_and_switched() {
     let st = w.wait_status("active, frame absent", |s| {
         s.state == State::Active && s.frame.state == FrameState::Absent
     });
-    assert!(st.devices[0].controlled);
-    assert!(wait_until(WAIT, || all_near(&colors(&stub, 0), BLACK, 0)));
+    assert!(!st.devices[0].controlled, "no frame, device left alone");
+    assert_eq!(st.reason.as_deref(), Some("waiting_for_source"));
 
     // Appears.
     let writer = write_frame(&a, |_| [255, 0, 0]);
     assert!(wait_until(WAIT, || all_near(&colors(&stub, 0), RED, 8)));
     w.wait_status("frame ok", |s| s.frame.state == FrameState::Ok);
 
-    // Removed (renderer replaced): hold, then fade towards black.
+    // Removed (renderer replaced): held, then released to the device's own
+    // mode — never faded to black.
     drop(writer);
     std::fs::remove_file(&a).unwrap();
     w.wait_new_status("frame absent", |s| s.frame.state == FrameState::Absent);
-    assert!(wait_until(WAIT, || colors(&stub, 0)
-        .iter()
-        .all(|c| c.r < 40)));
+    assert!(wait_until(WAIT, || stub.controllers()[0].active_mode == 2));
+    assert!(all_near(&colors(&stub, 0), RED, 8), "held colours, no fade");
 
     // Replaced by a new file at the same path (new inode, generation 1).
     let writer = write_frame(&a, |_| [0, 255, 0]);
     assert!(wait_until(WAIT, || all_near(&colors(&stub, 0), GREEN, 8)));
+    assert_eq!(stub.controllers()[0].active_mode, 0, "taken again");
 
-    // Truncated under the worker: invalid, worker alive, colours held.
+    // Truncated under the worker: invalid, worker alive.
     let f = std::fs::OpenOptions::new().write(true).open(&a).unwrap();
     f.set_len(100).unwrap();
     w.wait_new_status("frame invalid", |s| s.frame.state == FrameState::Invalid);
@@ -758,12 +765,10 @@ fn frame_missing_replaced_truncated_and_switched() {
     let _wb = write_frame(&b, |_| [0, 0, 255]);
     w.send(&encode_frame(Some(&b)).unwrap());
     assert!(wait_until(WAIT, || all_near(&colors(&stub, 0), BLUE, 8)));
-    // Cleared: no renderer live.
+    // Cleared: no renderer live → released after the hold.
     w.send(&encode_frame(None).unwrap());
     w.wait_new_status("frame none", |s| s.frame.state == FrameState::None);
-    assert!(wait_until(WAIT, || colors(&stub, 0)
-        .iter()
-        .all(|c| c.b < 40)));
+    assert!(wait_until(WAIT, || stub.controllers()[0].active_mode == 2));
     // The worker never held a descriptor on the frame files.
     let fds = std::fs::read_dir(format!("/proc/{}/fd", w.child.id())).unwrap();
     for fd in fds.flatten() {
@@ -896,4 +901,313 @@ fn standalone_with_closed_stdin_idles_instead_of_spinning() {
     );
     w.sigterm();
     assert!(w.wait_exit(Duration::from_secs(5)).success());
+}
+
+// ---------------------------------------------------------------------------
+// Review fixes A
+// ---------------------------------------------------------------------------
+
+fn untouched(stub: &StubServer) -> bool {
+    [
+        packet_id::SET_CUSTOM_MODE,
+        packet_id::UPDATE_LEDS,
+        packet_id::UPDATE_ZONE_LEDS,
+        packet_id::UPDATE_MODE,
+    ]
+    .iter()
+    .all(|id| !stub.received_ids().contains(id))
+        && stub.controllers().iter().all(|c| c.active_mode == 2)
+}
+
+/// MUST-FIX 1: connected with nothing to show (no wallpaper promoted, or
+/// spectrum without audio) never touches a device.
+#[test]
+fn no_source_never_takes_or_blanks_devices() {
+    for mode in ["ambient", "ambient+pulse", "spectrum"] {
+        let stub = StubServer::start(StubConfig::default()).unwrap();
+        let mut w = Worker::spawn(stub.port(), &["--mode", mode]);
+        w.send(&encode_frame(None).unwrap());
+        w.wait_status("connected", |s| {
+            s.state == State::Active && s.devices.len() == 2
+        });
+        thread::sleep(Duration::from_millis(1500));
+        assert!(untouched(&stub), "{mode}: {:?}", stub.received_ids());
+        w.send(&encode_status_request());
+        let st = w.wait_new_status("status", |_| true);
+        assert_eq!(st.reason.as_deref(), Some("waiting_for_source"), "{mode}");
+        assert_eq!(st.driven_count, 0);
+        assert!(st.devices.iter().all(|d| !d.controlled));
+        w.close_stdin();
+        assert!(w.wait_exit(Duration::from_secs(5)).success());
+        assert!(untouched(&stub), "{mode}: stop sent nothing either");
+        let r = w.last_status().unwrap().restore.unwrap();
+        assert_eq!(r.attempted, 0);
+    }
+}
+
+/// MUST-FIX 1: a source that appears is driven (exact driven_count), and
+/// ambient+pulse with a frame but no audio still shows steady ambient.
+#[test]
+fn source_appearing_is_driven_and_counted() {
+    let stub = StubServer::start(StubConfig::default()).unwrap();
+    let dir = temp_dir("appear");
+    let frame = dir.join("f.bin");
+    let mut w = Worker::spawn(stub.port(), &["--mode", "ambient+pulse"]);
+    w.wait_status("waiting", |s| {
+        s.reason.as_deref() == Some("waiting_for_source")
+    });
+    let _writer = write_frame(&frame, |_| [255, 0, 0]);
+    w.send(&encode_frame(Some(&frame)).unwrap());
+    assert!(wait_until(WAIT, || (0..2).all(|i| all_near(
+        &colors(&stub, i),
+        RED,
+        8
+    ))));
+    let st = w.wait_new_status("driving", |s| s.driven_count == 2);
+    assert!(st.reason.is_none() && !st.audio.fresh);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// MUST-FIX 2: SIGKILL leaves the devices in Direct; the next worker with
+/// the same `--saved-modes` file restores the user's ORIGINAL modes (not
+/// Direct) and removes the file after the clean restore.
+#[test]
+fn unclean_death_then_next_worker_restores_the_originals() {
+    let stub = StubServer::start(StubConfig::default()).unwrap();
+    let dir = temp_dir("saved");
+    let saved = dir.join("led-saved-modes.json");
+    let args = [
+        "--mode",
+        "spectrum",
+        "--synthetic-audio",
+        "--saved-modes",
+        saved.to_str().unwrap(),
+    ];
+    let mut a = Worker::spawn(stub.port(), &args);
+    a.wait_status("controlled", |s| {
+        s.devices.len() == 2 && s.devices.iter().all(|d| d.controlled)
+    });
+    let text = std::fs::read_to_string(&saved).expect("written before take-over");
+    assert!(text.contains("\"Rainbow\""), "{text}");
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(&saved).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    a.child.kill().unwrap();
+    a.child.wait().unwrap();
+    assert!(stub.controllers().iter().all(|c| c.active_mode == 0));
+
+    let mut b = Worker::spawn(stub.port(), &args);
+    b.wait_status("controlled again", |s| {
+        s.devices.len() == 2 && s.devices.iter().all(|d| d.controlled)
+    });
+    b.sigterm();
+    assert!(b.wait_exit(Duration::from_secs(5)).success());
+    assert!(
+        stub.controllers().iter().all(|c| c.active_mode == 2),
+        "originals restored: {:?}",
+        stub.controllers()
+            .iter()
+            .map(|c| c.active_mode)
+            .collect::<Vec<_>>()
+    );
+    assert!(!saved.exists(), "removed after a full restore");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// MUST-FIX 2: an adopted file is honoured even when no source ever
+/// arrives (the devices are released at once), and a corrupt file is
+/// ignored with one log line, never fatal.
+#[test]
+fn saved_modes_file_is_adopted_without_a_source_and_corrupt_is_ignored() {
+    let stub = StubServer::start(StubConfig::default()).unwrap();
+    let dir = temp_dir("saved2");
+    let saved = dir.join("s.json");
+    let args = [
+        "--mode",
+        "spectrum",
+        "--synthetic-audio",
+        "--saved-modes",
+        saved.to_str().unwrap(),
+    ];
+    let mut a = Worker::spawn(stub.port(), &args);
+    a.wait_status("controlled", |s| {
+        s.devices.len() == 2 && s.devices.iter().all(|d| d.controlled)
+    });
+    a.child.kill().unwrap();
+    a.child.wait().unwrap();
+    assert!(stub.controllers().iter().all(|c| c.active_mode == 0));
+    // Next worker: ambient, no frame → never drives, but gives back.
+    let mut b = Worker::spawn(
+        stub.port(),
+        &[
+            "--mode",
+            "ambient",
+            "--saved-modes",
+            saved.to_str().unwrap(),
+        ],
+    );
+    assert!(wait_until(WAIT, || stub
+        .controllers()
+        .iter()
+        .all(|c| c.active_mode == 2)));
+    assert!(wait_until(WAIT, || !saved.exists()));
+    b.close_stdin();
+    assert!(b.wait_exit(Duration::from_secs(5)).success());
+
+    std::fs::write(&saved, b"{garbage").unwrap();
+    let mut c = Worker::spawn(
+        stub.port(),
+        &[
+            "--mode",
+            "ambient",
+            "--saved-modes",
+            saved.to_str().unwrap(),
+        ],
+    );
+    c.wait_status("running", |s| s.state == State::Active);
+    assert!(
+        !saved.exists(),
+        "corrupt file removed (replaced on next write)"
+    );
+    let lines: Vec<String> = c
+        .stderr
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|l| l.contains("led.saved_modes"))
+        .cloned()
+        .collect();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("reason=not_json"), "{lines:?}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// R1: a slow-but-alive server (each post-switch re-read takes 400 ms, under
+/// the 500 ms request timeout) with many devices: SIGTERM still ends the
+/// worker well inside the daemon's 4 s grace, with the restore attempted.
+#[test]
+fn sigterm_during_slow_take_over_of_many_devices_is_bounded() {
+    let controllers: Vec<Controller> = (0..24)
+        .map(|i| sample_controller(&format!("Dev {i}"), &[("A", 2)]))
+        .collect();
+    let stub = StubServer::start(StubConfig {
+        controllers,
+        fault: Fault::StallAfterCustomMode(Duration::from_millis(400)),
+        ..StubConfig::default()
+    })
+    .unwrap();
+    let mut w = Worker::spawn(stub.port(), &["--mode", "spectrum", "--synthetic-audio"]);
+    assert!(wait_until(WAIT, || stub
+        .received_ids()
+        .contains(&packet_id::SET_CUSTOM_MODE)));
+    let t0 = Instant::now();
+    w.sigterm();
+    assert!(w.wait_exit(Duration::from_secs(20)).success());
+    let took = t0.elapsed();
+    eprintln!("slow take-over stop took {took:?}");
+    // Documented worst case 3.35 s (LED_PROTOCOL_V1.md); this path is
+    // one in-flight 400 ms re-read + a fire-and-forget restore.
+    assert!(took < Duration::from_millis(3350), "stop took {took:?}");
+    let last = w.last_status().unwrap();
+    let r = last.restore.expect("restore summary");
+    assert!(r.attempted >= 1 && r.restored == r.attempted, "{r:?}");
+    assert!(!r.timed_out);
+    assert_eq!(stub.controllers()[0].active_mode, 2, "first device back");
+}
+
+fn voluntary_switches(pid: u32) -> u64 {
+    let mut total = 0;
+    for task in std::fs::read_dir(format!("/proc/{pid}/task"))
+        .unwrap()
+        .flatten()
+    {
+        if let Ok(text) = std::fs::read_to_string(task.path().join("status")) {
+            for line in text.lines() {
+                if let Some(v) = line.strip_prefix("voluntary_ctxt_switches:") {
+                    total += v.trim().parse::<u64>().unwrap_or(0);
+                }
+            }
+        }
+    }
+    total
+}
+
+/// R3: with no OpenRGB the worker sleeps until its next probe or a control
+/// line (no 50 ms polling, no frame reads), yet still answers SIGTERM at
+/// once.
+#[test]
+fn idle_without_openrgb_is_quiet_and_still_stops_promptly() {
+    let port = quiet_port(7);
+    let dir = temp_dir("idle");
+    let frame = dir.join("f.bin");
+    let _writer = write_frame(&frame, |_| [255, 0, 0]);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kwe-led-worker"))
+        .args([
+            "--port",
+            &port.to_string(),
+            "--frame",
+            frame.to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(500));
+    let pid = child.id();
+    let before = voluntary_switches(pid);
+    thread::sleep(Duration::from_secs(4));
+    let used = voluntary_switches(pid) - before;
+    eprintln!("idle (no server) voluntary context switches in 4 s: {used}");
+    // Old loop: ~80 in 4 s (50 ms wake + per-tick frame open). Now: the
+    // probes (1 s, 2 s, 4 s backoff) and one 5 s heartbeat.
+    assert!(used <= 30, "{used} switches in 4 s");
+    let t0 = Instant::now();
+    // SAFETY: our own child.
+    unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+    let status = child.wait().unwrap();
+    assert!(status.success());
+    assert!(
+        t0.elapsed() < Duration::from_millis(500),
+        "{:?}",
+        t0.elapsed()
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// NIT: a device name with a newline cannot forge a log line.
+#[test]
+fn server_strings_cannot_inject_log_lines() {
+    let mut evil = sample_controller("Evil\nevent=led.fatal detail=forged", &[("A", 1)]);
+    evil.modes.truncate(2); // Rainbow saved index 2 then vanishes below
+    evil.active_mode = 1;
+    let stub = StubServer::start(StubConfig {
+        controllers: vec![evil],
+        ..StubConfig::default()
+    })
+    .unwrap();
+    let mut w = Worker::spawn(stub.port(), &["--mode", "spectrum", "--synthetic-audio"]);
+    w.wait_status("controlled", |s| {
+        s.devices.len() == 1 && s.devices.iter().all(|d| d.controlled)
+    });
+    let mut list = stub.controllers();
+    list[0].modes.truncate(1); // remembered Static vanished → restore error logged
+    stub.set_controllers(list);
+    stub.notify_device_list_updated();
+    w.config(ConfigPatch {
+        mode: Some(Mode::Off),
+        ..ConfigPatch::default()
+    });
+    assert!(wait_until(WAIT, || w
+        .stderr
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|l| l.contains("op=restore"))));
+    let log = w.stderr.lock().unwrap().clone();
+    assert!(log.iter().all(|l| l.starts_with("event=led.")), "{log:?}");
+    assert!(
+        !log.iter().any(|l| l.starts_with("event=led.fatal")),
+        "{log:?}"
+    );
 }

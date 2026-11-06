@@ -245,6 +245,7 @@ private slots:
         QTest::newRow("connecting") << "connecting" << QString() << false;
         QTest::newRow("server_absent") << "server_absent" << QString() << false;
         QTest::newRow("active") << "active" << QString() << false;
+        QTest::newRow("active_waiting") << "active" << "waiting_for_source" << false;
         QTest::newRow("off_paused") << "off" << "paused" << true;
         QTest::newRow("off_user") << "off" << QString() << false;
         QTest::newRow("degraded") << "degraded" << "timeout" << false;
@@ -281,6 +282,7 @@ private slots:
         QCOMPARE(client.protocolVersion(), 4);
         QCOMPARE(client.sdkPort(), 6742);
         QCOMPARE(client.deviceCount(), 2);
+        QCOMPARE(client.drivenCount(), -1); // not reported by this worker line
         QVERIFY(!client.devicesTruncated());
         QVERIFY(!client.audioFresh());
         const auto devices = client.devices();
@@ -293,6 +295,29 @@ private slots:
         QCOMPARE(devices.at(1).toMap().value(QStringLiteral("vendor")).toString(), QString());
         QVERIFY(client.isDeviceEnabled(KeyboardId));
         QVERIFY(!client.isDeviceEnabled(StripId));
+    }
+
+    void drivenCountIsTheWorkersExactNumber() {
+        m_daemon.state = QStringLiteral("active");
+        auto line = workerStatus(
+            QStringLiteral("active"),
+            QJsonArray{device(KeyboardId, QStringLiteral("Keyboard"), QString(), 104),
+                       device(StripId, QStringLiteral("Strip"), QString(), 30)},
+            false, 2, false);
+        line.insert(QStringLiteral("driven_count"), 1);
+        m_daemon.workerStatus = line;
+        LedSyncClient client(m_socketPath);
+        client.refresh();
+        QTRY_COMPARE(client.drivenCount(), 1);
+        QCOMPARE(client.deviceCount(), 2);
+        // Waiting for a source: connected, nothing driven.
+        m_daemon.reason = QStringLiteral("waiting_for_source");
+        line.insert(QStringLiteral("driven_count"), 0);
+        line.insert(QStringLiteral("reason"), QStringLiteral("waiting_for_source"));
+        m_daemon.workerStatus = line;
+        client.refresh();
+        QTRY_COMPARE(client.reason(), QStringLiteral("waiting_for_source"));
+        QCOMPARE(client.drivenCount(), 0);
     }
 
     void truncatedDeviceListIsFlagged() {

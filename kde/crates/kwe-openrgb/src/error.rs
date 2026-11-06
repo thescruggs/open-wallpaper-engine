@@ -50,6 +50,10 @@ pub enum Error {
     /// A device whose mode was saved is no longer present (restore only).
     #[error("device is no longer present")]
     DeviceGone,
+    /// The remembered mode no longer exists on the device (restore only):
+    /// its index is out of range or names a different mode now.
+    #[error("the remembered mode no longer exists on this device")]
+    ModeGone,
     #[error("invalid argument: {0}")]
     InvalidArgument(&'static str),
 }
@@ -58,6 +62,13 @@ impl Error {
     /// The quiet, expected "no SDK server" outcome.
     pub fn is_server_absent(&self) -> bool {
         matches!(self, Error::ServerAbsent { .. })
+    }
+
+    /// True for the restore outcomes after which a remembered mode can never
+    /// be applied again ([`Error::DeviceGone`], [`Error::ModeGone`]), so it
+    /// is dropped. Every other restore error keeps it for a later attempt.
+    pub fn drops_saved_mode(&self) -> bool {
+        matches!(self, Error::DeviceGone | Error::ModeGone)
     }
 
     /// True when the connection must be dropped and re-established.

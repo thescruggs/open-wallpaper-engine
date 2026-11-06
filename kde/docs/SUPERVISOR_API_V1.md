@@ -356,7 +356,11 @@ An invalid `led` record in the file (bad bounds, unknown mode or field)
 quarantines the file like any other schema violation. `settings.set
 {"led": {"enabled": false}}` stops the worker (SIGTERM / stdin EOF → the
 worker restores every device it controlled; 4 s grace, then SIGKILL);
-`enabled: true` spawns it with a fresh restart budget. Every other field
+`enabled: true` spawns it with a fresh restart budget. Every spawn passes
+`--saved-modes <state_dir>/led-saved-modes.json` (review fixes A): the
+worker persists the devices' pre-control modes there before taking a device
+over, so a worker that was SIGKILLed / crashed / OOM-killed is cleaned up by
+the next one (format and rules in `LED_PROTOCOL_V1.md`). Every other field
 reaches the running worker as one merged `led_config` line — no respawn.
 
 Daemon flags: `--led-worker <path>` (default `kwe-led-worker` beside the
@@ -424,7 +428,8 @@ RPCs):
 | `starting` | `null` \| `restarting` \| `worker_stopping` | spawned but no status line yet / between restarts / previous worker still restoring |
 | `connecting` | `null` | worker's first probe in flight |
 | `server_absent` | `null` | **normal**: no SDK server on loopback — "enable OpenRGB's SDK server (SDK Server tab) or run `openrgb --server`" |
-| `active` | `null` | driving the enabled devices (`device_count` may be 0) |
+| `active` | `null` | driving the enabled devices (`device_count` may be 0; `worker_status.driven_count` = devices driven) |
+| `active` | `waiting_for_source` | connected, **no device taken over**: the mode has nothing to show yet (no frame for `ambient`/`ambient+pulse`, no fresh audio for `spectrum`); passed through from the worker |
 | `off` | `paused` \| `null` | connected, devices restored: by the pause verdict, or the user chose mode `off` |
 | `degraded` | worker reason (`timeout`, `disconnected`, `io_error`, `protocol_error`, `unsupported_version`, `device_error`, `error`) \| `worker_unresponsive` | re-probing / worker silent ≥ 15 s |
 

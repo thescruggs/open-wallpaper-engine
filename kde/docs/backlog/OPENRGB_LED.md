@@ -129,6 +129,58 @@
     for `worker_restarting`); the stock unit still runs without
     `--audio-capture`, so on a stock install audio modes show the
     no-audio hint (L3 correction 1).
+- **Review fixes A — done (uncommitted, 2026-11-06), live check pending.**
+  Adversarial review of L1–L4; worker + client + minimal daemon wiring.
+  Bar: the user's own lighting is never lost or blanked by LED sync. Each
+  regression test below was run against pre-fix HEAD `1ae2185` (scratch
+  worktree; tests reduced to the old API) and **failed** there.
+  - MUST-FIX 1 — CLOSED. No device is taken over until the mode has a real
+    source (valid frame ≤ 2 s for the ambient modes, audio for spectrum);
+    when it goes away: 2 s hold, then release (restore, as for `off`), no
+    fade to black; status `active` + reason `waiting_for_source`, new
+    `driven_count`. Daemon passes the reason through; manager row + exact
+    count. Tests `no_source_never_takes_or_blanks_devices`,
+    `source_appearing_is_driven_and_counted`,
+    `spectrum_reacts_to_audio_lines_and_releases_without_them`.
+  - MUST-FIX 2 — CLOSED. `kwe-led-worker --saved-modes <ABS>` (atomic,
+    0600, ≤ 8 MiB, versioned JSON) written before each take-over, removed
+    after a full restore, adopted on start; stale entries (device left the
+    recorded per-LED mode) forgotten; corrupt file → one log line, removed.
+    Daemon passes `<state_dir>/led-saved-modes.json` (one line in
+    `supervisor.rs`: `led.set_state_dir(&config.state_dir)`). Direct-origin
+    devices remembered as Direct + colours. Tests
+    `unclean_death_then_next_worker_restores_the_originals`,
+    `saved_modes_file_is_adopted_without_a_source_and_corrupt_is_ignored`,
+    daemon `real_worker_killed_mid_drive_is_cleaned_up_by_its_successor`,
+    `saved::tests::*`.
+  - MUST-FIX 3 — CLOSED. Restore keeps the entry unless device/mode gone;
+    one refresh + retry on a list change; off/release/disable paths keep
+    failures and carry them across connections and into the file. Tests
+    `restore_all_keeps_modes_when_the_connection_is_lost`,
+    `restore_all_under_a_notification_storm_never_drops_a_mode`,
+    `restore_one_keeps_mode_on_error`.
+  - R1 — CLOSED. Stop checked between connect and enumerate, between
+    devices (0.5 s per-tick budget, round-robin), before restore; no driving
+    in the connecting tick; signals via a `sigwait` thread. Documented worst
+    case 3.35 s. Test `sigterm_during_slow_take_over_of_many_devices_is_bounded`
+    (old: 9.66 s, new: 0.45 s).
+  - R3 — CLOSED. No frame reads / no polling while disconnected; 4 Hz idle
+    while waiting, 1 Hz in `off`. Release build, 10 s, all threads:
+    disconnected 201 → 6, mode off 201 → 14, connected no source 201 → 44.
+    Test `idle_without_openrgb_is_quiet_and_still_stops_promptly`.
+  - R4 — CLOSED. `MAX_ENUMERATION_BYTES` 16 MiB (estimated retained size),
+    `LimitExceeded {what: "enumeration bytes"}`. Test
+    `enumeration_total_bytes_are_budgeted`.
+  - NIT log injection — CLOSED (`{:?}` names + control chars escaped in
+    `log.rs`; test `server_strings_cannot_inject_log_lines`).
+  - NIT `--probe` budget — CLOSED (enumeration ≤ 2 s → ≈ 3.3 s worst case).
+  - NIT ids — PARTIAL. Identical `DeviceKey`s saved/restored separately
+    (occurrence); settings id drops `location` when a serial is present
+    (**id change** for such devices); serial-less devices still change id
+    when their location changes (documented limit).
+  - Not in this slice (second agent): smoke scripts, `check.sh`, settings
+    quarantine, audio-capture policy, restart-budget docs, daemon test
+    skipping.
 - L5: pending.
 
 Requested 2026-08-29: drive OpenRGB-controlled devices (keyboard, case

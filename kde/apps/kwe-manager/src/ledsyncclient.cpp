@@ -416,6 +416,7 @@ void LedSyncClient::applyStatus(const QJsonObject &status) {
     }
     m_devices = devices;
     m_deviceCount = workerStatus.value(QStringLiteral("device_count")).toInt(int(devices.size()));
+    m_drivenCount = workerStatus.value(QStringLiteral("driven_count")).toInt(-1);
     emit statusChanged();
 
     if (status.value(QStringLiteral("settings")).isObject())

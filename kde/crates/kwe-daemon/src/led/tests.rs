@@ -663,3 +663,89 @@ fn real_worker_crash_is_restarted_within_the_budget() {
         led.status().state == "server_absent"
     });
 }
+
+// --------------------------------------------------------------------------
+// Review fixes A
+// --------------------------------------------------------------------------
+
+#[test]
+fn saved_modes_path_rides_the_argv_and_waiting_reason_passes_through() {
+    let root = temporary_directory("saved-argv");
+    let status = status_json("active", "ambient")
+        .replace(r#""reason":null"#, r#""reason":"waiting_for_source""#);
+    let body = format!(
+        "printf '%s\\n' \"$@\" > \"$0.argv\"\nprintf '%s\\n' '{status}'\nexec /bin/cat > \"$0.stdin\""
+    );
+    let worker = fake_worker(&root, &body);
+    let mut led = manager(&worker, LedSettings::default());
+    let state = root.join("state");
+    led.set_state_dir(&state);
+    tick_until(&mut led, "waiting", |led| {
+        led.status().reason.as_deref() == Some("waiting_for_source")
+    });
+    assert_eq!(led.status().state, "active");
+    let argv = fs::read_to_string(format!("{}.argv", worker.display())).unwrap();
+    let args: Vec<&str> = argv.lines().collect();
+    let at = args.iter().position(|a| *a == "--saved-modes").unwrap();
+    assert_eq!(
+        Path::new(args[at + 1]),
+        state.join(SAVED_MODES_FILE).as_path()
+    );
+    drop(led);
+    fs::remove_dir_all(root).ok();
+}
+
+/// MUST-FIX 2 through the daemon: a worker SIGKILLed while driving leaves
+/// the devices in Direct; the respawned worker (same state directory)
+/// gives the user's original modes back on disable.
+#[test]
+fn real_worker_killed_mid_drive_is_cleaned_up_by_its_successor() {
+    let Some(binary) = real_worker() else {
+        return;
+    };
+    let stub = StubServer::start(StubConfig::default()).unwrap();
+    let root = temporary_directory("real-kill");
+    let frame = root.join("frame.bin");
+    let _writer = write_frame(&frame);
+    let mut led = LedManager::new(
+        Some(LedWorkerConfig {
+            worker_path: binary,
+            port: Some(stub.port()),
+        }),
+        LedSettings::default(),
+    );
+    led.set_timings_for_test(fast_timings());
+    led.set_state_dir(&root);
+    led.set_frame(Some(&frame));
+    tick_until(&mut led, "driving", |_| {
+        stub.controllers().iter().all(|c| c.active_mode == 0)
+    });
+    assert!(root.join(SAVED_MODES_FILE).is_file());
+    let pid = led.running_pid().unwrap();
+    // SAFETY: a crash stand-in for our own child.
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+    tick_until(&mut led, "respawned and driving", |led| {
+        led.running_pid().is_some_and(|p| p != pid)
+            && led
+                .status()
+                .worker_status
+                .is_some_and(|s| s.driven_count == 2)
+    });
+    led.set_settings(LedSettings {
+        enabled: false,
+        ..LedSettings::default()
+    });
+    tick_until(&mut led, "stopped", |led| !led.is_stopping());
+    assert!(
+        stub.controllers().iter().all(|c| c.active_mode == 2),
+        "originals, not Direct: {:?}",
+        stub.controllers()
+            .iter()
+            .map(|c| c.active_mode)
+            .collect::<Vec<_>>()
+    );
+    assert!(!root.join(SAVED_MODES_FILE).exists());
+    fs::remove_dir_all(root).ok();
+}

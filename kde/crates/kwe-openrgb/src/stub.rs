@@ -47,6 +47,10 @@ pub enum Fault {
     /// Send each controller-data reply one byte at a time, sleeping this
     /// long between bytes.
     DripFeed(Duration),
+    /// Sleep this long before a controller-data reply that directly follows
+    /// a `SetCustomMode` for the same device (the client's re-read after
+    /// taking control). Enumeration stays fast: a slow-but-alive server.
+    StallAfterCustomMode(Duration),
 }
 
 #[derive(Debug, Clone)]
@@ -364,6 +368,7 @@ fn handle_connection(
         lock(writer).write_all(&encode_packet(dev, id, payload))
     };
     let mut negotiated = 0u32;
+    let mut after_custom_mode: Option<u32> = None;
     loop {
         let mut header = [0u8; HEADER_LEN];
         if !read_full(&mut stream, &mut header, stop)? {
@@ -393,6 +398,7 @@ fn handle_connection(
             }
             (s.fault.clone(), s.protocol_version, s.ack_updates)
         };
+        let follows_custom_mode = after_custom_mode.take() == Some(dev_id);
         match id {
             packet_id::REQUEST_PROTOCOL_VERSION => {
                 let client = word(&payload, 0).unwrap_or(0);
@@ -426,6 +432,12 @@ fn handle_connection(
                 let Some(body) = body else {
                     continue;
                 };
+                if let Fault::StallAfterCustomMode(d) = fault
+                    && follows_custom_mode
+                    && !sleep_unless_stopped(d, stop)
+                {
+                    return Ok(());
+                }
                 if !send_controller_reply(&mut stream, writer, dev_id, body, &fault, stop)? {
                     return Ok(());
                 }
@@ -459,6 +471,7 @@ fn handle_connection(
                 }
             }
             packet_id::SET_CUSTOM_MODE => {
+                after_custom_mode = Some(dev_id);
                 let mut s = lock(shared);
                 if let Some(c) = s.controllers.get_mut(dev_id as usize) {
                     let pick = ["direct", "custom", "static"].iter().find_map(|want| {
@@ -569,7 +582,10 @@ fn send_controller_reply(
                 lock(writer).write_all(&[byte])?;
             }
         }
-        Fault::None | Fault::NoVersionReply | Fault::HugeControllerCount => {
+        Fault::None
+        | Fault::NoVersionReply
+        | Fault::HugeControllerCount
+        | Fault::StallAfterCustomMode(_) => {
             lock(writer).write_all(&encode_packet(dev_id, id, &body))?;
         }
     }

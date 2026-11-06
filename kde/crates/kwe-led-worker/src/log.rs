@@ -55,7 +55,19 @@ impl LogLimiter {
             line.push_str(&format!(" suppressed={}", self.suppressed));
             self.suppressed = 0;
         }
-        let line: String = line.chars().take(MAX_LINE_CHARS).collect();
+        // One event = one line: control characters (a server-supplied
+        // device name with a newline, ...) are escaped, never written raw.
+        let line: String = line
+            .chars()
+            .flat_map(|c| -> Box<dyn Iterator<Item = char>> {
+                if c.is_control() {
+                    Box::new(c.escape_default())
+                } else {
+                    Box::new(std::iter::once(c))
+                }
+            })
+            .take(MAX_LINE_CHARS)
+            .collect();
         if self.enabled {
             eprintln!("{line}");
         }
@@ -86,6 +98,12 @@ mod tests {
             assert!(l.log(later, "x", "a").is_some());
         }
         assert!(l.log(later, "x", "a").is_none());
+        let mut l = LogLimiter::silent(t0);
+        let line = l
+            .log(t0, "x", "device=Kbd\nevent=led.fatal forged\r\u{1b}[2J")
+            .unwrap();
+        assert!(!line.chars().any(char::is_control), "{line:?}");
+        assert!(line.contains("\\n"), "{line:?}");
         let long = "y".repeat(5000);
         let mut l = LogLimiter::silent(t0);
         assert!(l.log(t0, "x", &long).unwrap().chars().count() <= MAX_LINE_CHARS);

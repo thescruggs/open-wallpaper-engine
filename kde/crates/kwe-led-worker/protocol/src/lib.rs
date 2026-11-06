@@ -80,11 +80,32 @@ impl Mode {
     }
 }
 
-/// Stable identifier of a physical device: FNV-1a 64 over
-/// `name NUL vendor NUL serial NUL location` (the OpenRGB client's
-/// `DeviceKey`), as 16 lowercase hex digits. Deterministic across runs,
-/// processes, and controller re-ordering.
+/// Settings identifier of a physical device (`disabled_devices`, status
+/// `devices[].id`): FNV-1a 64 over `name NUL vendor NUL serial NUL
+/// location`, as 16 lowercase hex digits — **except that `location` is
+/// left out (hashed as empty) when the device reports a non-empty serial**.
+/// Locations such as `/dev/hidraw3` change on replug/reboot, which would
+/// silently re-enable a device the user disabled; a serial identifies the
+/// unit by itself. Devices without a serial keep the location (it is the
+/// only thing telling two identical units apart), so their ids still change
+/// when the location does. Two units with the same name, vendor and serial
+/// share one id (disabling one disables both).
+///
+/// Deterministic across runs, processes, and controller re-ordering.
 pub fn device_id(name: &str, vendor: &str, serial: &str, location: &str) -> String {
+    let location = if serial.trim().is_empty() {
+        location
+    } else {
+        ""
+    };
+    device_key_hash(name, vendor, serial, location)
+}
+
+/// FNV-1a 64 over all four key strings (`name NUL vendor NUL serial NUL
+/// location`), 16 lowercase hex digits. The worker uses it (plus an
+/// occurrence index) to tell individual controllers apart internally; it is
+/// not a settings id — see [`device_id`].
+pub fn device_key_hash(name: &str, vendor: &str, serial: &str, location: &str) -> String {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut hash = OFFSET;
@@ -411,7 +432,10 @@ pub enum State {
     ServerAbsent,
     /// Before the first probe completed.
     Connecting,
-    /// Connected and enumerated; driving the enabled devices.
+    /// Connected and enumerated. Driving the enabled devices when `reason`
+    /// is `null`; with reason `waiting_for_source` no device is taken over
+    /// (the mode has nothing real to show yet: no frame for `ambient` /
+    /// `ambient+pulse`, no fresh audio for `spectrum`).
     Active,
     /// Connection dropped or refused for a reason other than absence; see
     /// `reason`. The worker keeps re-probing.
@@ -536,8 +560,9 @@ pub struct StatusLine {
     /// Increments by one per emitted line.
     pub seq: u64,
     pub state: State,
-    /// Machine-readable cause for `degraded` (and the last stop cause on the
-    /// final `stopped` line); `null` otherwise.
+    /// Machine-readable cause for `degraded`, `waiting_for_source` on
+    /// `active` while no device is driven, the last stop cause on the final
+    /// `stopped` line; `null` otherwise.
     pub reason: Option<String>,
     pub mode: Mode,
     pub brightness: u8,
@@ -546,6 +571,12 @@ pub struct StatusLine {
     pub frame: FrameInfo,
     pub audio: AudioInfo,
     pub device_count: u32,
+    /// Devices this worker is sending colours to right now (in its per-LED
+    /// mode and driven this state). 0 while waiting for a source, in mode
+    /// `off`, and while not connected. Additive in v1: absent on lines of
+    /// older workers (decodes as 0).
+    #[serde(default)]
+    pub driven_count: u32,
     pub devices: Vec<DeviceInfo>,
     pub devices_truncated: bool,
     pub counters: Counters,
@@ -625,10 +656,27 @@ mod tests {
         assert_eq!(a, device_id("Kbd", "Vendor", "SN", "loc"));
         assert!(is_device_id(&a));
         assert_ne!(a, device_id("KbdV", "endor", "SN", "loc"));
-        assert_ne!(a, device_id("Kbd", "Vendor", "SN", "loc2"));
-        // Pinned value: changing the hash would silently re-enable every
-        // device a user disabled.
+        // A serial identifies the unit: the location (replug/reboot) does
+        // not change the id ...
+        assert_eq!(a, device_id("Kbd", "Vendor", "SN", "loc2"));
+        // ... without a serial the location is all that tells units apart.
+        assert_ne!(
+            device_id("Kbd", "Vendor", "", "loc"),
+            device_id("Kbd", "Vendor", "", "loc2")
+        );
+        assert_ne!(
+            device_key_hash("Kbd", "Vendor", "SN", "loc"),
+            device_key_hash("Kbd", "Vendor", "SN", "loc2")
+        );
+        // Pinned values: changing the hash would silently re-enable every
+        // device a user disabled. Serial-less ids are the original
+        // derivation; serial ids hash the location as empty.
         assert_eq!(device_id("", "", "", ""), "d94d12186c0f2fb7");
+        assert_eq!(device_key_hash("", "", "", ""), "d94d12186c0f2fb7");
+        assert_eq!(
+            device_id("Kbd", "Vendor", "SN", "anything"),
+            device_key_hash("Kbd", "Vendor", "SN", "")
+        );
     }
 
     #[test]
@@ -773,11 +821,20 @@ mod tests {
                 bands: None,
             },
             device_count: devices.len() as u32,
+            driven_count: 0,
             devices,
             devices_truncated: false,
             counters: Counters::default(),
             restore: None,
         }
+    }
+
+    #[test]
+    fn status_from_an_older_worker_without_driven_count_decodes() {
+        let mut value = serde_json::to_value(sample_status(vec![])).unwrap();
+        value.as_object_mut().unwrap().remove("driven_count");
+        let back = decode_status(value.to_string().as_bytes()).unwrap();
+        assert_eq!(back.driven_count, 0);
     }
 
     #[test]

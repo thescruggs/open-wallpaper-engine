@@ -20,11 +20,11 @@ use serde_json::{Value, json};
 
 static TERMINATED: AtomicBool = AtomicBool::new(false);
 
-extern "C" fn on_signal(_signal: libc::c_int) {
-    TERMINATED.store(true, Ordering::Release);
-}
-
 const PROBE_MAX_OUTPUT_BYTES: usize = 64 * 1024;
+/// `--probe` enumeration budget: with the 250 ms connect and the default
+/// 1 s `--timeout-ms` for the version exchange, the probe ends within
+/// ≈ 3.3 s even against a stalling server — inside `kwe diagnose`'s 5 s.
+const PROBE_ENUMERATE_BUDGET: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -70,9 +70,16 @@ struct Args {
     /// Re-probe delay cap.
     #[arg(long, default_value_t = 60_000, hide = true, value_parser = clap::value_parser!(u64).range(50..=60_000))]
     backoff_max_ms: u64,
-    /// `--probe` I/O timeout.
+    /// `--probe` I/O timeout (the whole probe is additionally bounded by a
+    /// 2 s enumeration budget).
     #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u64).range(1..=30_000))]
     timeout_ms: u64,
+    /// Persist the devices' previous modes here (absolute path; written
+    /// before a device is taken over, removed once all are restored) so a
+    /// worker that died without restoring is cleaned up by the next one.
+    /// Without it, remembered modes live in memory only.
+    #[arg(long, value_parser = parse_frame)]
+    saved_modes: Option<PathBuf>,
 }
 
 fn parse_mode(text: &str) -> Result<Mode, String> {
@@ -95,8 +102,9 @@ fn probe(args: &Args) -> i32 {
     let config = ClientConfig {
         port: args.port,
         client_name: "KDE Wallpaper Engine LED probe".into(),
+        connect_timeout: Duration::from_millis(250),
         io_timeout: Duration::from_millis(args.timeout_ms),
-        ..ClientConfig::default()
+        enumerate_budget: PROBE_ENUMERATE_BUDGET.min(Duration::from_millis(args.timeout_ms * 2)),
     };
     let mut out = json!({
         "version": kwe_led_protocol::VERSION,
@@ -169,14 +177,22 @@ fn main() {
         std::process::exit(probe(&args));
     }
 
-    // SAFETY: the handler only stores to a static atomic, which is
-    // async-signal-safe. Installed before any other thread starts. This is
-    // the crate's only unsafe code (same pattern as kwe-audio-worker);
-    // std offers no signal API, and SIGTERM must trigger the device
-    // restore.
-    unsafe {
-        libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
+    // Termination signals are handled by a dedicated thread (`sigwait`), so
+    // the main loop can sleep until its next deadline — up to a minute
+    // while OpenRGB is absent — and still react to SIGTERM at once.
+    // SAFETY: plain libc calls on a local, zero-initialised sigset_t, made
+    // before any other thread exists, so every thread inherits the mask.
+    // This is the crate's only unsafe code (std offers no signal API).
+    let mut signals: libc::sigset_t = unsafe { std::mem::zeroed() };
+    let masked = unsafe {
+        libc::sigemptyset(&mut signals) == 0
+            && libc::sigaddset(&mut signals, libc::SIGTERM) == 0
+            && libc::sigaddset(&mut signals, libc::SIGINT) == 0
+            && libc::pthread_sigmask(libc::SIG_BLOCK, &signals, std::ptr::null_mut()) == 0
+    };
+    if !masked {
+        eprintln!("event=led.fatal detail=signal_mask");
+        std::process::exit(1);
     }
 
     let now = Instant::now();
@@ -189,9 +205,33 @@ fn main() {
         rate_hz: args.rate_hz,
         disabled: args.disable_device.iter().cloned().collect(),
     };
-    let engine = Engine::new(cfg, settings, args.frame.clone(), now, LogLimiter::new(now));
+    let mut engine = Engine::new(cfg, settings, args.frame.clone(), now, LogLimiter::new(now));
+    if let Some(path) = args.saved_modes.clone() {
+        engine = engine.with_saved_modes(path, now);
+    }
 
     let shared = Shared::new();
+    let signal_shared = Arc::clone(&shared);
+    if std::thread::Builder::new()
+        .name("kwe-led-signal".into())
+        .spawn(move || {
+            loop {
+                let mut signal: libc::c_int = 0;
+                // SAFETY: `signals` is a valid, initialised set blocked in
+                // every thread; sigwait only writes the signal number.
+                if unsafe { libc::sigwait(&signals, &mut signal) } != 0 {
+                    eprintln!("event=led.fatal detail=sigwait");
+                    break;
+                }
+                TERMINATED.store(true, Ordering::Release);
+                signal_shared.terminate();
+            }
+        })
+        .is_err()
+    {
+        eprintln!("event=led.fatal detail=signal_thread");
+        std::process::exit(1);
+    }
     let reader_shared = Arc::clone(&shared);
     if std::thread::Builder::new()
         .name("kwe-led-stdin".into())

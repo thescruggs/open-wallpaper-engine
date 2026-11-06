@@ -1131,7 +1131,8 @@ impl SupervisorRuntime {
                 .unwrap_or_default(),
         );
         display_power.set_enabled(settings_store.pause_when_display_off());
-        let led = LedManager::new(config.led_worker.clone(), settings_store.led().clone());
+        let mut led = LedManager::new(config.led_worker.clone(), settings_store.led().clone());
+        led.set_state_dir(&config.state_dir);
         Self {
             config,
             store,
