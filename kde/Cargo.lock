@@ -336,6 +336,7 @@ name = "kwe-led-worker"
 version = "0.1.0-alpha.1"
 dependencies = [
  "clap",
+ "kwe-core",
  "kwe-frame-protocol",
  "kwe-input-protocol",
  "kwe-led-protocol",

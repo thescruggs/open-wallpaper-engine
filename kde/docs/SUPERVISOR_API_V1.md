@@ -408,6 +408,24 @@ is still not reaped 2 s after SIGKILL (uninterruptible sleep) is given up on
 with one `event=led.worker.unreaped` line, so neither a supervisor tick nor
 daemon shutdown waits forever.
 
+Restore-only pass (review fixes D, R-a): when a worker ended uncleanly
+(non-zero exit, signal, wedged, SIGKILLed at the stop grace) and no
+successor will adopt the saved-modes file — the restart budget is
+exhausted, `led.enabled` was turned off, or the daemon is shutting down
+before the respawn — the daemon runs `kwe-led-worker --restore-saved
+--saved-modes <file> [--port N]` once (same spawn hardening, stdin and
+stdout `/dev/null`). It restores the remembered devices' ORIGINAL modes
+under the normal trust rules and never takes a device over
+(`LED_PROTOCOL_V1.md` §Remembered modes file). Bounded: SIGKILL after 3 s
+(`RESTORE_PASS_LIMIT`; the worker itself ends within ≈ 2.5 s), reaped from
+the supervisor tick, never awaited there; at shutdown it is awaited in
+place for at most the rest of `stop grace + 0.5 s` (≥ 0.5 s, ≤ 3 s). It is
+never a restart strike, is skipped entirely when no saved-modes file
+exists or no worker binary is runnable, and a normal spawn waits for it to
+finish (≤ 3 s). Log lines: `event=led.worker.restore_pass pid=N
+detail=started|finished exit=...|killed_at_limit`. Not surfaced in
+`led.status`.
+
 Feeding, all latest-wins and nonblocking (one pending line per stream, a
 full pipe never blocks the supervisor thread, audio to the renderer, or
 RPCs):

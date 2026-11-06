@@ -162,21 +162,88 @@ pub fn ambient_zone(grid: &Grid, shape: &ZoneShape, leds: usize) -> Vec<Rgbf> {
     }
 }
 
-/// Mono, perceptually lifted bands: `sqrt(mean(left, right))`, clamped to
-/// `0..=1`. Non-finite values count as 0. Mismatched lengths use the
-/// shorter.
-pub fn mono_bands(left: &[f32], right: &[f32]) -> Vec<f32> {
+/// Mono raw bands: `mean(left, right)`, clamped to `0..=1`, at the
+/// pipeline's own (small) scale — see [`window_level`]. Non-finite values
+/// count as 0. Mismatched lengths use the shorter.
+pub fn mono_raw(left: &[f32], right: &[f32]) -> Vec<f32> {
     left.iter()
         .zip(right)
         .map(|(l, r)| {
             let v = (l + r) * 0.5;
             if v.is_finite() {
-                v.clamp(0.0, 1.0).sqrt()
+                v.clamp(0.0, 1.0)
             } else {
                 0.0
             }
         })
         .collect()
+}
+
+/// Loudness of one analysis window: the sum of its mono raw bands.
+///
+/// `kwe_core::audio::analyze_stereo` divides each band's windowed |sample|
+/// sum by the WHOLE window length, so the bands of one window add up to
+/// the window's mean Hann-weighted |x| ≈ 0.43 × its RMS for noise-like
+/// music — independent of the band count (16/32/64) and window length.
+/// A single band is that divided by the band count: about 100× below the
+/// `0..1` range the old worker assumed (review fixes D, M1).
+pub fn window_level(raw: &[f32]) -> f32 {
+    raw.iter().sum()
+}
+
+/// Automatic gain for display (review fixes D, M1). Tracks a running peak
+/// of the loudest band, expressed per band count (`max(raw) × bands`, so
+/// it is on the [`window_level`] scale): instant attack, exponential decay
+/// of [`AutoGain::DECAY_DB_PER_S`], never below [`AutoGain::FLOOR`].
+/// Bands are shown as `sqrt(raw × bands / peak)` (the perceptual lift the
+/// worker always used), so the loudest recent band is full scale whatever
+/// the playback volume.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AutoGain {
+    peak: f32,
+}
+
+impl Default for AutoGain {
+    fn default() -> Self {
+        Self { peak: Self::FLOOR }
+    }
+}
+
+impl AutoGain {
+    /// Running-peak decay: 10 dB per second. A quiet passage 20 dB below a
+    /// loud one is back at full scale within 2 s, 30 dB below within 3 s;
+    /// between beats (≤ 0.5 s) the reference falls ≤ 5 dB, so beats still
+    /// read as beats.
+    pub const DECAY_DB_PER_S: f32 = 10.0;
+    /// Reference floor, `max(raw) × bands` units: 6.4e-3 is the loudest
+    /// band of −37 dBFS noise. Quieter material is shown below full scale
+    /// instead of being amplified (a frame just above the silence floor
+    /// peaks at ≈ 37 %, digital silence is black); −40 dBFS music still
+    /// reaches ≈ 90 % on its loudest band.
+    pub const FLOOR: f32 = 6.4e-3;
+
+    /// The current reference (tests, diagnostics).
+    pub fn peak(&self) -> f32 {
+        self.peak
+    }
+
+    /// Advances the reference by `dt` seconds and returns the display
+    /// bands for `raw`. `sound == false` (a frame under the silence floor)
+    /// lets the reference decay and shows black.
+    pub fn step(&mut self, dt: f32, raw: &[f32], sound: bool) -> Vec<f32> {
+        let dt = if dt.is_finite() { dt.max(0.0) } else { 0.0 };
+        self.peak *= 10f32.powf(-Self::DECAY_DB_PER_S * dt / 20.0);
+        if !sound {
+            self.peak = self.peak.max(Self::FLOOR);
+            return vec![0.0; raw.len()];
+        }
+        let n = raw.len() as f32;
+        let loudest = raw.iter().copied().fold(0.0f32, f32::max) * n;
+        self.peak = self.peak.max(loudest).max(Self::FLOOR);
+        raw.iter()
+            .map(|v| (v * n / self.peak).clamp(0.0, 1.0).sqrt())
+            .collect()
+    }
 }
 
 /// Bass energy: mean of the lowest eighth of the bands (at least 2).
@@ -364,8 +431,9 @@ mod tests {
 
     #[test]
     fn audio_helpers() {
-        let bands = mono_bands(&[1.0, 0.0, f32::NAN, 4.0], &[0.0, 0.0, 0.0, 4.0]);
-        assert_eq!(bands, vec![0.5f32.sqrt(), 0.0, 0.0, 1.0]);
+        let raw = mono_raw(&[1.0, 0.0, f32::NAN, 4.0], &[0.0, 0.0, 0.0, 4.0]);
+        assert_eq!(raw, vec![0.5, 0.0, 0.0, 1.0]);
+        assert_eq!(window_level(&raw), 1.5);
         assert_eq!(bass_energy(&[]), 0.0);
         let mut b = vec![0.0; 16];
         b[0] = 1.0;
@@ -374,6 +442,36 @@ mod tests {
         b[0] = 0.0;
         assert_eq!(bass_energy(&b), 0.5);
         assert_eq!(bass_energy(&[0.4]), 0.4);
+    }
+
+    /// M1: instant attack, 10 dB/s decay, floor, silence shows black.
+    #[test]
+    fn auto_gain_attack_decay_floor() {
+        let mut g = AutoGain::default();
+        assert_eq!(g.peak(), AutoGain::FLOOR);
+        // A loud frame (−10 dBFS scale) is full scale at once.
+        let loud = vec![0.003f32; 64];
+        let out = g.step(0.05, &loud, true);
+        assert!(out.iter().all(|v| (*v - 1.0).abs() < 1e-6), "{out:?}");
+        assert!((g.peak() - 0.003 * 64.0).abs() < 1e-6);
+        // 20 dB quieter: dim at first, full scale again after 2 s.
+        let quiet = vec![0.0003f32; 64];
+        let first = g.step(0.05, &quiet, true)[0];
+        assert!(first < 0.4, "{first}");
+        for _ in 0..40 {
+            g.step(0.05, &quiet, true);
+        }
+        assert!(g.step(0.05, &quiet, true)[0] > 0.99);
+        // Silence: black, and the reference decays to the floor, no lower.
+        assert!(g.step(10.0, &quiet, false).iter().all(|v| *v == 0.0));
+        assert_eq!(g.peak(), AutoGain::FLOOR);
+        // Near-silence is not amplified to full scale.
+        let faint = vec![1.5e-5f32; 64];
+        let v = g.step(0.05, &faint, true)[0];
+        assert!(v < 0.4, "{v}");
+        // Non-finite dt never poisons the reference.
+        g.step(f32::NAN, &faint, true);
+        assert!(g.peak().is_finite());
     }
 
     #[test]

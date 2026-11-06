@@ -16,4 +16,6 @@ libc.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+# Review fixes D: tests feed real `analyze_stereo` output (pipeline levels).
+kwe-core = { path = "../kwe-core" }
 kwe-openrgb = { path = "../kwe-openrgb", features = ["stub"] }

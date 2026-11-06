@@ -349,7 +349,7 @@ fn a_worker_that_never_reads_stdin_never_blocks_the_audio_tee() {
     let mut led = manager(&worker, LedSettings::default());
     led.set_timings_for_test(fast_timings());
     tick_until(&mut led, "spawn", |led| led.running_pid().is_some());
-    let line = audio_line(64, 0.5);
+    let line = audio_line(64, 0.0009); // −20 dBFS: the real pipeline scale
     // 4000 lines ≈ 5 MiB: ~80× the pipe's capacity.
     let started = Instant::now();
     for i in 0..4000 {
@@ -1040,4 +1040,211 @@ fn audio_demand_needs_a_connected_unpaused_worker_and_is_debounced() {
     assert!(!led.audio_demand(), "ambient: no capture, no hold");
     drop(led);
     fs::remove_dir_all(root).ok();
+}
+
+// --------------------------------------------------------------------------
+// Review fixes D (R-a): the restore-only pass after an unclean death when
+// no successor will run.
+// --------------------------------------------------------------------------
+
+/// A real-worker manager on `port` with the state dir and a red frame.
+fn real_manager(binary: PathBuf, port: u16, root: &Path, frame: &Path) -> LedManager {
+    let mut led = LedManager::new(
+        Some(LedWorkerConfig {
+            worker_path: binary,
+            port: Some(port),
+        }),
+        LedSettings::default(),
+    );
+    led.set_timings_for_test(fast_timings());
+    led.set_state_dir(root);
+    led.set_frame(Some(frame));
+    led
+}
+
+fn modes(stub: &StubServer) -> Vec<i32> {
+    stub.controllers().iter().map(|c| c.active_mode).collect()
+}
+
+fn kill(pid: u32) {
+    // SAFETY: a crash stand-in for our own child.
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+}
+
+/// R-a: a worker crash-looping while it drives (SIGKILLed mid-drive until
+/// the restart budget is gone) no longer leaves the devices frozen on the
+/// last frame: the daemon runs one restore pass and they end on their
+/// ORIGINAL modes (Rainbow = 2), the file removed, no extra restart.
+#[test]
+fn budget_exhausted_by_kills_mid_drive_ends_on_the_original_modes() {
+    let Some(binary) = real_worker() else {
+        return;
+    };
+    let stub = StubServer::start(StubConfig::default()).unwrap();
+    let root = temporary_directory("restore-budget");
+    let frame = root.join("frame.bin");
+    let _writer = write_frame(&frame);
+    let mut led = real_manager(binary, stub.port(), &root, &frame);
+    let mut last = None;
+    for round in 0..=MAX_RESTARTS {
+        tick_until(&mut led, "driving", |led| {
+            led.running_pid().is_some_and(|p| Some(p) != last)
+                && led
+                    .status()
+                    .worker_status
+                    .is_some_and(|s| s.driven_count == 2)
+        });
+        assert_eq!(modes(&stub), vec![0, 0], "round {round}: driven");
+        let pid = led.running_pid().unwrap();
+        kill(pid);
+        last = Some(pid);
+    }
+    tick_until(&mut led, "budget exhausted", |led| {
+        led.status().worker.restart_budget_exhausted
+    });
+    tick_until(&mut led, "restored", |led| {
+        !led.is_restoring() && modes(&stub) == vec![2, 2]
+    });
+    assert!(!root.join(SAVED_MODES_FILE).exists());
+    let status = led.status();
+    assert_eq!(status.worker.restarts, MAX_RESTARTS as u64, "no strike");
+    assert!(status.worker.restart_budget_exhausted && !status.worker.running);
+    drop(led);
+    fs::remove_dir_all(root).ok();
+}
+
+/// R-a: disabling LED sync right after an unclean death (before any
+/// successor ran) restores the originals through the pass.
+#[test]
+fn disable_right_after_an_unclean_death_restores_the_originals() {
+    let Some(binary) = real_worker() else {
+        return;
+    };
+    let stub = StubServer::start(StubConfig::default()).unwrap();
+    let root = temporary_directory("restore-disable");
+    let frame = root.join("frame.bin");
+    let _writer = write_frame(&frame);
+    let mut led = real_manager(binary, stub.port(), &root, &frame);
+    tick_until(&mut led, "driving", |led| {
+        led.status()
+            .worker_status
+            .is_some_and(|s| s.driven_count == 2)
+    });
+    kill(led.running_pid().unwrap());
+    led.set_settings(LedSettings {
+        enabled: false,
+        ..LedSettings::default()
+    });
+    tick_until(&mut led, "restored", |led| {
+        !led.is_stopping() && !led.is_restoring() && modes(&stub) == vec![2, 2]
+    });
+    assert!(!root.join(SAVED_MODES_FILE).exists());
+    assert_eq!(led.status().worker.restarts, 0);
+    assert!(led.running_pid().is_none());
+    drop(led);
+    fs::remove_dir_all(root).ok();
+}
+
+/// R-a: with no saved-modes file there is no pass at all; with a file but
+/// no server the pass is a bounded no-op that leaves the file; and the
+/// daemon's shutdown runs a pass still owed (within its bound).
+#[test]
+fn restore_pass_is_quiet_without_a_file_or_a_server_and_runs_at_shutdown() {
+    let Some(binary) = real_worker() else {
+        return;
+    };
+    // No file: budget exhausted by kills against an absent server.
+    let root = temporary_directory("restore-nofile");
+    let frame = root.join("frame.bin");
+    let _writer = write_frame(&frame);
+    let mut led = real_manager(binary.clone(), quiet_port(21), &root, &frame);
+    let mut last = None;
+    for _ in 0..=MAX_RESTARTS {
+        tick_until(&mut led, "worker up", |led| {
+            led.running_pid().is_some_and(|p| Some(p) != last)
+        });
+        let pid = led.running_pid().unwrap();
+        kill(pid);
+        last = Some(pid);
+    }
+    tick_until(&mut led, "budget exhausted", |led| {
+        led.status().worker.restart_budget_exhausted
+    });
+    for _ in 0..20 {
+        led.tick();
+        assert!(!led.is_restoring(), "no file, no pass");
+        thread::sleep(Duration::from_millis(5));
+    }
+    drop(led);
+    fs::remove_dir_all(root).ok();
+
+    // A file, then the server goes away: the pass ends at once, keeps it.
+    let stub = StubServer::start(StubConfig::default()).unwrap();
+    let root = temporary_directory("restore-noserver");
+    let frame = root.join("frame.bin");
+    let _writer = write_frame(&frame);
+    let mut led = real_manager(binary.clone(), stub.port(), &root, &frame);
+    tick_until(&mut led, "driving", |led| {
+        led.status()
+            .worker_status
+            .is_some_and(|s| s.driven_count == 2)
+    });
+    let port = stub.port();
+    drop(stub);
+    kill(led.running_pid().unwrap());
+    led.set_settings(LedSettings {
+        enabled: false,
+        ..LedSettings::default()
+    });
+    tick_until(&mut led, "pass started", |led| led.is_restoring());
+    let started = Instant::now();
+    tick_until(&mut led, "pass ended", |led| !led.is_restoring());
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(root.join(SAVED_MODES_FILE).is_file(), "kept for later");
+    drop(led);
+
+    // Shutdown with a pass owed (worker died, successor not yet started):
+    // the server is back; the pass runs inside `finish_shutdown`.
+    let stub = start_stub_on(port);
+    let mut led = real_manager(binary, port, &root, &frame);
+    led.set_timings_for_test(Timings {
+        restart_delay: Duration::from_secs(60),
+        ..fast_timings()
+    });
+    tick_until(&mut led, "driving", |led| {
+        led.status()
+            .worker_status
+            .is_some_and(|s| s.driven_count == 2)
+    });
+    kill(led.running_pid().unwrap());
+    tick_until(&mut led, "death seen", |led| led.running_pid().is_none());
+    assert_eq!(modes(&stub), vec![0, 0], "frozen until the pass");
+    let t = Instant::now();
+    led.finish_shutdown();
+    assert!(t.elapsed() < RESTORE_PASS_LIMIT + Duration::from_secs(1));
+    let end = Instant::now() + WAIT;
+    while modes(&stub) != vec![2, 2] && Instant::now() < end {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(modes(&stub), vec![2, 2]);
+    assert!(!root.join(SAVED_MODES_FILE).exists());
+    drop(led);
+    fs::remove_dir_all(root).ok();
+}
+
+/// A stub on a fixed port (the one an earlier stub of this test used),
+/// retried for a bounded time.
+fn start_stub_on(port: u16) -> StubServer {
+    let end = Instant::now() + Duration::from_secs(10);
+    loop {
+        match StubServer::start_on(port, StubConfig::default()) {
+            Ok(stub) => return stub,
+            Err(error) => {
+                assert!(Instant::now() < end, "stub on {port}: {error}");
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
 }

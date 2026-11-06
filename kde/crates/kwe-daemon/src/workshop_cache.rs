@@ -268,6 +268,13 @@ impl WorkshopCache {
             changed = true;
         }
         for (id, entry) in updates {
+            // Review fixes D (NIT): a Steam-lag scan of a still-tombstoned
+            // id must not re-cache it — the fresh `last_seen` would outlive
+            // the tombstone and the id would then be synthesized (and
+            // touched) as `subscribed_missing` forever.
+            if self.unsubscribed.contains_key(&id) {
+                continue;
+            }
             let dominated = self.items.get(&id).is_some_and(|existing| {
                 existing.title == entry.title
                     && existing.kind == entry.kind
@@ -782,5 +789,39 @@ mod tests {
         assert!(cache.forget_unsubscribed("8", t0));
         cache.merge_and_update(&mut catalog(Vec::new()), t0 + STALE_ENTRY_MS + 1);
         assert!(!cache.unsubscribed.contains_key("8"));
+    }
+
+    /// Review fixes D (NIT): a Steam-lag scan inside the tombstone's life
+    /// does not re-cache the id, so after the tombstone ages out (30 days)
+    /// the id is never synthesized as `subscribed_missing` — and stays gone.
+    #[test]
+    fn steam_lag_scan_never_outlives_the_tombstone() {
+        use super::test_support::{catalog, item};
+        let dir = state_dir("tombstone-lag");
+        fs::create_dir_all(&dir).unwrap();
+        let mut cache = WorkshopCache::open(&dir);
+        let t0 = now_ms();
+        cache.merge_and_update(&mut catalog(vec![item("9", "subscribed_installed")]), t0);
+        assert!(cache.forget_unsubscribed("9", t0));
+        // Steam lag, late in the settle window.
+        cache.merge_and_update(
+            &mut catalog(vec![item("9", "subscribed_installed")]),
+            t0 + UNSUBSCRIBE_SETTLE_MS - 1,
+        );
+        assert!(
+            !cache.items.contains_key("9"),
+            "not re-cached while tombstoned"
+        );
+        // Just after the tombstone's 30 days: no synthesis, now or later.
+        for at in [t0 + STALE_ENTRY_MS + 1, t0 + STALE_ENTRY_MS + 60_000] {
+            let mut scan = catalog(Vec::new());
+            cache.merge_and_update(&mut scan, at);
+            assert!(
+                scan.items.is_empty(),
+                "synthesized at {at}: {:?}",
+                scan.items
+            );
+        }
+        assert!(cache.items.is_empty() && cache.unsubscribed.is_empty());
     }
 }

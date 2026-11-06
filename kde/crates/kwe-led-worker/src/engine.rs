@@ -19,7 +19,9 @@ use kwe_openrgb::{
 use crate::color::{Rgbf, Smoother, Taus, apply_brightness, smooth_scalar};
 use crate::frame::{FrameSampler, Sample};
 use crate::log::LogLimiter;
-use crate::mapping::{ambient_zone, bass_energy, controller_colors, mono_bands, spectrum_zone};
+use crate::mapping::{
+    AutoGain, ambient_zone, bass_energy, controller_colors, mono_raw, spectrum_zone, window_level,
+};
 use crate::saved::{Store, judge};
 
 /// After the source disappears (no valid frame for the ambient modes, no
@@ -30,11 +32,18 @@ pub const FRAME_HOLD: Duration = Duration::from_secs(2);
 /// A frame read within this long counts as "a frame is showing now" for
 /// takeover (tolerates one busy read at the 4 Hz waiting tick).
 pub const FRAME_NOW: Duration = Duration::from_millis(500);
-/// An audio frame whose loudest (perceptual) band is below this is silence.
-/// Bands are `sqrt(mean(left, right))`, so 0.05 is a raw level of 0.0025 —
-/// far below anything audible, and a spectrum LED at 0.05 is near black
-/// anyway.
-pub const SILENCE_LEVEL: f32 = 0.05;
+/// An audio frame whose [`window_level`] (sum of the mono raw bands) is
+/// below this is silence. Review fixes D (M1): the old rule (loudest
+/// `sqrt(band)` < 0.05, i.e. raw 0.0025) called −20 dBFS music silent,
+/// because `analyze_stereo` bands are ≈ 100× smaller than `0..1`.
+///
+/// Measured through `kwe_core::audio::analyze_stereo` (2048-sample
+/// window): the window level is ≈ 0.43 × RMS for noise-like signals —
+/// 4.3e-4 at −60 dBFS, 1.4e-3 at −50, 4.3e-3 at −40, 4.3e-2 at −20.
+/// 6.4e-4 (≈ −56 dBFS) keeps digital silence, dither and noise-floor hiss
+/// (−60 dBFS and below) silent and quiet-but-audible music (−50 dBFS and
+/// up) sound, with ≥ 4 dB margin on either side and 16 dB to −40 dBFS.
+pub const SILENCE_LEVEL: f32 = 6.4e-4;
 /// `spectrum` releases the devices after this long without sound even
 /// while (silent) audio frames keep arriving; `ambient+pulse` stops pulsing
 /// (steady ambient). Gaps between songs or sentences are shorter, so they
@@ -81,8 +90,11 @@ pub const PULSE_TAUS: Taus = Taus {
     attack: 0.03,
     release: 0.25,
 };
-/// Brightness floor of `ambient+pulse` at silence.
-pub const PULSE_FLOOR: f32 = 0.2;
+/// Brightness floor of `ambient+pulse` while sound plays: the pulse moves
+/// the ambient colours between 50 % (no bass right now) and 100 % (bass at
+/// the running peak). Review fixes D: 0.2 sat near-dark between beats; in
+/// sustained silence the colours are steady 100 % ambient (unchanged).
+pub const PULSE_FLOOR: f32 = 0.5;
 
 /// Default probe backoff: 1 s doubling to 60 s.
 pub const BACKOFF_MIN: Duration = Duration::from_secs(1);
@@ -347,6 +359,116 @@ impl RestoreParts {
     }
 }
 
+/// `--restore-saved`: operations are started only within this long of the
+/// pass's start; with the in-flight operation (≤ 0.5 s I/O timeout) the
+/// pass ends within ≈ 2.5 s, inside the daemon's 3 s hard bound
+/// (`RESTORE_PASS_LIMIT`) and its 4 s stop grace.
+pub const RESTORE_SAVED_BUDGET: Duration = Duration::from_secs(2);
+
+/// What a `--restore-saved` pass did (review fixes D, R-a).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreSaved {
+    /// No file, an unusable file (removed), or an empty one.
+    NoFile,
+    /// The file was not trusted (other boot / stale): removed, devices
+    /// left alone (same rule as a normal worker's adoption).
+    Forgotten(&'static str),
+    /// OpenRGB unreachable (or the connection failed): file untouched.
+    Unreachable { kept: u32 },
+    /// Restored what it could; `kept` entries stay in the file (device
+    /// missing, failure, or out of time).
+    Done {
+        restored: u32,
+        forgotten: u32,
+        kept: u32,
+    },
+}
+
+/// One bounded restore-only pass over the saved-modes file at `path`
+/// (`--restore-saved`, run by the daemon when a worker died uncleanly and
+/// no successor will run). Applies the normal adoption rules (same boot,
+/// writer alive within `saved_fresh`), connects once, restores every
+/// remembered device it finds, and rewrites the file to hold what is left
+/// (removed when nothing is). It never switches a device to the per-LED
+/// mode, and leaves the file untouched when it cannot connect (no
+/// liveness touch either, so the file still ages out).
+pub fn restore_saved(
+    path: PathBuf,
+    mut client_cfg: ClientConfig,
+    saved_fresh: Duration,
+    wall: SystemTime,
+    boot_id: Option<String>,
+    log: &mut LogLimiter,
+) -> RestoreSaved {
+    let start = Instant::now();
+    let deadline = start + RESTORE_SAVED_BUDGET;
+    let (mut store, loaded) = Store::open_with_boot_id(path, boot_id);
+    if let Some(why) = &loaded.ignored {
+        log.log(
+            start,
+            "restore_saved",
+            &format!("detail=ignored reason={why}"),
+        );
+        return RestoreSaved::NoFile;
+    }
+    if loaded.entries.is_empty() {
+        return RestoreSaved::NoFile;
+    }
+    if let Err(why) = judge(&loaded.provenance, store.boot_id(), wall, saved_fresh) {
+        let _ = store.write(&[]);
+        log.log(
+            start,
+            "restore_saved",
+            &format!(
+                "detail=forgotten reason={why} entries={}",
+                loaded.entries.len()
+            ),
+        );
+        return RestoreSaved::Forgotten(why);
+    }
+    let entries = loaded.entries.len() as u32;
+    // Enumeration must also end inside the budget.
+    client_cfg.enumerate_budget = client_cfg
+        .enumerate_budget
+        .min(deadline.saturating_duration_since(Instant::now()));
+    let connected = Client::connect(&client_cfg).and_then(|mut c| {
+        c.refresh()?;
+        Ok(c)
+    });
+    let mut client = match connected {
+        Ok(c) => c,
+        Err(e) => {
+            log.log(
+                Instant::now(),
+                "restore_saved",
+                &format!(
+                    "detail=unreachable reason={} kept={entries}",
+                    error_reason(&e)
+                ),
+            );
+            return RestoreSaved::Unreachable { kept: entries };
+        }
+    };
+    client.adopt_saved_modes(loaded.entries);
+    let forgotten = client.drop_stale_saved_modes().len() as u32;
+    let reports = client.restore_all_until(&|| Instant::now() >= deadline);
+    let restored = reports.iter().filter(|r| r.result.is_ok()).count() as u32;
+    let kept = client.saved_modes().len() as u32;
+    if restored > 0 || forgotten > 0 || kept < entries {
+        let _ = store.write(client.saved_modes());
+    }
+    log.log(
+        Instant::now(),
+        "restore_saved",
+        &format!("detail=done restored={restored} forgotten={forgotten} kept={kept}"),
+    );
+    RestoreSaved::Done {
+        restored,
+        forgotten,
+        kept,
+    }
+}
+
 pub struct Engine {
     cfg: EngineConfig,
     settings: Settings,
@@ -367,7 +489,10 @@ pub struct Engine {
     sampler: FrameSampler,
     frame_state: FrameState,
     frame_ok_at: Option<Instant>,
+    /// Latest audio frame: arrival and display bands (auto-gained, `0..=1`).
     audio: Option<(Instant, Vec<f32>)>,
+    /// Display gain shared by spectrum and the bass pulse.
+    gain: AutoGain,
     /// When the last audio frame with sound (≥ [`SILENCE_LEVEL`]) arrived.
     loud_at: Option<Instant>,
     /// Start of the current unbroken stretch with a source present now.
@@ -425,6 +550,7 @@ impl Engine {
             sampler: FrameSampler::default(),
             frame_ok_at: None,
             audio: None,
+            gain: AutoGain::default(),
             loud_at: None,
             live_since: None,
             released_at: None,
@@ -585,10 +711,15 @@ impl Engine {
 
     pub fn set_audio(&mut self, now: Instant, left: &[f32], right: &[f32]) {
         self.counters.audio_frames = self.counters.audio_frames.saturating_add(1);
-        let bands = mono_bands(left, right);
-        if bands.iter().any(|b| *b >= SILENCE_LEVEL) {
+        let raw = mono_raw(left, right);
+        let sound = window_level(&raw) >= SILENCE_LEVEL;
+        if sound {
             self.loud_at = Some(now);
         }
+        let dt = self.audio.as_ref().map_or(0.0, |(t, _)| {
+            now.saturating_duration_since(*t).as_secs_f32()
+        });
+        let bands = self.gain.step(dt, &raw, sound);
         self.audio = Some((now, bands));
     }
 
@@ -893,8 +1024,8 @@ impl Engine {
             self.read_frame(now);
         }
         // In sustained silence ambient+pulse shows steady ambient instead of
-        // the 20 % floor (it would otherwise sit near-dark while nothing
-        // plays, now that capture runs whenever an audio mode is selected).
+        // the pulse floor ([`PULSE_FLOOR`]): capture runs whenever an audio
+        // mode is selected, so silent frames arrive while nothing plays.
         let pulse_target = match (self.settings.mode, self.fresh_bands(now)) {
             (Mode::AmbientPulse, Some(b)) if self.sound_recent(now) => {
                 PULSE_FLOOR + (1.0 - PULSE_FLOOR) * bass_energy(b)

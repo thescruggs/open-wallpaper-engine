@@ -69,6 +69,10 @@ const REPROBE_MIN_INTERVAL: Duration = Duration::from_secs(2);
 /// in uninterruptible sleep) before the handle is dropped with one log line
 /// — so neither a supervisor tick nor daemon shutdown can wait forever.
 const KILL_REAP_LIMIT: Duration = Duration::from_secs(2);
+/// Review fixes D (R-a): hard bound on the one-shot `--restore-saved`
+/// pass (the worker itself ends within ≈ 2.5 s); SIGKILLed after it.
+/// Well inside the 4 s stop grace and `TimeoutStopSec=5s`.
+pub const RESTORE_PASS_LIMIT: Duration = Duration::from_secs(3);
 /// stdout bytes read per tick (the pipe's capacity).
 const STDOUT_READ_BUDGET: usize = 64 * 1024;
 /// Review fixes C2 (R1): how long LED sync keeps demanding audio capture
@@ -219,7 +223,9 @@ struct Running {
 
 enum RunningOutcome {
     Alive,
-    Exited(String),
+    /// Exit detail, and whether it was a clean exit 0 (the worker restored
+    /// its devices before exiting).
+    Exited(String, bool),
     Wedged,
     WaitError(String),
 }
@@ -232,6 +238,13 @@ struct Stopping {
     killed: bool,
     /// A `try_wait` error was already logged for this worker.
     wait_error_logged: bool,
+}
+
+/// The one-shot restore-only worker (`--restore-saved`, review fixes D).
+struct RestorePass {
+    child: Child,
+    deadline: Instant,
+    killed: bool,
 }
 
 /// Audio tee counters, surfaced in `led.status` for diagnostics.
@@ -331,6 +344,12 @@ pub struct LedManager {
     /// (`audio_demand`), and when its live reason was last seen.
     audio_demand: bool,
     audio_live_at: Option<Instant>,
+    /// R-a: a worker ended uncleanly (non-zero exit, signal, wedged,
+    /// SIGKILLed while stopping) since the last worker was spawned, so the
+    /// saved-modes file may name devices still in the per-LED mode. When
+    /// no successor will run, one restore-only pass settles it.
+    restore_owed: bool,
+    restore_pass: Option<RestorePass>,
 }
 
 /// File name of the worker's remembered-modes file in the state directory.
@@ -361,6 +380,8 @@ impl LedManager {
             saved_modes: None,
             audio_demand: false,
             audio_live_at: None,
+            restore_owed: false,
+            restore_pass: None,
         }
     }
 
@@ -746,7 +767,7 @@ impl LedManager {
         let outcome = self.running.as_mut().map(|running| {
             running.reader.drain(&running.stdout);
             match running.child.try_wait() {
-                Ok(Some(status)) => RunningOutcome::Exited(exit_detail(&status)),
+                Ok(Some(status)) => RunningOutcome::Exited(exit_detail(&status), status.success()),
                 Ok(None) => {
                     let silent_since = running.reader.latest_at.unwrap_or(running.spawned_at);
                     if now.saturating_duration_since(silent_since) >= wedged_after {
@@ -765,8 +786,9 @@ impl LedManager {
                     flush(running, &mut self.tee);
                 }
             }
-            Some(RunningOutcome::Exited(detail)) => {
+            Some(RunningOutcome::Exited(detail, clean)) => {
                 eprintln!("event=led.worker.exited detail={detail}");
+                self.restore_owed |= !clean;
                 if let Some(running) = self.running.take() {
                     self.absorb_reader(&running.reader);
                 }
@@ -779,12 +801,14 @@ impl LedManager {
                     wedged_after.as_millis()
                 );
                 self.last_exit = Some("wedged".to_string());
+                self.restore_owed = true;
                 self.begin_stop("wedged");
                 self.schedule_restart();
             }
             Some(RunningOutcome::WaitError(error)) => {
                 eprintln!("event=led.worker.wait_error detail={error}");
                 self.last_exit = Some("wait_error".to_string());
+                self.restore_owed = true;
                 self.begin_stop("wait_error");
                 self.schedule_restart();
             }
@@ -792,6 +816,7 @@ impl LedManager {
         if self.settings.enabled
             && self.running.is_none()
             && self.stopping.is_none()
+            && self.restore_pass.is_none()
             && self.unavailable.is_none()
             && !self.budget_exhausted
             && self.next_spawn_at.is_some_and(|at| now >= at)
@@ -803,7 +828,112 @@ impl LedManager {
                 self.schedule_restart();
             }
         }
+        if self.restore_owed
+            && self.running.is_none()
+            && self.stopping.is_none()
+            && self.restore_pass.is_none()
+            && !self.successor_pending()
+        {
+            self.start_restore_pass(RESTORE_PASS_LIMIT);
+        }
         self.update_audio_demand(Instant::now());
+    }
+
+    /// A normal worker will be (re)started without user action: it adopts
+    /// the saved-modes file itself, so no restore pass is needed.
+    fn successor_pending(&self) -> bool {
+        self.settings.enabled && self.unavailable.is_none() && !self.budget_exhausted
+    }
+
+    /// R-a: starts the one-shot `--restore-saved` pass (never a restart
+    /// strike, never takes a device over). Quietly nothing when there is no
+    /// saved-modes file or no runnable worker binary.
+    fn start_restore_pass(&mut self, limit: Duration) {
+        self.restore_owed = false;
+        let (Some(config), Some(path)) = (self.config.as_ref(), self.saved_modes.as_ref()) else {
+            return;
+        };
+        if !path.is_file() || !is_executable(&config.worker_path) {
+            return;
+        }
+        let mut command = Command::new(&config.worker_path);
+        command
+            .env_clear()
+            .arg("--restore-saved")
+            .arg("--saved-modes")
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit());
+        if let Some(port) = config.port {
+            command.arg("--port").arg(port.to_string());
+        }
+        // SAFETY: as in `spawn`: async-signal-safe libc calls only.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        match command.spawn() {
+            Ok(child) => {
+                eprintln!(
+                    "event=led.worker.restore_pass pid={} detail=started",
+                    child.id()
+                );
+                self.restore_pass = Some(RestorePass {
+                    child,
+                    deadline: Instant::now() + limit,
+                    killed: false,
+                });
+            }
+            Err(error) => {
+                eprintln!("event=led.worker.restore_pass detail=spawn_failed error={error}");
+            }
+        }
+    }
+
+    /// Reaps the restore pass, or SIGKILLs it at its deadline. Never waits.
+    fn tick_restore_pass(&mut self) {
+        let Some(pass) = self.restore_pass.as_mut() else {
+            return;
+        };
+        let pid = pass.child.id();
+        match pass.child.try_wait() {
+            Ok(Some(status)) => {
+                eprintln!(
+                    "event=led.worker.restore_pass pid={pid} detail=finished exit={}",
+                    exit_detail(&status)
+                );
+                self.restore_pass = None;
+            }
+            Ok(None) => {
+                let now = Instant::now();
+                if !pass.killed && now >= pass.deadline {
+                    signal_process_group(pid, libc::SIGKILL);
+                    let _ = pass.child.kill();
+                    pass.killed = true;
+                    eprintln!("event=led.worker.restore_pass pid={pid} detail=killed_at_limit");
+                } else if pass.killed && now >= pass.deadline + KILL_REAP_LIMIT {
+                    eprintln!("event=led.worker.unreaped pid={pid} detail=restore pass");
+                    self.restore_pass = None;
+                }
+            }
+            Err(error) => {
+                eprintln!("event=led.worker.wait_error pid={pid} detail={error}");
+                signal_process_group(pid, libc::SIGKILL);
+                let _ = pass.child.kill();
+                self.restore_pass = None;
+            }
+        }
     }
 
     /// Daemon shutdown, first half: ask the worker to restore and exit
@@ -819,7 +949,8 @@ impl LedManager {
     /// reaps), plus a hard backstop in case the clock misbehaves.
     pub fn finish_shutdown(&mut self) {
         self.begin_shutdown();
-        let backstop = Instant::now() + self.timings.stop_grace + KILL_REAP_LIMIT * 2;
+        let started = Instant::now();
+        let backstop = started + self.timings.stop_grace + KILL_REAP_LIMIT * 2;
         while self.stopping.is_some() {
             self.tick_stopping();
             if self.stopping.is_some() {
@@ -830,6 +961,31 @@ impl LedManager {
                             stopping.child.id()
                         );
                     }
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        self.finish_restore_pass(started);
+    }
+
+    /// Shutdown, R-a: no successor will ever run, so a restore owed for an
+    /// uncleanly ended worker is done now (bounded: whatever is left of
+    /// `stop_grace + 0.5 s` since shutdown began, at least 0.5 s and at most
+    /// [`RESTORE_PASS_LIMIT`] — inside `TimeoutStopSec=5s` in the usual
+    /// case, where no worker was still stopping).
+    fn finish_restore_pass(&mut self, started: Instant) {
+        if self.restore_owed && self.restore_pass.is_none() {
+            let left = (started + self.timings.stop_grace + Duration::from_millis(500))
+                .saturating_duration_since(Instant::now());
+            self.start_restore_pass(left.clamp(Duration::from_millis(500), RESTORE_PASS_LIMIT));
+        }
+        let backstop = Instant::now() + RESTORE_PASS_LIMIT + KILL_REAP_LIMIT * 2;
+        while self.restore_pass.is_some() {
+            self.tick_restore_pass();
+            if self.restore_pass.is_some() {
+                if Instant::now() >= backstop {
+                    self.restore_pass = None;
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(10));
@@ -850,6 +1006,7 @@ impl LedManager {
     }
 
     fn tick_stopping(&mut self) {
+        self.tick_restore_pass();
         let Some(stopping) = self.stopping.as_mut() else {
             return;
         };
@@ -863,6 +1020,9 @@ impl LedManager {
                     "event=led.worker.stopped pid={pid} detail={}",
                     exit_detail(&status)
                 );
+                // SIGKILLed at the grace (or failed): it may not have
+                // restored its devices.
+                self.restore_owed |= stopping.killed || !status.success();
                 self.absorb_reader(&stopping.reader);
             }
             result => {
@@ -874,6 +1034,7 @@ impl LedManager {
                     if stopping.killed {
                         // Nothing more can be done; drop the handle.
                         self.stopping = None;
+                        self.restore_owed = true;
                         return;
                     }
                 }
@@ -891,6 +1052,7 @@ impl LedManager {
                         KILL_REAP_LIMIT.as_millis()
                     );
                     self.stopping = None;
+                    self.restore_owed = true;
                 }
             }
         }
@@ -1094,6 +1256,8 @@ impl LedManager {
         };
         flush(&mut running, &mut self.tee);
         self.running = Some(running);
+        // The new worker adopts the saved-modes file itself.
+        self.restore_owed = false;
         Ok(())
     }
 
@@ -1110,6 +1274,11 @@ impl LedManager {
     #[cfg(test)]
     pub(crate) fn is_stopping(&self) -> bool {
         self.stopping.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_restoring(&self) -> bool {
+        self.restore_pass.is_some()
     }
 }
 

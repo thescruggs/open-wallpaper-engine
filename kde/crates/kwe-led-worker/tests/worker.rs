@@ -294,6 +294,12 @@ fn count(stub: &StubServer, dev: u32, id: u32) -> usize {
         .count()
 }
 
+/// Loudest band of −20 dBFS music through `kwe_core::audio::analyze_stereo`
+/// at 16 bands (≈ 0.06 / bands): the real pipeline's scale, not `0..1`
+/// (review fixes D, M1).
+const MUSIC: f32 = 0.004;
+
+/// Bass-only frame (bands 0 and 1 at `level`) at 16 bands.
 fn audio_line(level: f32) -> Vec<u8> {
     let mut bands = vec![0.0f32; 16];
     bands[..2].fill(level);
@@ -404,7 +410,7 @@ fn spectrum_reacts_to_audio_lines_and_releases_without_them() {
         strip[0].b > 200 && strip[7] == BLACK && logo.r > 200
     };
     let ok = wait_until(WAIT, || {
-        w.send(&audio_line(1.0));
+        w.send(&audio_line(MUSIC));
         lit(&stub)
     });
     assert!(
@@ -445,7 +451,7 @@ fn update_rate_is_bounded_and_changeable_at_runtime() {
         let mut loud = false;
         while Instant::now() < end {
             loud = !loud;
-            w.send(&audio_line(if loud { 1.0 } else { 0.0 }));
+            w.send(&audio_line(if loud { MUSIC } else { 0.0 }));
             thread::sleep(Duration::from_millis(5));
         }
     };
@@ -1413,7 +1419,7 @@ fn flapping_audio_is_bounded_end_to_end() {
     while t0.elapsed() < Duration::from_secs(12) {
         let burst = Instant::now();
         while burst.elapsed() < Duration::from_millis(600) {
-            w.send(&audio_line(1.0));
+            w.send(&audio_line(MUSIC));
             thread::sleep(Duration::from_millis(30));
         }
         thread::sleep(Duration::from_millis(3000));
@@ -1426,4 +1432,88 @@ fn flapping_audio_is_bounded_end_to_end() {
     // per burst (4 here).
     let bound = 1 + (secs / 7.0) as usize;
     assert!(takes >= 1 && takes <= bound, "{takes} > {bound}");
+}
+
+/// Review fixes D (R-a): `--restore-saved` end to end. A SIGKILLed
+/// worker's leftovers are given back to the ORIGINAL modes by one bounded
+/// pass that never takes a device over; with no file, or no server, it is
+/// a quiet exit 0 (no connection, no error line); without
+/// `--saved-modes` it is a usage error.
+#[test]
+fn restore_saved_pass_restores_leftovers_and_is_quiet_otherwise() {
+    let stub = StubServer::start(StubConfig::default()).unwrap();
+    let dir = temp_dir("restore-saved");
+    let saved = dir.join("led-saved-modes.json");
+    let pass = |port: u16| {
+        let t = Instant::now();
+        let out = Command::new(env!("CARGO_BIN_EXE_kwe-led-worker"))
+            .args(["--restore-saved", "--port", &port.to_string()])
+            .arg("--saved-modes")
+            .arg(&saved)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        (out, t.elapsed())
+    };
+    let quiet = |out: &std::process::Output| {
+        let err = String::from_utf8_lossy(&out.stderr).to_lowercase();
+        !err.contains("error") && !err.contains("fatal") && !err.contains("panic")
+    };
+
+    // No file: exit 0, nothing logged, the server is never contacted.
+    let (out, _) = pass(stub.port());
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stderr.is_empty() && out.stdout.is_empty(), "{out:?}");
+    assert!(stub.received().is_empty());
+
+    // Leftovers of a SIGKILLed worker (same boot, fresh).
+    let mut a = Worker::spawn(
+        stub.port(),
+        &[
+            "--mode",
+            "spectrum",
+            "--synthetic-audio",
+            "--saved-modes",
+            saved.to_str().unwrap(),
+        ],
+    );
+    a.wait_status("controlled", |s| {
+        s.devices.len() == 2 && s.devices.iter().all(|d| d.controlled)
+    });
+    a.child.kill().unwrap();
+    a.child.wait().unwrap();
+    assert!(stub.controllers().iter().all(|c| c.active_mode == 0));
+    assert!(saved.exists());
+
+    // No server: quiet, quick, file untouched.
+    let bytes = std::fs::read(&saved).unwrap();
+    let (out, took) = pass(quiet_port(11));
+    assert_eq!(out.status.code(), Some(0));
+    assert!(quiet(&out), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(took < Duration::from_secs(2), "{took:?}");
+    assert_eq!(std::fs::read(&saved).unwrap(), bytes);
+
+    // Server back: originals restored, file removed, nothing taken over.
+    let before = stub.received().len();
+    let (out, took) = pass(stub.port());
+    assert_eq!(out.status.code(), Some(0));
+    assert!(quiet(&out), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(took < Duration::from_secs(3), "{took:?}");
+    assert!(wait_until(WAIT, || stub
+        .controllers()
+        .iter()
+        .all(|c| c.active_mode == 2)));
+    assert!(!saved.exists());
+    assert!(
+        stub.received()[before..]
+            .iter()
+            .all(|p| p.id != packet_id::SET_CUSTOM_MODE && p.id != packet_id::UPDATE_LEDS)
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_kwe-led-worker"))
+        .args(["--restore-saved", "--port", &stub.port().to_string()])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "needs --saved-modes");
+    std::fs::remove_dir_all(dir).unwrap();
 }

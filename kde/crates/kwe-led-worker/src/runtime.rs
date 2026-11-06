@@ -285,10 +285,18 @@ impl Outbox {
 // main loop
 // ---------------------------------------------------------------------------
 
+/// Peak raw band of [`synthetic_bands`] times the band count: the loudest
+/// band of −20 dBFS noise through `kwe_core::audio::analyze_stereo` is
+/// ≈ 0.06 / bands (review fixes D: synthetic audio used to be ≈ 100× louder
+/// than anything the real pipeline produces, which hid M1).
+pub const SYNTHETIC_PEAK: f32 = 0.06;
+
 /// Synthetic stereo bands for `--synthetic-audio` (development without the
 /// daemon): a 2 Hz bass pulse plus a peak sweeping across the spectrum
-/// every 4 s. Pure; `n` is 16, 32, or 64.
+/// every 4 s, at the real pipeline's level for −20 dBFS music (see
+/// [`SYNTHETIC_PEAK`]). Pure; `n` is 16, 32, or 64.
 pub fn synthetic_bands(t: f32, n: usize) -> (Vec<f32>, Vec<f32>) {
+    let scale = SYNTHETIC_PEAK / n.max(1) as f32;
     let pulse = (0.5 + 0.5 * (std::f32::consts::TAU * 2.0 * t).sin()).powi(2);
     let peak = (t * 0.25).fract() * n as f32;
     let bands: Vec<f32> = (0..n)
@@ -296,7 +304,7 @@ pub fn synthetic_bands(t: f32, n: usize) -> (Vec<f32>, Vec<f32>) {
             let d = i as f32 - peak;
             let sweep = (-(d * d) / 6.0).exp();
             let bass = if i < n / 8 { pulse } else { 0.0 };
-            sweep.max(bass).clamp(0.0, 1.0)
+            sweep.max(bass).clamp(0.0, 1.0) * scale
         })
         .collect();
     (bands.clone(), bands)
@@ -587,6 +595,39 @@ mod tests {
         for t in [0.0, 0.1, 1.3, 7.9] {
             let (l, r) = synthetic_bands(t, 32);
             assert!(kwe_input_protocol::AudioFrame::new(1, l, r).is_ok());
+        }
+    }
+
+    /// Review fixes D (M1): synthetic audio is at real pipeline levels —
+    /// never louder than a full-scale signal through `analyze_stereo` (its
+    /// loudest band is that of −20 dBFS noise), and its whole-window level
+    /// never below a −50 dBFS signal (sparse bands: one sweep peak plus
+    /// the bass), for every band count.
+    #[test]
+    fn synthetic_bands_are_at_real_pipeline_levels() {
+        use crate::engine::SILENCE_LEVEL;
+        use crate::mapping::window_level;
+        let window = 2048;
+        let full: Vec<f32> = (0..window).map(|i| (i as f32 * 0.05).sin()).collect();
+        let quiet: Vec<f32> = (0..window)
+            .map(|i| if i % 2 == 0 { 0.003_16 } else { -0.003_16 })
+            .collect();
+        for n in [16, 32, 64] {
+            let loud = kwe_core::analyze_stereo(1, &full, &full, n).unwrap();
+            let loud_max = loud.left.iter().copied().fold(0.0f32, f32::max);
+            let floor = kwe_core::analyze_stereo(1, &quiet, &quiet, n).unwrap();
+            let floor_level = window_level(&floor.left);
+            for k in 0..80 {
+                let (l, _) = synthetic_bands(k as f32 * 0.05, n);
+                let max = l.iter().copied().fold(0.0f32, f32::max);
+                assert!(max <= loud_max, "n {n}: {max} > full scale {loud_max}");
+                let level = window_level(&l);
+                assert!(
+                    level >= floor_level,
+                    "n {n}: {level} < −50 dBFS {floor_level}"
+                );
+                assert!(level >= SILENCE_LEVEL);
+            }
         }
     }
 

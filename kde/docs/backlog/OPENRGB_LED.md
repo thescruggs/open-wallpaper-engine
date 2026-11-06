@@ -392,6 +392,72 @@
   strays). Wall time 15.7–15.9 s; passed 3/3 consecutive runs.
   - Not covered: audio modes end to end (would need a null-sink capture in
     the LED smoke); live devices (6742 still not listening).
+- **Review fixes D — done (uncommitted, 2026-11-06), live check pending.**
+  Last fix slice before the first live test on real RGB hardware. Each new
+  regression test was run against the pre-fix code (HEAD `7de122b` in a
+  scratch worktree, new tests copied in) and FAILED there; passes now.
+  - M1 audio levels — CLOSED. `analyze_stereo` bands are ≈ 100× below
+    `0..1` (each band is a time slice divided by the whole window length;
+    window level Σ bands ≈ 0.43 × RMS). The worker now judges silence on
+    the window level (< 6.4e-4 ≈ −56 dBFS: digital silence and ≤ −60 dBFS
+    hiss are silent, ≥ −50 dBFS is sound) and auto-gains the display bands
+    (running peak of `max(raw) × bands`: instant attack, 10 dB/s decay,
+    floor 6.4e-3), feeding both the spectrum zones and the bass pulse;
+    `ambient+pulse` floor 0.2 → 0.5 (50–100 % of ambient while sound
+    plays). `--synthetic-audio` and every worker test fixture now run at
+    real pipeline levels (engine tests feed `kwe_core::analyze_stereo`
+    output for generated noise / 60+120 Hz bass tone / silence).
+    Constants and measurements: `LED_PROTOCOL_V1.md` §Audio levels. Tests
+    `engine::tests::{real_level_music_takes_over_and_is_clearly_visible,
+    silence_and_hiss_are_silent_but_quiet_music_is_sound,
+    silence_after_real_music_releases_after_the_documented_time,
+    loud_to_quiet_recovers_within_the_documented_time,
+    steady_real_levels_never_flap_over_a_minute,
+    ambient_pulse_modulates_around_a_lit_ambient_at_real_levels}`,
+    `mapping::tests::auto_gain_attack_decay_floor`,
+    `runtime::tests::synthetic_bands_are_at_real_pipeline_levels`. The
+    verifier's `real_levels` repro: raw 0.0009 / 0.0028 / 0.0075 → takeover
+    + brightest 255/255 each (was: no takeover / 13 / 22).
+  - R-a frozen devices after a crash loop — CLOSED. New worker flag
+    `--restore-saved` (one bounded restore-only pass over `--saved-modes`,
+    normal trust rules, ≤ ≈ 2.5 s, never takes control, quiet exit 0 with
+    no file or no server). The daemon runs it when a worker ended
+    uncleanly and no successor will run (budget exhausted, disabled,
+    shutdown before the respawn); SIGKILL at 3 s; never a strike. Tests
+    `led::tests::{budget_exhausted_by_kills_mid_drive_ends_on_the_original_modes,
+    disable_right_after_an_unclean_death_restores_the_originals,
+    restore_pass_is_quiet_without_a_file_or_a_server_and_runs_at_shutdown}`
+    (real worker + stub), `engine::tests::restore_pass_*`,
+    `worker::restore_saved_pass_restores_leftovers_and_is_quiet_otherwise`.
+  - R-b guard evasions — CLOSED for the listed cases. Any word of a command
+    naming a kwe-daemon binary (path or daemon variable) is a launch unless
+    the command is inert (test/echo/cp/pkill/systemctl/...); shell `-c` /
+    `eval` strings are searched; `cargo run` mentioning kwe-daemon anywhere;
+    `--no-led-worker` must be its own word; `--led-sdk-port` must resolve
+    (literal, literal-assigned variable, or a variable the script refuses
+    to be 6742) to a number ≠ 6742, 06742 counts as 6742, arithmetic /
+    command substitution / defaults are suspect. Self-test 50 bad / 32
+    good; clean on `scripts/*.sh`. Still missed (not in scope): a path
+    built by concatenation (`B=target/debug/kwe-; "${B}daemon"`), aliases,
+    sourcing another file.
+  - NIT Workshop tombstone edge — CLOSED. A scan of a still-tombstoned id
+    no longer re-caches it, so it can never outlive the tombstone and be
+    synthesized as `subscribed_missing`. Test
+    `workshop_cache::tests::steam_lag_scan_never_outlives_the_tombstone`.
+  - **Open items — need the first live test** (nothing here was verified
+    against real hardware or real capture):
+    - real OpenRGB wire compatibility (installed OpenRGB 1.1; only the
+      in-tree stub has been spoken to);
+    - real captured audio driving LEDs (levels/AGC were derived from
+      `analyze_stereo` on generated signals, not from PipeWire capture of
+      real music);
+    - restore fidelity on real hardware (saved mode + colours re-applied to
+      real controllers, incl. after a crash and via the restore-only pass);
+    - the "spectrum" bands are time slices of the 43 ms window, not
+      frequencies (`kwe-core/src/audio.rs`, renderer contract, unchanged
+      here): spectrum bars therefore show loudness across the window, and
+      "bass" is the window's first eighth — expect a lively but not
+      frequency-accurate display.
 
 Requested 2026-08-29: drive OpenRGB-controlled devices (keyboard, case
 LEDs, strips) from the running wallpaper and/or the captured system

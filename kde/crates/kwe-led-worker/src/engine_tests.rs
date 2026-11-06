@@ -137,12 +137,80 @@ impl Rig {
     }
 }
 
-fn loud(e: &mut Engine, now: Instant) {
-    e.set_audio(now, &[0.8; 16], &[0.8; 16]);
+// ---------------------------------------------------------------------------
+// Real pipeline levels (review fixes D, M1): every audio fixture is the
+// output of `kwe_core::audio::analyze_stereo` for a generated signal, with
+// the daemon's real window (2048 samples at 48 kHz) and band count (64).
+// ---------------------------------------------------------------------------
+
+const WINDOW: usize = 2048;
+const BANDS: usize = 64;
+const RATE: f32 = 48_000.0;
+
+#[derive(Debug, Clone, Copy)]
+enum Signal {
+    /// Uniform white noise at this RMS level (dBFS): broadband music.
+    Noise(f32),
+    /// 60 Hz + half-amplitude 120 Hz at this RMS level: bass-heavy music.
+    Bass(f32),
+    Silence,
 }
 
+fn rms_of(db: f32) -> f32 {
+    10f32.powf(db / 20.0)
+}
+
+/// One analysed window of `signal`; `k` advances the noise seed / tone
+/// phase so consecutive frames differ like real capture.
+fn frame_of(signal: Signal, k: u64) -> Vec<f32> {
+    let samples: Vec<f32> = match signal {
+        Signal::Silence => vec![0.0; WINDOW],
+        Signal::Noise(db) => {
+            let amp = rms_of(db) * 3f32.sqrt();
+            let mut s = k.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            (0..WINDOW)
+                .map(|_| {
+                    s = s
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    ((s >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0) * amp
+                })
+                .collect()
+        }
+        Signal::Bass(db) => {
+            // RMS of sin + 0.5 sin(2x) is sqrt((1 + 0.25) / 2).
+            let scale = rms_of(db) / (1.25f32 / 2.0).sqrt();
+            let start = (k as usize * WINDOW) as f32;
+            (0..WINDOW)
+                .map(|i| {
+                    let t = (start + i as f32) / RATE;
+                    let w = std::f32::consts::TAU * 60.0 * t;
+                    (w.sin() + 0.5 * (2.0 * w).sin()) * scale
+                })
+                .collect()
+        }
+    };
+    kwe_core::analyze_stereo(1, &samples, &samples, BANDS)
+        .unwrap()
+        .left
+}
+
+static FRAME_NO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn play(e: &mut Engine, now: Instant, signal: Signal) {
+    let k = FRAME_NO.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let b = frame_of(signal, k);
+    e.set_audio(now, &b, &b);
+}
+
+/// Normal listening level: −20 dBFS broadband.
+fn loud(e: &mut Engine, now: Instant) {
+    play(e, now, Signal::Noise(-20.0));
+}
+
+/// Digital silence (what a PipeWire monitor delivers with nothing playing).
 fn quiet(e: &mut Engine, now: Instant) {
-    e.set_audio(now, &[0.0; 16], &[0.0; 16]);
+    play(e, now, Signal::Silence);
 }
 
 /// N1: silent audio frames (capture runs continuously while an audio mode
@@ -207,8 +275,8 @@ fn ambient_pulse_is_steady_ambient_in_silence() {
     thread::sleep(Duration::from_millis(100));
     let c = r.stub.controllers()[0].colors[0];
     assert!(
-        c.r < 120,
-        "a quiet moment in music still pulses down: {c:?}"
+        (120..200).contains(&c.r),
+        "a quiet moment in music pulses down to the 50 % floor, not dark: {c:?}"
     );
     fs::remove_dir_all(dir).ok();
 }
@@ -478,5 +546,308 @@ fn persist_encodes_only_when_the_set_changes() {
         after_take,
         "no encode in 200 steady ticks"
     );
+    fs::remove_dir_all(dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Review fixes D (M1): audio at real pipeline levels.
+// ---------------------------------------------------------------------------
+
+/// Brightest channel over every LED of every device (0..=255).
+fn brightest(stub: &StubServer) -> u8 {
+    stub.controllers()
+        .iter()
+        .flat_map(|c| c.colors.iter())
+        .map(|k| k.r.max(k.g).max(k.b))
+        .max()
+        .unwrap_or(0)
+}
+
+/// 60 % of full scale at brightness 100.
+const VISIBLE: u8 = 153;
+
+/// Runs `signal` in spectrum mode from a fresh rig for `secs` and returns
+/// the rig plus the brightest channel seen over the last second.
+fn spectrum_run(signal: Signal, secs: f32) -> (Rig, u8) {
+    let mut r = Rig::new(Mode::Spectrum, None);
+    r.run_until(secs - 1.0, |e, now, _| play(e, now, signal));
+    let mut peak = 0u8;
+    while r.secs() < secs {
+        let t = r.secs() + 0.1;
+        r.run_until(t, |e, now, _| play(e, now, signal));
+        thread::sleep(Duration::from_millis(5));
+        peak = peak.max(brightest(&r.stub));
+    }
+    (r, peak)
+}
+
+/// M1: normal (−20 dBFS), loud (−10 dBFS) and quiet (−40 dBFS) music —
+/// broadband and bass-heavy — takes the devices over within the dwell and
+/// reaches a clearly visible brightness. The pre-fix worker never took
+/// over at −20/−40 dBFS and painted ≤ 13/255 at −10 dBFS.
+#[test]
+fn real_level_music_takes_over_and_is_clearly_visible() {
+    for signal in [
+        Signal::Noise(-20.0),
+        Signal::Bass(-20.0),
+        Signal::Noise(-10.0),
+        Signal::Noise(-40.0),
+        Signal::Bass(-40.0),
+    ] {
+        let (r, peak) = spectrum_run(signal, 4.0);
+        assert!(
+            r.wait_modes(&[0, 0]),
+            "{signal:?}: not taken {:?}",
+            r.modes()
+        );
+        let st = r.e.status(r.now, 1);
+        assert!(!st.audio.silent, "{signal:?}: counted as silence");
+        assert_eq!(st.driven_count, 2, "{signal:?}");
+        eprintln!("{signal:?}: brightest channel {peak}/255");
+        assert!(peak >= VISIBLE, "{signal:?}: brightest {peak} < {VISIBLE}");
+    }
+}
+
+/// M1: digital silence and noise-floor hiss (−60 dBFS and below) are
+/// silence — never a takeover, `audio.silent` — while quiet-but-audible
+/// material (−50 dBFS) is sound. Pre-fix, −50 dBFS was silence.
+#[test]
+fn silence_and_hiss_are_silent_but_quiet_music_is_sound() {
+    for (signal, sound) in [
+        (Signal::Silence, false),
+        (Signal::Noise(-80.0), false),
+        (Signal::Noise(-60.0), false),
+        (Signal::Bass(-60.0), false),
+        (Signal::Noise(-50.0), true),
+        (Signal::Bass(-50.0), true),
+    ] {
+        let mut r = Rig::new(Mode::Spectrum, None);
+        r.run_until(6.0, |e, now, _| play(e, now, signal));
+        let st = r.e.status(r.now, 1);
+        assert!(st.audio.fresh, "{signal:?}");
+        assert_eq!(st.audio.silent, !sound, "{signal:?}: {:?}", st.audio);
+        thread::sleep(Duration::from_millis(100));
+        let takes = r.count(0, packet_id::SET_CUSTOM_MODE);
+        assert_eq!(takes, usize::from(sound), "{signal:?}: {takes} takeovers");
+    }
+}
+
+/// M1: after real-level music stops (digital silence, or hiss at
+/// −65 dBFS), spectrum releases after `SILENCE_RELEASE` (3 s), not before.
+#[test]
+fn silence_after_real_music_releases_after_the_documented_time() {
+    for after in [Signal::Silence, Signal::Noise(-65.0)] {
+        let mut r = Rig::new(Mode::Spectrum, None);
+        r.run_until(3.0, |e, now, _| loud(e, now));
+        assert!(r.wait_modes(&[0, 0]), "{after:?}: never taken");
+        let stop = r.secs();
+        let release = SILENCE_RELEASE.as_secs_f32();
+        r.run_until(stop + release - 0.2, |e, now, _| play(e, now, after));
+        assert_eq!(r.settled_modes(), vec![0, 0], "{after:?}: released early");
+        r.run_until(stop + release + 0.3, |e, now, _| play(e, now, after));
+        assert!(r.wait_modes(&[2, 2]), "{after:?}: not released");
+        assert!(r.e.status(r.now, 1).audio.silent);
+    }
+}
+
+/// M1: a quiet passage after a loud one is back to a clearly visible
+/// brightness within 3 s (20 dB at 10 dB/s = 2 s, plus smoothing), and it
+/// never releases meanwhile.
+#[test]
+fn loud_to_quiet_recovers_within_the_documented_time() {
+    let mut r = Rig::new(Mode::Spectrum, None);
+    r.run_until(5.0, |e, now, _| play(e, now, Signal::Noise(-10.0)));
+    assert!(r.wait_modes(&[0, 0]));
+    r.run_until(5.3, |e, now, _| play(e, now, Signal::Noise(-30.0)));
+    thread::sleep(Duration::from_millis(50));
+    let dimmed = brightest(&r.stub);
+    r.run_until(8.0, |e, now, _| play(e, now, Signal::Noise(-30.0)));
+    let mut peak = 0;
+    for _ in 0..5 {
+        let t = r.secs() + 0.1;
+        r.run_until(t, |e, now, _| play(e, now, Signal::Noise(-30.0)));
+        thread::sleep(Duration::from_millis(5));
+        peak = peak.max(brightest(&r.stub));
+    }
+    eprintln!("loud→quiet: {dimmed}/255 at +0.3 s, {peak}/255 at +3 s");
+    assert!(dimmed < peak, "the gain did adapt ({dimmed} → {peak})");
+    assert!(peak >= VISIBLE, "recovered to {peak} < {VISIBLE}");
+    assert_eq!(r.count(0, packet_id::UPDATE_MODE), 0, "never released");
+    assert_eq!(r.count(0, packet_id::SET_CUSTOM_MODE), 1);
+}
+
+/// M1: a steady signal at any real level is one takeover and no release
+/// over a simulated minute (the pre-fix worker flapped around its
+/// threshold at −10 dBFS and never took over at −20/−40 dBFS).
+#[test]
+fn steady_real_levels_never_flap_over_a_minute() {
+    for signal in [
+        Signal::Noise(-40.0),
+        Signal::Noise(-20.0),
+        Signal::Bass(-20.0),
+        Signal::Noise(-10.0),
+    ] {
+        let mut r = Rig::new(Mode::Spectrum, None);
+        r.run_until(61.0, |e, now, _| play(e, now, signal));
+        thread::sleep(Duration::from_millis(100));
+        for dev in 0..2 {
+            let takes = r.count(dev, packet_id::SET_CUSTOM_MODE);
+            let gives = r.count(dev, packet_id::UPDATE_MODE);
+            assert_eq!((takes, gives), (1, 0), "{signal:?} device {dev}");
+        }
+    }
+}
+
+/// M1: `ambient+pulse` at real levels modulates around a visibly lit
+/// ambient (50–100 %) — beats (−20 dBFS bass, 250 ms) over a −40 dBFS bed
+/// visibly pulse, and loud steady music (−10 dBFS) never dims below the
+/// floor. Pre-fix: −20 dBFS never pulsed, −10 dBFS dimmed to ≈ 24 %.
+#[test]
+fn ambient_pulse_modulates_around_a_lit_ambient_at_real_levels() {
+    let dir = temp_dir("pulse-real");
+    let frame = dir.join("f.bin");
+    let _w = solid_frame(&frame, [255, 0, 0]);
+    for steady in [false, true] {
+        let mut r = Rig::new(Mode::AmbientPulse, Some(frame.clone()));
+        let signal = move |s: f32| {
+            if steady {
+                Signal::Noise(-10.0)
+            } else if s % 0.5 < 0.25 {
+                Signal::Bass(-20.0)
+            } else {
+                Signal::Noise(-40.0)
+            }
+        };
+        r.run_until(3.0, |e, now, s| play(e, now, signal(s)));
+        assert!(r.wait_modes(&[0, 0]));
+        let (mut lo, mut hi) = (255u8, 0u8);
+        while r.secs() < 8.0 {
+            let t = r.secs() + 0.05;
+            r.run_until(t, |e, now, s| play(e, now, signal(s)));
+            thread::sleep(Duration::from_millis(3));
+            let c = r.stub.controllers()[0].colors[0];
+            lo = lo.min(c.r);
+            hi = hi.max(c.r);
+        }
+        eprintln!("ambient+pulse steady={steady}: red {lo}..{hi}");
+        assert!(lo >= 115, "steady={steady}: dimmed to {lo}");
+        assert!(hi >= 200, "steady={steady}: peak {hi}");
+        if !steady {
+            assert!(hi - lo >= 40, "beats must visibly pulse: {lo}..{hi}");
+        }
+    }
+    fs::remove_dir_all(dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Review fixes D (R-a): the restore-only pass (`--restore-saved`).
+// ---------------------------------------------------------------------------
+
+fn restore_pass(port: u16, path: &std::path::Path, boot: &str, wall: SystemTime) -> RestoreSaved {
+    let mut log = LogLimiter::silent(Instant::now());
+    restore_saved(
+        path.to_path_buf(),
+        EngineConfig::with_port(port).client,
+        SAVED_FRESH,
+        wall,
+        Some(boot.into()),
+        &mut log,
+    )
+}
+
+/// Leaves both stub devices in Direct with the file naming Rainbow, as a
+/// SIGKILLed worker would.
+fn leftovers(stub: &StubServer, path: &std::path::Path, boot: &str) {
+    let mut c = Client::connect(&kwe_openrgb::ClientConfig::with_port(stub.port())).unwrap();
+    c.refresh().unwrap();
+    let ids: Vec<_> = c.controllers().iter().map(|x| x.id).collect();
+    for id in ids {
+        c.take_control(id).unwrap();
+    }
+    let (mut store, _) = Store::open_with_boot_id(path.to_path_buf(), Some(boot.into()));
+    store.write(c.saved_modes()).unwrap();
+    drop(c);
+    let end = Instant::now() + Duration::from_secs(5);
+    while stub.controllers().iter().any(|c| c.active_mode != 0) && Instant::now() < end {
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn restore_pass_gives_back_trusted_leftovers_and_removes_the_file() {
+    let stub = StubServer::start(StubConfig::default()).unwrap();
+    let dir = temp_dir("restore-pass");
+    let path = dir.join("s.json");
+    leftovers(&stub, &path, "b");
+    let before = stub.received().len();
+    let t = Instant::now();
+    let out = restore_pass(stub.port(), &path, "b", SystemTime::now());
+    assert!(t.elapsed() < RESTORE_SAVED_BUDGET + Duration::from_millis(600));
+    assert_eq!(
+        out,
+        RestoreSaved::Done {
+            restored: 2,
+            forgotten: 0,
+            kept: 0
+        }
+    );
+    let end = Instant::now() + Duration::from_secs(5);
+    while stub.controllers().iter().any(|c| c.active_mode != 2) && Instant::now() < end {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(stub.controllers().iter().all(|c| c.active_mode == 2));
+    assert!(!path.exists());
+    // It never takes anything over.
+    let took = stub.received()[before..]
+        .iter()
+        .filter(|p| p.id == packet_id::SET_CUSTOM_MODE || p.id == packet_id::UPDATE_LEDS)
+        .count();
+    assert_eq!(took, 0);
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn restore_pass_is_a_quiet_no_op_without_a_file_or_a_server_and_obeys_trust() {
+    let dir = temp_dir("restore-noop");
+    let path = dir.join("s.json");
+    // No file, server present: nothing sent at all.
+    let stub = StubServer::start(StubConfig::default()).unwrap();
+    let out = restore_pass(stub.port(), &path, "b", SystemTime::now());
+    assert_eq!(out, RestoreSaved::NoFile);
+    thread::sleep(Duration::from_millis(50));
+    assert!(stub.received().is_empty(), "connected without a file");
+    // A file, no server: untouched (content and mtime), quick.
+    leftovers(&stub, &path, "b");
+    let port = stub.port();
+    drop(stub);
+    let bytes = fs::read(&path).unwrap();
+    let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+    let t = Instant::now();
+    let out = restore_pass(port, &path, "b", SystemTime::now());
+    assert!(
+        matches!(out, RestoreSaved::Unreachable { kept: 2 }),
+        "{out:?}"
+    );
+    assert!(t.elapsed() < Duration::from_secs(1));
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+    // Untrusted (stale / other boot): forgotten, nothing sent.
+    for (boot, wall) in [
+        (
+            "b",
+            SystemTime::now() + SAVED_FRESH + Duration::from_secs(1),
+        ),
+        ("other", SystemTime::now()),
+    ] {
+        let stub = StubServer::start(StubConfig::default()).unwrap();
+        leftovers(&stub, &path, "b");
+        let before = stub.received().len();
+        let out = restore_pass(stub.port(), &path, boot, wall);
+        assert!(matches!(out, RestoreSaved::Forgotten(_)), "{out:?}");
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(stub.received().len(), before, "{boot}: sent something");
+        assert!(stub.controllers().iter().all(|c| c.active_mode == 0));
+        assert!(!path.exists());
+    }
     fs::remove_dir_all(dir).ok();
 }

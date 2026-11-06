@@ -3,7 +3,7 @@
 //!
 //! Exit codes: 0 normal stop (SIGTERM/SIGINT, `led_stop`, stdin EOF,
 //! `--duration-s`); 2 usage. `--probe`: 0 reachable, 3 server absent,
-//! 1 other error, 2 usage.
+//! 1 other error, 2 usage. `--restore-saved`: always 0 (2 usage).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use kwe_led_protocol::{Mode, is_device_id, validate_frame_path};
 use kwe_led_worker::engine::{
-    Engine, EngineConfig, MIN_RETAKE, SILENCE_RELEASE, Settings, TAKEOVER_DWELL, device_info,
+    Engine, EngineConfig, MIN_RETAKE, SAVED_FRESH, SILENCE_RELEASE, Settings, TAKEOVER_DWELL,
+    device_info, restore_saved,
 };
 use kwe_led_worker::log::LogLimiter;
 use kwe_led_worker::runtime::{Outbox, RunOptions, Shared, read_lines, run};
@@ -91,6 +92,12 @@ struct Args {
     /// Without it, remembered modes live in memory only.
     #[arg(long, value_parser = parse_frame)]
     saved_modes: Option<PathBuf>,
+    /// One bounded restore-only pass over `--saved-modes` (same boot and
+    /// freshness rules as adoption), then exit 0 within ≈ 2.5 s. Never
+    /// takes a device over; a quiet no-op without a file or a server. Run
+    /// by the daemon after a worker died uncleanly and none will follow.
+    #[arg(long, requires = "saved_modes")]
+    restore_saved: bool,
 }
 
 fn parse_mode(text: &str) -> Result<Mode, String> {
@@ -186,6 +193,20 @@ fn main() {
     }
     if args.probe {
         std::process::exit(probe(&args));
+    }
+    if args.restore_saved {
+        let now = Instant::now();
+        let mut log = LogLimiter::new(now);
+        let path = args.saved_modes.clone().unwrap_or_default();
+        restore_saved(
+            path,
+            EngineConfig::with_port(args.port).client,
+            SAVED_FRESH,
+            std::time::SystemTime::now(),
+            kwe_led_worker::saved::current_boot_id(),
+            &mut log,
+        );
+        std::process::exit(0);
     }
 
     // Termination signals are handled by a dedicated thread (`sigwait`), so

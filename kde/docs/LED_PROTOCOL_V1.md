@@ -45,7 +45,8 @@ the code is `crates/kwe-led-worker` (binary + library) and the wire types are
 | `--timeout-ms N` | 1000 | 1..=30000 | `--probe` I/O timeout (enumeration additionally ≤ 2 s) |
 | `--saved-modes PATH` | none | absolute, ≤4096 B, no `.`/`..` | persist remembered device modes (below); without it they live in memory only |
 | `--standalone` | off | | development: stdin EOF does not stop |
-| `--synthetic-audio` | off | | development: internal 32-band test audio (2 Hz bass pulse + sweeping peak) |
+| `--restore-saved` | off | requires `--saved-modes` | one bounded restore-only pass over the saved-modes file, then exit 0 (below; review fixes D) |
+| `--synthetic-audio` | off | | development: internal 32-band test audio (2 Hz bass pulse + sweeping peak) at the real pipeline's level (loudest band `0.06 / bands`, as −20 dBFS noise through `analyze_stereo`) |
 | `--duration-s N` | none | 1..=3600 | stop (and restore) after N s |
 | `--backoff-min-ms N` (hidden) | 1000 | 50..=60000 | first re-probe delay |
 | `--backoff-max-ms N` (hidden) | 60000 | ≥ min, ≤60000 | re-probe delay cap |
@@ -73,6 +74,7 @@ kwe-led-worker --port N --standalone --synthetic-audio \
 | 1 | could not start its stdin thread (resource exhaustion) |
 | 2 | usage error |
 | `--probe`: 0 / 3 / 1 / 2 | reachable / server absent / other error / usage |
+| `--restore-saved`: 0 / 2 | always 0 (nothing to do, unreachable, done) / usage |
 
 An absent, refusing, stalling, or misbehaving OpenRGB server is **never** an
 exit: it is a status. A non-zero exit or a signal death is a real crash and
@@ -98,7 +100,7 @@ NDJSON, one JSON object per line, ≤ **4096 bytes** including the newline
 
 | Type | Semantics |
 |---|---|
-| `audio_bands` | The renderer line from `kwe-input-protocol`, unchanged and validated by its own decoder. Latest wins; `sequence` is ignored. Fresh for 500 ms, then treated as "no audio". A frame whose loudest band (perceptual, `sqrt(mean(l, r))`) is below **0.05** is **silence** (review fixes C1): fresh but not a source. |
+| `audio_bands` | The renderer line from `kwe-input-protocol`, unchanged and validated by its own decoder. Latest wins; `sequence` is ignored. Fresh for 500 ms, then treated as "no audio". A frame whose **window level** — the sum of its mono raw bands `mean(l, r)` — is below **6.4e-4** (≈ −56 dBFS) is **silence** (review fixes D, M1; see §Audio levels): fresh but not a source. |
 | `led_config` | Every field optional; a present field replaces the current value, absent keeps it. `mode` ∈ `off`, `ambient`, `spectrum`, `ambient+pulse`; `brightness` 0..=100; `rate_hz` 1..=20; `disabled_devices` (≤128 ids) **replaces the whole set** (`[]` enables all). Unknown fields or out-of-range values reject the whole line (nothing applied). |
 | `led_frame` | The active renderer's frame file; `null` = no renderer live. Absolute UTF-8 path ≤4096 bytes, no NUL, no `.`/`..` components. Existence is not required (checked per tick). |
 | `led_status_request` | Emit a status line as soon as the rate limit allows (≤250 ms). |
@@ -177,7 +179,7 @@ heartbeat older than ~15 s while the process lives means it is wedged.
 | `frame.state` | `none` (no path), `ok`, `absent` (no file), `invalid` (bad header, truncated, symlink, not a regular file), `busy` (writer mid-publish on every attempt, or nothing published yet) |
 | `frame.sequence/width/height` | of the last accepted snapshot |
 | `audio.fresh`, `audio.bands` | an `audio_bands` line arrived within 500 ms; its band count |
-| `audio.silent` | fresh frames arrive but carry no sound (every band < 0.05 for the last 500 ms). With `waiting_for_source` in `spectrum`: `fresh:true, silent:true` = nothing is playing; `fresh:false` = no audio frames at all. *Additive (review fixes C1)*: decodes as `false` from an older worker |
+| `audio.silent` | fresh frames arrive but carry no sound (window level < 6.4e-4, ≈ −56 dBFS, for the last 500 ms; review fixes D — was "every `sqrt(band)` < 0.05", which called −20 dBFS music silent). With `waiting_for_source` in `spectrum`: `fresh:true, silent:true` = nothing is playing; `fresh:false` = no audio frames at all. *Additive (review fixes C1)*: decodes as `false` from an older worker |
 | `device_count` | controllers the server reported |
 | `devices[]` | ≤32 listed; `devices_truncated` when more exist or the line had to shrink. `id` is the key for `disabled_devices`; display strings are cut to 80 chars; ≤16 zones per device (`zones_truncated`). Zone `type` ∈ `single`, `linear`, `matrix`, `unknown`; `matrix` = `[height, width]` |
 | `enabled` | not in `disabled_devices` |
@@ -402,6 +404,25 @@ daemon parses one device shape.
   write replaces it) — never a crash, never an exit.
 - Without the flag (standalone/dev) remembered modes live in memory only
   and a SIGKILLed worker leaves its devices in the per-LED mode.
+- **Restore-only pass** (`--restore-saved --saved-modes PATH`, review
+  fixes D, R-a): the daemon runs it when a worker ended uncleanly and no
+  successor will adopt the file (restart budget exhausted, LED sync
+  disabled, or daemon shutdown before the respawn). Same trust rules as
+  adoption (same boot, writer alive within 60 s; untrusted = forgotten and
+  removed, devices left alone). It connects once (connect 250 ms, version
+  exchange ≤ 0.5 s, enumeration bounded by what is left of its budget),
+  forgets entries the user evidently replaced, restores every listed
+  remembered device, and rewrites the file to hold what is left (removed
+  when empty; untouched when nothing changed). It starts operations only
+  within **2 s** of its start (`RESTORE_SAVED_BUDGET`), so it ends within
+  ≈ 2.5 s; the daemon SIGKILLs it at 3 s. It never sends `SetCustomMode`
+  or `UpdateLEDs`, never touches the file's mtime as a liveness mark, and
+  is a quiet exit 0 with no file (no connection at all) or with OpenRGB
+  unreachable (file left untouched, one `event=led.restore_saved
+  detail=unreachable reason=server_absent kept=N` line). Its only other
+  stderr lines are `event=led.restore_saved detail=done restored=N
+  forgotten=N kept=N`, `detail=forgotten reason=<why>`, or
+  `detail=ignored reason=<why>`. No stdout.
 - Known limits (what the user sees):
   - **Inside the 60 s window** a user's brand-new Direct lighting (an
     OpenRGB profile or Effects-plugin effect applied right after the worker
@@ -410,7 +431,10 @@ daemon parses one device shape.
     The user re-applies it (or their profile) once.
   - **Outside the window, or after a reboot**, leftovers are forgotten: a
     device the dead worker left in Direct keeps showing the **last
-    wallpaper colours, frozen**, until the user picks lighting in OpenRGB
+    wallpaper colours, frozen**, (since review fixes D the daemon's
+    restore-only pass closes the crash-loop / disable / shutdown cases
+    inside the window; this remains for a daemon that itself died, e.g.
+    SIGKILL or OOM, and was not restarted within 60 s), until the user picks lighting in OpenRGB
     (or a profile loads). If LED sync then takes that device over, it
     remembers those frozen colours as the "previous" lighting.
   - A device missing from the list at stop (`enabled:false`, daemon stop)
@@ -488,12 +512,53 @@ each (was 9.66 s before review fixes A), < 0.5 s idle with no server
 | matrix | each cell = mean of its box of the grid; LEDs absent from the map take the frame colour | one bar per column, lit from the bottom, top cell partial |
 | other/unknown, or matrix without a usable map | treated as linear | treated as linear |
 
-- Audio bands: `sqrt(mean(left, right))` per band (perceptual lift); bass
-  energy = mean of the lowest eighth of the bands (≥ 2).
-- `ambient+pulse`: ambient colour × `0.2 + 0.8·bass`; without fresh audio,
-  or after 3 s of silence, the factor is 1 (plain ambient — it used to sit
-  at the 0.2 floor, near-dark, whenever nothing played); a quiet moment
-  shorter than that inside music still pulses down.
+- Audio bands: auto-gained (§Audio levels), then `sqrt(raw · bands / peak)`
+  per band (perceptual lift), `0..=1`; bass energy = mean of the lowest
+  eighth of those bands (≥ 2).
+- `ambient+pulse`: ambient colour × `0.5 + 0.5·bass` while sound plays
+  (review fixes D: was `0.2 + 0.8·bass`, which sat near-dark between
+  beats): the colours stay between **50 % and 100 %** of plain ambient —
+  measured with real-level fixtures: beats of −20 dBFS bass over a
+  −40 dBFS bed swing red 173..233 of 255, steady −10 dBFS music sits at
+  238..248. Without fresh audio, or after 3 s of silence, the factor is 1
+  (plain ambient); a quiet moment shorter than that inside music still
+  pulses down to the 50 % floor.
+### Audio levels (review fixes D, M1)
+
+`kwe_core::audio::analyze_stereo` (renderer path, unchanged) divides each
+band's Hann-windowed |sample| sum by the **whole** window length, so the
+bands of one window add up to its mean weighted |x| ≈ **0.43 × RMS** for
+noise-like music, whatever the band count or window length; one band is
+that divided by the band count — about 100× below `0..1`. Measured through
+`analyze_stereo` (2048 samples, 64 bands): window level 4.3e-4 at −60 dBFS,
+1.4e-3 at −50, 4.3e-3 at −40, 4.3e-2 at −20, 0.43 at 0 dBFS; loudest raw
+band of −20 dBFS noise ≈ 0.0009, of a full-scale sine ≈ 0.0075–0.01. (The
+"bands" are time slices of the window, not frequencies: see the backlog's
+open items.) The worker therefore:
+
+- **Silence** = window level `Σ mean(l, r)` < **6.4e-4** (≈ −56 dBFS):
+  digital silence, dither and noise-floor hiss (≤ −60 dBFS) are silent;
+  quiet-but-audible music (≥ −50 dBFS) is sound. Drives `audio.silent`,
+  the `spectrum` source and its 3 s silence release, and the pulse.
+- **Automatic gain** for display: a running peak of `max(raw) × bands`
+  with **instant attack**, **decay 10 dB/s**, and a **floor of 6.4e-3**
+  (the loudest band of −37 dBFS noise). Display band = `sqrt(clamp(raw ×
+  bands / peak, 0, 1))`, used by the spectrum zones and the bass pulse. A
+  silent frame shows black and lets the peak decay. Consequences: the
+  loudest recent band is full scale at any playback volume; a passage
+  20 dB quieter than the one before is back at full scale within **2 s**
+  (30 dB within 3 s; the regression test asserts ≥ 60 % within 3 s of a
+  −10 → −30 dBFS drop); between beats (≤ 0.5 s) the reference falls
+  ≤ 5 dB, so beats still read as beats; material just above the silence
+  floor peaks at ≈ 37 % instead of being amplified to full brightness;
+  −40 dBFS music still reaches ≈ 85 % on its loudest LEDs.
+- Measured brightest channel in `spectrum` (brightness 100, stub devices,
+  real `analyze_stereo` fixtures): −20 dBFS noise 232/255, −20 dBFS bass
+  tone 207, −10 dBFS 232, −40 dBFS noise 216, −40 dBFS bass 207; no
+  takeover/release cycle over a simulated minute at −40/−20/−10 dBFS.
+  Before the fix: −20 and −40 dBFS never took over, −10 dBFS painted
+  ≤ 13/255 and flapped around the threshold.
+
 - Smoothing (exponential, per LED): ambient τ = 0.25 s; spectrum attack
   30 ms / release 200 ms; pulse attack 30 ms / release 250 ms.
 - Brightness cap applied last (linear scale of the sRGB bytes).
@@ -515,7 +580,9 @@ each (was 9.66 s before review fixes A), < 0.5 s idle with no server
 | restore on stop | 1.5 s; final flush 0.3 s; SIGTERM → exit ≤ 3.35 s |
 | device operations per tick | started within 0.5 s; stop checked between devices |
 | idle ticks | none while disconnected (sleep to next probe); 4 Hz waiting for a source; 1 Hz in mode `off` |
-| hysteresis | takeover dwell 1 s; ≥ 5 s from a release to the next takeover (one user mode switch / device enable skips it); spectrum silence release 3 s (level < 0.05) |
+| hysteresis | takeover dwell 1 s; ≥ 5 s from a release to the next takeover (one user mode switch / device enable skips it); spectrum silence release 3 s (window level < 6.4e-4 ≈ −56 dBFS) |
+| audio gain | running peak: instant attack, 10 dB/s decay, floor 6.4e-3 (`max(raw) × bands`) |
+| restore-only pass | operations started within 2 s, exits ≈ ≤ 2.5 s; daemon SIGKILLs at 3 s |
 | saved-modes trust | same boot id + mtime within 60 s; liveness touch every 5 s while the file exists |
 | remembered-modes file | ≤ 8 MiB, ≤ 128 entries |
 | stderr | token bucket: burst 20 lines, then 1 per 6 s, `suppressed=N` appended; lines ≤ 512 chars; control characters escaped (server strings cannot forge lines) |
