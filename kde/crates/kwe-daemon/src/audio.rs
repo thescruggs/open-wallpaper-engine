@@ -7,13 +7,17 @@
 //! identify its own worker's `audio.forward` connections by peer credentials.
 //!
 //! Capture runs while EITHER the `--audio-capture` flag was passed OR LED
-//! sync currently wants audio (enabled, worker usable, mode `spectrum` or
-//! `ambient+pulse`) — review fixes B. The supervisor publishes the LED
-//! demand into a shared flag every tick; this runtime follows it on its own
-//! 100 ms tick, starting capture when it rises and stopping it (SIGTERM,
-//! grace, SIGKILL) when it falls and the flag was not passed. What
-//! renderers receive is decided elsewhere and does not change: the
-//! per-wallpaper audio grant and the generation gate in the supervisor.
+//! sync demands audio — review fixes B, narrowed in C2 (R1): LED sync
+//! enabled in `spectrum` / `ambient+pulse`, its worker connected to an
+//! OpenRGB server (driving or `waiting_for_source`) and the pause verdict
+//! not holding, debounced by `led::AUDIO_DEMAND_HOLD` (10 s) on the falling
+//! edge. The supervisor publishes that demand into a shared flag every
+//! tick; this runtime follows it on its own 100 ms tick, starting capture
+//! when it rises and stopping it (SIGTERM, grace, SIGKILL) when it falls
+//! and the flag was not passed. Who receives the frames is decided in the
+//! supervisor (C2, R2): without the flag the daemon's own capture reaches
+//! the LED worker only — renderers get nothing, as before LED sync; with
+//! it the per-wallpaper audio grant and the generation gate apply.
 //!
 //! The worker's stderr is inherited (its bounded diagnostics land in the
 //! daemon's own log); its stdout is unused. The worker is spawned with the
@@ -62,8 +66,8 @@ pub struct AudioCaptureConfig {
     pub socket: PathBuf,
     /// Optional PipeWire capture node passthrough (`--capture-node`).
     pub capture_node: Option<String>,
-    /// LED sync wants audio right now (written by the supervisor every
-    /// tick, read here every `WORKER_TICK`).
+    /// LED sync demands capture right now (`LedManager::audio_demand`,
+    /// written by the supervisor every tick, read here every `WORKER_TICK`).
     pub led_demand: Arc<AtomicBool>,
 }
 
@@ -79,7 +83,9 @@ pub struct AudioCaptureStatus {
     /// while this holds unless the restart budget is exhausted.
     pub active: bool,
     /// Why capture is wanted: `audio_capture_flag` (`--audio-capture`),
-    /// `led_sync` (LED sync in an audio mode). Empty = capture off.
+    /// `led_sync` (LED sync demands it: audio mode, connected to OpenRGB,
+    /// not paused — or within the 10 s hold after that ended). Empty =
+    /// capture off.
     pub reasons: Vec<&'static str>,
     pub pid: Option<u32>,
     pub restarts: u64,

@@ -132,3 +132,18 @@ qt_add_executable(kwe-wallpaper-filter-model-test
 )
 target_link_libraries(kwe-wallpaper-filter-model-test PRIVATE Qt6::Core Qt6::Gui Qt6::Test)
 add_test(NAME kwe-wallpaper-filter-model-test COMMAND kwe-wallpaper-filter-model-test)
+
+# Review fixes C2 (R9): offscreen QML check that the unsubscribe confirmation
+# emits accepted() once per click and rejected() once on Cancel / Escape.
+# Qt 6's qmltestrunner (a bare `qmltestrunner` on PATH may be Qt 5's).
+find_program(KWE_QMLTESTRUNNER
+    NAMES qmltestrunner6 qmltestrunner
+    PATHS "${QT6_INSTALL_PREFIX}/${QT6_INSTALL_BINS}" /usr/lib/qt6/bin
+    NO_DEFAULT_PATH)
+if(KWE_QMLTESTRUNNER)
+    add_test(NAME kwe-unsubscribe-dialog-qmltest
+        COMMAND "${KWE_QMLTESTRUNNER}" -platform offscreen
+            -input "${CMAKE_CURRENT_SOURCE_DIR}/qml/tst_unsubscribedialog.qml")
+else()
+    message(WARNING "Qt 6 qmltestrunner not found: kwe-unsubscribe-dialog-qmltest is not registered")
+endif()

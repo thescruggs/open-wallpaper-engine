@@ -36,6 +36,10 @@ QJsonObject merged(QJsonObject base, const QJsonObject &overlay) {
 
 LedSyncClient::LedSyncClient(QString socketPath, QObject *parent)
     : QObject(parent), m_socketPath(std::move(socketPath)) {
+    // audioHint derives from status, settings and support alike.
+    connect(this, &LedSyncClient::statusChanged, this, &LedSyncClient::audioHintChanged);
+    connect(this, &LedSyncClient::settingsChanged, this, &LedSyncClient::audioHintChanged);
+    connect(this, &LedSyncClient::supportChanged, this, &LedSyncClient::audioHintChanged);
     connect(&m_socket, &QLocalSocket::connected, this, &LedSyncClient::writeRequest);
     connect(&m_socket, &QLocalSocket::readyRead, this, &LedSyncClient::consumeResponse);
     connect(&m_socket, &QLocalSocket::errorOccurred, this, [this](QLocalSocket::LocalSocketError) {
@@ -379,6 +383,26 @@ void LedSyncClient::drainQueue() {
     begin(m_queue.takeFirst());
 }
 
+bool LedSyncClient::showsPaused() const {
+    return m_state == QStringLiteral("off") && m_reason == QStringLiteral("paused");
+}
+
+QString LedSyncClient::audioHint() const {
+    const QString currentMode = mode();
+    const bool audioMode =
+        currentMode == QStringLiteral("spectrum") || currentMode == QStringLiteral("ambient+pulse");
+    // Capture runs only while LED sync is connected to OpenRGB in an audio
+    // mode (C2, R1), so only then is missing audio worth a word.
+    if (m_support != QStringLiteral("ready") || !enabled() || !audioMode || !m_hasWorkerStatus
+        || m_state != QStringLiteral("active"))
+        return {};
+    if (!m_audioFresh)
+        return QStringLiteral("no_audio");
+    if (m_audioSilent)
+        return QStringLiteral("nothing_playing");
+    return {};
+}
+
 void LedSyncClient::applyStatus(const QJsonObject &status) {
     setSupport(QStringLiteral("ready"));
     m_state = boundedText(status.value(QStringLiteral("state")));
@@ -391,8 +415,10 @@ void LedSyncClient::applyStatus(const QJsonObject &status) {
     const auto server = workerStatus.value(QStringLiteral("server")).toObject();
     m_protocolVersion = server.value(QStringLiteral("protocol")).toInt(0);
     m_sdkPort = server.value(QStringLiteral("port")).toInt(0);
-    m_audioFresh =
-        workerStatus.value(QStringLiteral("audio")).toObject().value(QStringLiteral("fresh")).toBool(false);
+    const auto audio = workerStatus.value(QStringLiteral("audio")).toObject();
+    m_audioFresh = audio.value(QStringLiteral("fresh")).toBool(false);
+    // Additive (C1): an older worker never reports it (false).
+    m_audioSilent = audio.value(QStringLiteral("silent")).toBool(false);
     m_devicesTruncated = workerStatus.value(QStringLiteral("devices_truncated")).toBool(false);
     QVariantList devices;
     for (const auto &value : workerStatus.value(QStringLiteral("devices")).toArray()) {

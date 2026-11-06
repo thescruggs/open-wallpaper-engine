@@ -28,9 +28,13 @@
 //! loads with that field's default.
 //!
 //! The `led` record is isolated from the rest (review fixes B, R2): an
-//! invalid `led` value (bounds, unknown mode, wrong type) resets ONLY `led`
-//! to its defaults — logged once as `event=settings.led_reset` — and
-//! unknown fields inside `led` (a newer daemon's) are ignored. Persistence
+//! invalid `led` value (bounds, unknown mode, wrong type) repairs ONLY `led`
+//! — field-wise since review fixes C2 (N4): valid fields are kept, invalid
+//! ones take their defaults, and `enabled` is kept when it is a bool and is
+//! otherwise `false` (a broken record never turns device takeover on). The
+//! repair is logged once as `event=settings.led_reset` and written back at
+//! open, so the next start is quiet. Unknown fields inside `led` (a newer
+//! daemon's) are ignored. Persistence
 //! is atomic; a file that is not valid JSON, is not the expected top-level
 //! shape (unknown top-level key, wrong type of a non-`led` field) or has an
 //! unsupported schema is still quarantined as a whole with the
@@ -255,16 +259,80 @@ impl<'de> Deserialize<'de> for LedField {
         // Any JSON value is accepted here; only the top-level shape can fail
         // the whole file.
         let raw = serde_json::Value::deserialize(deserializer)?;
-        let parsed = serde_json::from_value::<LedSettings>(raw)
-            .map_err(anyhow::Error::from)
-            .and_then(|led| led.validate().map(|()| led));
+        // Only an object is a record (serde would also read a positional
+        // array such as `[true]` into the struct).
+        let parsed = if raw.is_object() {
+            serde_json::from_value::<LedSettings>(raw.clone())
+                .map_err(anyhow::Error::from)
+                .and_then(|led| led.validate().map(|()| led))
+        } else {
+            Err(anyhow::anyhow!("led must be an object"))
+        };
         Ok(match parsed {
             Ok(value) => Self::new(value),
             Err(error) => Self {
-                value: LedSettings::default(),
+                value: recover_led(&raw),
                 reset_reason: Some(error.to_string()),
             },
         })
+    }
+}
+
+/// Review fixes C2 (N4): field-wise recovery of an invalid `led` record.
+/// Every field that is individually valid is kept; the others take their
+/// defaults — except `enabled`, which is kept only when it is a bool and is
+/// otherwise `false`: a broken record must never turn LED sync (device
+/// takeover) ON for a user who may have turned it off. Device ids that are
+/// not well-formed are dropped (they cannot name a real device); the rest
+/// are sorted, de-duplicated and capped like a patch.
+fn recover_led(raw: &serde_json::Value) -> LedSettings {
+    let defaults = LedSettings::default();
+    let Some(object) = raw.as_object() else {
+        return LedSettings {
+            enabled: false,
+            ..defaults
+        };
+    };
+    let enabled = object
+        .get("enabled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let mode = object
+        .get("mode")
+        .and_then(|value| serde_json::from_value::<Mode>(value.clone()).ok())
+        .unwrap_or(defaults.mode);
+    let brightness = object
+        .get("brightness")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u8::try_from(value).ok())
+        .filter(|value| *value <= BRIGHTNESS_MAX)
+        .unwrap_or(defaults.brightness);
+    let rate_hz = object
+        .get("rate_hz")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u8::try_from(value).ok())
+        .filter(|value| (RATE_MIN_HZ..=RATE_MAX_HZ).contains(value))
+        .unwrap_or(defaults.rate_hz);
+    let mut disabled_devices: Vec<String> = object
+        .get("disabled_devices")
+        .and_then(serde_json::Value::as_array)
+        .map(|ids| {
+            ids.iter()
+                .filter_map(serde_json::Value::as_str)
+                .filter(|id| is_device_id(id))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    disabled_devices.sort();
+    disabled_devices.dedup();
+    disabled_devices.truncate(MAX_DISABLED_DEVICES);
+    LedSettings {
+        enabled,
+        mode,
+        brightness,
+        rate_hz,
+        disabled_devices,
     }
 }
 
@@ -295,7 +363,15 @@ impl SettingsStore {
         ensure_private_dir(directory)?;
         let path = directory.join(SETTINGS_FILE);
         let state = Self::load(&path);
-        Ok(Self { path, state })
+        let store = Self { path, state };
+        if store.state.led.reset_reason.is_some() {
+            // N4: persist the repaired `led` record now, so the reset is
+            // logged once, not at every start.
+            if let Err(error) = store.save(&store.state) {
+                eprintln!("event=settings.led_repair_save_failed detail={error:#}");
+            }
+        }
+        Ok(store)
     }
 
     pub fn audio_output(&self) -> bool {
@@ -417,10 +493,14 @@ impl SettingsStore {
         match serde_json::from_slice::<PersistedSettings>(&bytes) {
             Ok(state) if state.schema_version == 1 => {
                 if let Some(reason) = &state.led.reset_reason {
-                    // Only `led` falls back; the other knobs load as stored
-                    // and the file is rewritten at the next change.
+                    // Only `led` is repaired (field-wise, `enabled` never
+                    // forced on); the other knobs load as stored and
+                    // `open` writes the repaired record back at once.
                     let reason: String = reason.chars().take(200).collect();
-                    eprintln!("event=settings.led_reset detail={reason:?}");
+                    eprintln!(
+                        "event=settings.led_reset enabled={} detail={reason:?}",
+                        state.led.value.enabled
+                    );
                 }
                 state
             }
@@ -663,7 +743,7 @@ mod tests {
         ] {
             std::fs::write(&path, bad).unwrap();
             let mut store = SettingsStore::open(&directory).unwrap();
-            assert_eq!(store.led(), &LedSettings::default(), "{}", String::from_utf8_lossy(bad));
+            assert!(store.led().validate().is_ok(), "{}", String::from_utf8_lossy(bad));
             assert!(store.led_reset_reason().is_some());
             assert!(!store.audio_output(), "audio_output survives");
             assert!(store.pause_when_covered(), "pause policy survives");
@@ -684,8 +764,89 @@ mod tests {
             assert!(reloaded.led_reset_reason().is_none());
             assert!(!reloaded.audio_output());
         }
+    }
 
-        // Unknown fields inside `led` (a newer daemon's) are tolerated.
+    /// Review fixes C2 (N4): a bad `led` record never turns LED sync ON.
+    /// `enabled` survives when it is a bool and becomes `false` when it is
+    /// not; every other individually valid field survives; the repaired
+    /// record is written back at once so the next start is quiet.
+    #[test]
+    fn a_bad_led_record_keeps_sync_off_keeps_valid_fields_and_is_repaired_once() {
+        let directory = temporary_directory("led-repair");
+        let path = directory.join(SETTINGS_FILE);
+        // Disabled + an unknown mode (a downgrade after a newer daemon) + a
+        // too-wide rate: off stays off, brightness and devices survive.
+        std::fs::write(
+            &path,
+            br#"{"schema_version":1,"audio_output":false,"led":{"enabled":false,"mode":"disco","brightness":40,"rate_hz":50,"disabled_devices":["0123456789abcdef"]}}"#,
+        )
+        .unwrap();
+        let store = SettingsStore::open(&directory).unwrap();
+        let led = store.led();
+        assert!(!led.enabled, "a user who turned LED sync off stays off");
+        assert_eq!(led.mode, Mode::Ambient, "invalid mode → default");
+        assert_eq!(led.rate_hz, RATE_DEFAULT_HZ, "invalid rate → default");
+        assert_eq!(led.brightness, 40, "valid field kept");
+        assert_eq!(led.disabled_devices, vec!["0123456789abcdef".to_string()]);
+        assert!(store.led_reset_reason().is_some(), "logged once");
+        assert!(!store.audio_output(), "other knobs untouched");
+        let repaired = SettingsStore::open(&directory).unwrap();
+        assert!(
+            repaired.led_reset_reason().is_none(),
+            "the repaired record was persisted: the second start is quiet"
+        );
+        assert_eq!(repaired.led(), led);
+        assert!(!repaired.audio_output());
+
+        // `enabled` that is not a bool → off (never the default "on").
+        for bad in [
+            &br#"{"schema_version":1,"led":{"enabled":"yes","brightness":30}}"#[..],
+            br#"{"schema_version":1,"led":{"enabled":null}}"#,
+            br#"{"schema_version":1,"led":"on"}"#,
+            br#"{"schema_version":1,"led":[true]}"#,
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            let store = SettingsStore::open(&directory).unwrap();
+            assert!(!store.led().enabled, "{}", String::from_utf8_lossy(bad));
+            assert!(store.led_reset_reason().is_some());
+            assert!(
+                SettingsStore::open(&directory)
+                    .unwrap()
+                    .led_reset_reason()
+                    .is_none()
+            );
+        }
+        // Enabled + one bad field: still on, the rest kept.
+        std::fs::write(
+            &path,
+            br#"{"schema_version":1,"led":{"enabled":true,"mode":"spectrum","brightness":300}}"#,
+        )
+        .unwrap();
+        let store = SettingsStore::open(&directory).unwrap();
+        assert!(store.led().enabled);
+        assert_eq!(store.led().mode, Mode::Spectrum);
+        assert_eq!(store.led().brightness, BRIGHTNESS_DEFAULT);
+        // Unsorted ids are normalized, not dropped; bad ids are dropped.
+        std::fs::write(
+            &path,
+            br#"{"schema_version":1,"led":{"enabled":false,"disabled_devices":["ffffffffffffffff","nothex","0123456789abcdef","ffffffffffffffff"]}}"#,
+        )
+        .unwrap();
+        let store = SettingsStore::open(&directory).unwrap();
+        assert_eq!(
+            store.led().disabled_devices,
+            vec![
+                "0123456789abcdef".to_string(),
+                "ffffffffffffffff".to_string()
+            ]
+        );
+        assert!(!store.led().enabled);
+    }
+
+    #[test]
+    fn led_unknown_inner_fields_are_tolerated() {
+        let directory = temporary_directory("led-unknown");
+        let path = directory.join(SETTINGS_FILE);
         std::fs::write(
             &path,
             br#"{"schema_version":1,"audio_output":false,"led":{"mode":"spectrum","future_knob":{"x":1}}}"#,

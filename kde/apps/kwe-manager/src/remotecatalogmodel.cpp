@@ -324,7 +324,7 @@ void RemoteCatalogModel::clearPending(const QString &id, const QString &note) {
     emit dataChanged(index(row), index(row), {SubscriptionPendingRole, SubscribedRole});
   }
   if (!note.isEmpty())
-    setNotice(note);
+    setNotice(note, id);
   if (m_changes.isEmpty())
     m_pendingTimer.stop();
 }
@@ -404,10 +404,12 @@ void RemoteCatalogModel::setErrorMessage(const QString &message) {
   emit errorMessageChanged();
 }
 
-void RemoteCatalogModel::setNotice(const QString &message) {
-  if (m_notice == message)
+void RemoteCatalogModel::setNotice(const QString &message, const QString &id) {
+  const QString noticeId = message.isEmpty() ? QString() : id;
+  if (m_notice == message && m_noticeId == noticeId)
     return;
   m_notice = message;
+  m_noticeId = noticeId;
   emit noticeChanged();
 }
 

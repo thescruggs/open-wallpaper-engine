@@ -13,6 +13,15 @@
 //! Entries are touched every scan they appear in (a live subscription never
 //! ages out); ids absent from every scan for 30 days are dropped, so an
 //! unsubscribed item fades deterministically.
+//!
+//! W5 review fix (C2, R8): an unsubscribe the daemon itself carried out
+//! (`workshop.unsubscribe` answered ok) removes the id from the cache and
+//! records a tombstone, so the next scan — where Steam has dropped the
+//! item — does not synthesize it as a vanished `subscribed_missing`
+//! subscription. A tombstone ends when the daemon subscribes to the id
+//! again, when a scan shows the id subscribed more than
+//! `UNSUBSCRIBE_SETTLE_MS` after the unsubscribe (re-subscribed in the
+//! Steam client; earlier sightings are Steam's own lag), or after 30 days.
 
 use std::{
     collections::BTreeMap,
@@ -33,6 +42,9 @@ const MAX_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 const STALE_ENTRY_MS: u128 = 30 * 24 * 60 * 60 * 1000;
 /// `ScanLimits::default().max_projects` — synthesis must not exceed it.
 const MAX_CATALOG_ITEMS: usize = 25_000;
+/// A scan that still shows an unsubscribed id as subscribed within this
+/// window is Steam catching up, not a re-subscription (10 minutes).
+const UNSUBSCRIBE_SETTLE_MS: u128 = 10 * 60 * 1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedItem {
@@ -50,6 +62,10 @@ struct CachedItem {
 struct PersistedCache {
     schema_version: u32,
     items: BTreeMap<String, CachedItem>,
+    /// R8: ids the daemon unsubscribed → when (unix ms). Additive: older
+    /// files load with none; older daemons ignore the key.
+    #[serde(default)]
+    unsubscribed: BTreeMap<String, u128>,
 }
 
 /// True when the workspace state means "the user subscribed in Steam".
@@ -69,6 +85,7 @@ fn placeholder_title(item: &CatalogItem) -> bool {
 pub struct WorkshopCache {
     path: PathBuf,
     items: BTreeMap<String, CachedItem>,
+    unsubscribed: BTreeMap<String, u128>,
 }
 
 impl WorkshopCache {
@@ -76,46 +93,80 @@ impl WorkshopCache {
     /// quarantined to an `.invalid-*` sibling and the cache starts fresh.
     pub fn open(state_dir: &Path) -> Self {
         let path = state_dir.join(CACHE_FILE);
-        let items = match fs::metadata(&path) {
+        let (items, unsubscribed) = match fs::metadata(&path) {
             Ok(metadata) if metadata.len() > MAX_CACHE_BYTES => {
                 eprintln!("event=workshop.cache_oversize bytes={}", metadata.len());
                 quarantine_invalid_state(&path);
-                BTreeMap::new()
+                (BTreeMap::new(), BTreeMap::new())
             }
             Ok(_) => match fs::read(&path) {
                 Ok(bytes) => match serde_json::from_slice::<PersistedCache>(&bytes) {
                     Ok(cache)
                         if cache.schema_version == CACHE_SCHEMA_VERSION
-                            && cache.items.len() <= MAX_CACHE_ITEMS =>
+                            && cache.items.len() <= MAX_CACHE_ITEMS
+                            && cache.unsubscribed.len() <= MAX_CACHE_ITEMS =>
                     {
-                        cache.items
+                        (cache.items, cache.unsubscribed)
                     }
                     Ok(_) => {
                         eprintln!(
                             "event=workshop.cache_invalid detail=unsupported or oversized cache"
                         );
                         quarantine_invalid_state(&path);
-                        BTreeMap::new()
+                        (BTreeMap::new(), BTreeMap::new())
                     }
                     Err(error) => {
                         eprintln!("event=workshop.cache_invalid detail={error}");
                         quarantine_invalid_state(&path);
-                        BTreeMap::new()
+                        (BTreeMap::new(), BTreeMap::new())
                     }
                 },
                 Err(error) => {
                     eprintln!("event=workshop.cache_read_error detail={error}");
                     quarantine_invalid_state(&path);
-                    BTreeMap::new()
+                    (BTreeMap::new(), BTreeMap::new())
                 }
             },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                (BTreeMap::new(), BTreeMap::new())
+            }
             Err(error) => {
                 eprintln!("event=workshop.cache_read_error detail={error}");
-                BTreeMap::new()
+                (BTreeMap::new(), BTreeMap::new())
             }
         };
-        Self { path, items }
+        Self {
+            path,
+            items,
+            unsubscribed,
+        }
+    }
+
+    /// R8: the daemon unsubscribed `id` (Steam accepted it). Drops its
+    /// cached entry and remembers the unsubscribe, so a later scan without
+    /// the id does not synthesize it as a vanished subscription. Returns
+    /// true when the cache changed and a `save()` is worthwhile.
+    pub fn forget_unsubscribed(&mut self, id: &str, now_unix_ms: u128) -> bool {
+        self.items.remove(id);
+        if self.unsubscribed.len() >= MAX_CACHE_ITEMS && !self.unsubscribed.contains_key(id) {
+            // Bounded: forget the oldest tombstone first.
+            if let Some(oldest) = self
+                .unsubscribed
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(id, _)| id.clone())
+            {
+                self.unsubscribed.remove(&oldest);
+            }
+        }
+        self.unsubscribed.insert(id.to_string(), now_unix_ms);
+        true
+    }
+
+    /// R8: the daemon subscribed to `id` again: it is a subscription like
+    /// any other from now on. Returns whether the cache changed.
+    pub fn note_subscribed(&mut self, id: &str) -> bool {
+        self.unsubscribed.remove(id).is_some()
     }
 
     /// Fills placeholder metadata on scanned items, snapshots fresh metadata
@@ -198,6 +249,24 @@ impl WorkshopCache {
             }
         }
         let mut changed = false;
+        // R8: tombstones end when they age out, or when a scan shows the id
+        // subscribed after the settle window (re-subscribed in Steam).
+        let resubscribed: Vec<String> = self
+            .unsubscribed
+            .iter()
+            .filter(|(id, at)| {
+                at.saturating_add(STALE_ENTRY_MS) < now_unix_ms
+                    || (at.saturating_add(UNSUBSCRIBE_SETTLE_MS) < now_unix_ms
+                        && catalog.items.iter().any(|item| {
+                            &item.workshop_id == *id && is_subscribed_state(&item.workshop_state)
+                        }))
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in resubscribed {
+            self.unsubscribed.remove(&id);
+            changed = true;
+        }
         for (id, entry) in updates {
             let dominated = self.items.get(&id).is_some_and(|existing| {
                 existing.title == entry.title
@@ -226,7 +295,7 @@ impl WorkshopCache {
         let mut to_synthesize = Vec::new();
         let mut aged_out = Vec::new();
         for (id, entry) in &self.items {
-            if present_ids.contains(id) {
+            if present_ids.contains(id) || self.unsubscribed.contains_key(id) {
                 continue;
             }
             if entry.last_seen_unix_ms.saturating_add(STALE_ENTRY_MS) < now_unix_ms {
@@ -313,6 +382,7 @@ impl WorkshopCache {
         serde_json::to_vec_pretty(&PersistedCache {
             schema_version: CACHE_SCHEMA_VERSION,
             items: self.items.clone(),
+            unsubscribed: self.unsubscribed.clone(),
         })
         .unwrap_or_default()
     }
@@ -377,6 +447,45 @@ fn synthesized_item(id: &str, entry: &CachedItem) -> CatalogItem {
             .into(),
     });
     item
+}
+
+/// Catalog fixtures for tests outside this module (R8 service test).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub(crate) fn catalog(items: Vec<CatalogItem>) -> Catalog {
+        Catalog {
+            schema_version: 1,
+            generated_unix_ms: 0,
+            libraries: Vec::new(),
+            items,
+            diagnostics: Vec::new(),
+            stats: kwe_core::CatalogStats::default(),
+        }
+    }
+
+    /// A scanned Workshop item with real metadata in `state`.
+    pub(crate) fn item(id: &str, state: &str) -> CatalogItem {
+        CatalogItem {
+            workshop_id: id.into(),
+            title: format!("Title {id}"),
+            kind: ProjectKind::Scene,
+            compatibility: kwe_core::Compatibility::RendererDependent,
+            compatibility_detail: String::new(),
+            content_root: PathBuf::new(),
+            project_file: PathBuf::new(),
+            entry_file: None,
+            preview_file: None,
+            metadata_hash: Some("abc".into()),
+            tags: vec!["nature".into()],
+            requested_permissions: Vec::new(),
+            workshop_state: state.into(),
+            workshop_progress: None,
+            workshop_update_available: false,
+            diagnostics: Vec::new(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -641,5 +750,37 @@ mod tests {
         );
         let reloaded = WorkshopCache::open(&dir);
         assert_eq!(reloaded.items.len(), cache.items.len());
+    }
+
+    /// R8: a tombstone suppresses synthesis; a scan that still shows the id
+    /// subscribed inside the settle window (Steam lag) keeps it, one after
+    /// the window (re-subscribed in Steam) ends it, and it ages out.
+    #[test]
+    fn unsubscribe_tombstone_settles_and_ages_out() {
+        use super::test_support::{catalog, item};
+        let dir = state_dir("tombstone");
+        fs::create_dir_all(&dir).unwrap();
+        let mut cache = WorkshopCache::open(&dir);
+        let t0 = now_ms();
+        cache.merge_and_update(&mut catalog(vec![item("7", "subscribed_installed")]), t0);
+        assert!(cache.forget_unsubscribed("7", t0));
+        // Steam lag: still listed a minute later; then gone.
+        cache.merge_and_update(
+            &mut catalog(vec![item("7", "subscribed_installed")]),
+            t0 + 60_000,
+        );
+        let mut scan = catalog(Vec::new());
+        cache.merge_and_update(&mut scan, t0 + 120_000);
+        assert!(scan.items.is_empty(), "not resurrected after the lag");
+        // Seen subscribed after the settle window: a re-subscription.
+        let later = t0 + UNSUBSCRIBE_SETTLE_MS + 1;
+        cache.merge_and_update(&mut catalog(vec![item("7", "subscribed_installed")]), later);
+        let mut scan = catalog(Vec::new());
+        cache.merge_and_update(&mut scan, later + 1);
+        assert_eq!(scan.items.len(), 1, "re-subscribed in Steam: cached again");
+        // Aging: a tombstone older than 30 days is dropped.
+        assert!(cache.forget_unsubscribed("8", t0));
+        cache.merge_and_update(&mut catalog(Vec::new()), t0 + STALE_ENTRY_MS + 1);
+        assert!(!cache.unsubscribed.contains_key("8"));
     }
 }

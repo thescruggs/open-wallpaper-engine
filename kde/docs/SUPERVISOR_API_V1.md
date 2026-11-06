@@ -259,11 +259,17 @@ On load, a file that is not valid JSON, not the expected top-level shape
 `schema_version` is quarantined as a whole (renamed `settings-v1.json.invalid-<unix>`,
 every knob back to its default). The `led` record is isolated (review fixes
 B, R2): an invalid `led` value — out of bounds, unknown mode, unsorted ids,
-wrong type — resets **only** `led` to its defaults (one
-`event=settings.led_reset` journal line; `settings.get` / `led.status`
-then show the defaults, which is what the daemon runs; there is no separate
-"was reset" field) and the file is rewritten at the next settings change;
-unknown fields inside `led` (a newer daemon's) are ignored.
+wrong type — repairs **only** `led`, field by field (review fixes C2, N4):
+every individually valid field is kept, every invalid one takes its
+default, and `enabled` is kept when it is a bool and is otherwise `false` —
+a broken record never turns LED sync (device takeover) on, e.g. after a
+downgrade from a daemon that wrote a newer mode. Malformed device ids are
+dropped (they cannot name a device), the rest sorted and de-duplicated; a
+non-object `led` becomes "off, defaults". One `event=settings.led_reset`
+journal line is written and the repaired record is persisted at once, so
+the next start is quiet; `settings.get` / `led.status` show the repaired
+record, which is what the daemon runs (there is no separate "was reset"
+field). Unknown fields inside `led` (a newer daemon's) are ignored.
 **Downgrade:** a daemon older than LED sync rejects the `led` key and
 quarantines the whole file, so `audio_output` and both pause policies
 return to their defaults after a downgrade. Older binaries cannot be fixed
@@ -367,8 +373,9 @@ load and in `settings.set`):
 | `rate_hz` | 10 | 1..=20 |
 | `disabled_devices` | `[]` | ≤ 128 device ids (16 lowercase hex, `led.status` `worker_status.devices[].id`); `settings.set` **replaces** the list; stored sorted and unique |
 
-An invalid `led` record in the file resets only `led` to these defaults
-(see Global settings above); unknown fields inside it are ignored. `settings.set
+An invalid `led` record in the file is repaired field by field, never
+turning `enabled` on (see Global settings above); unknown fields inside it
+are ignored. `settings.set
 {"led": {"enabled": false}}` stops the worker (SIGTERM / stdin EOF → the
 worker restores every device it controlled; 4 s grace, then SIGKILL);
 `enabled: true` spawns it with a fresh restart budget. Every spawn passes
@@ -412,15 +419,21 @@ RPCs):
   worker as the renderer's exact `audio_bands` line — independent of the
   wallpaper's `audio` grant (the grant protects captured audio from
   untrusted wallpaper content; the LED worker is daemon code the user
-  enabled). Review fixes B: audio capture runs while `--audio-capture` was
-  passed **or** LED sync wants audio (enabled, worker usable, mode
-  `spectrum` / `ambient+pulse`; see BETA_M1d below), and before any
-  renderer was ever promoted the capture worker's `generation: 0` frames
-  reach the LED worker only (while it runs, in an audio mode, not paused) —
-  so Spectrum works without a wallpaper. What renderers receive is
-  unchanged: the generation gate and the per-wallpaper `audio` grant apply
-  exactly as before, whatever started capture (a wallpaper without the grant
-  receives nothing — test
+  enabled). Review fixes B / C2: audio capture runs while `--audio-capture`
+  was passed **or** LED sync demands audio (enabled, worker usable, mode
+  `spectrum` / `ambient+pulse`, connected to an OpenRGB server, not paused;
+  debounced — see BETA_M1d below), and before any renderer was ever
+  promoted the capture worker's `generation: 0` frames reach the LED worker
+  only (while it runs, in an audio mode, not paused) — so Spectrum works
+  without a wallpaper. What renderers receive is unchanged (C2, R2): without
+  `--audio-capture` the daemon's own capture frames (recognised by peer
+  credentials) go to the LED worker **only** — no renderer receives
+  `audio_bands`, even one holding the `audio` grant, exactly as before LED
+  sync when nothing was captured (test
+  `supervisor::tests::led_only_capture_never_reaches_a_granted_wallpaper_without_the_flag`);
+  with the flag, and for `audio.forward` frames from any other caller, the
+  generation gate and the per-wallpaper `audio` grant apply exactly as
+  before (a wallpaper without the grant receives nothing — test
   `supervisor::tests::led_only_audio_never_reaches_an_ungranted_wallpaper`).
 - **Pause (orchestrator design choice, flagged for maintainer review):**
   while the effective F3/F4 pause verdict holds — `(pause_when_covered AND
@@ -547,27 +560,38 @@ restarts within a rolling 10-minute window; beyond that it is disabled for the
 daemon's lifetime with a one-time log), and it inherits the daemon environment
 because PipeWire capture needs the session's `XDG_RUNTIME_DIR`.
 
-**When capture runs (review fixes B).** The worker runs while `--audio-capture`
-was passed OR LED sync wants audio — `led.enabled` on, a usable LED worker
-(not `--no-led-worker`, not `not_installed`/`not_executable`/out of
-restarts) and mode `spectrum` or `ambient+pulse`. The supervisor publishes
-the LED demand every tick and the capture service follows it within
-~100 ms: it starts capture when the demand rises and stops it (SIGTERM,
-1 s grace, SIGKILL; no restart strike) when it falls and the flag was not
-passed. The default mode `ambient` never captures, so nothing changes for a
-user who never picks an audio mode; choosing one in Settings is the opt-in.
-The LED pause verdict (mode `off`) does not stop capture. The restart budget
-applies whatever the reason; once exhausted, capture stays off for the
-daemon's lifetime.
+**When capture runs (review fixes B, narrowed in C2 / R1).** The worker
+runs while `--audio-capture` was passed OR LED sync demands audio. LED sync
+demands audio while ALL of: `led.enabled` on; a usable LED worker (not
+`--no-led-worker`, not `not_installed`/`not_executable`/out of restarts);
+mode `spectrum` or `ambient+pulse`; the LED worker reports a reachable
+OpenRGB server in state `active` (driving, or `waiting_for_source` — the
+bootstrap: Spectrum needs audio to leave it) or `off` outside a pause (the
+moment before a resume reaches the worker), with a status line younger than
+15 s; and the F3/F4 pause verdict does not hold. The demand **rises at
+once** and **falls 10 s** (`led::AUDIO_DEMAND_HOLD`) after its live reason
+(connected and not paused) went away, so a connect/disconnect flap or a
+quick pause toggle does not restart `pw-record`; a settings change that
+removes the need (disabled, non-audio mode, worker unusable) drops it at
+the next supervisor tick, without the hold. The supervisor publishes the
+demand every tick and the capture service follows it within ~100 ms: it
+starts capture when the demand rises and stops it (SIGTERM, 1 s grace,
+SIGKILL; no restart strike) when it falls and the flag was not passed. The
+default mode `ambient` never captures, and an audio mode with no OpenRGB
+SDK server running captures nothing; choosing an audio mode in Settings is
+the opt-in. The restart budget applies whatever the reason; once exhausted,
+capture stays off for the daemon's lifetime.
 
-| `--audio-capture` | LED enabled + usable | LED mode | capture | `reasons` |
-|---|---|---|---|---|
-| no | — | `ambient` / `off` | off | `[]` |
-| no | no | any | off | `[]` |
-| no | yes | `spectrum` / `ambient+pulse` | **on** | `["led_sync"]` |
-| yes | no | any | on | `["audio_capture_flag"]` |
-| yes | yes | `ambient` / `off` | on | `["audio_capture_flag"]` |
-| yes | yes | `spectrum` / `ambient+pulse` | on | `["audio_capture_flag", "led_sync"]` |
+| `--audio-capture` | LED demand (audio mode + usable + connected + not paused) | capture | `reasons` | LED worker receives | renderers receive |
+|---|---|---|---|---|---|
+| no | no (incl. ambient/off, no SDK server, paused > 10 s) | off | `[]` | — | nothing |
+| no | yes (or within the 10 s hold) | **on** | `["led_sync"]` | every capture frame that passes the generation gate (generation 0 while no renderer was ever promoted) | **nothing** (as before LED sync) |
+| yes | no | on | `["audio_capture_flag"]` | frames that pass the generation gate (the tee; used only in an audio mode) | grant-gated, as always |
+| yes | yes | on | `["audio_capture_flag", "led_sync"]` | every capture frame that passes the generation gate | grant-gated, as always |
+
+`audio.forward` frames from callers other than the daemon's own capture
+worker (tests, an external producer) keep the old path whatever the flag:
+generation gate, LED tee, grant-gated renderer delivery.
 
 `audio.status` (no params) reports:
 
@@ -577,7 +601,8 @@ daemon's lifetime.
 
 `enabled` mirrors the `--audio-capture` flag (unchanged meaning); `active`
 (additive) is "capture is wanted now" and `reasons` (additive) says why —
-`audio_capture_flag`, `led_sync`, or empty when capture is off; `pid` is the
+`audio_capture_flag`, `led_sync` (LED sync demands it, including the 10 s
+hold after it stopped needing it), or empty when capture is off; `pid` is the
 live worker (or `null`); `restarts` counts bounded respawns;
 `disabled_reason` is `"too_many_restarts"` once the budget is exhausted.
 

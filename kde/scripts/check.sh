@@ -23,40 +23,16 @@ if grep -qx -- "WantedBy=default.target" "$unit_file"; then
     exit 1
 fi
 
-# MUST-FIX 4 (OpenRGB review fixes B): LED sync defaults on, so a script
-# that starts kwe-daemon without --no-led-worker would drive the
-# maintainer's REAL devices through OpenRGB's SDK server (127.0.0.1:6742).
-# Every daemon launch under scripts/ must pass --no-led-worker or point the
-# worker at a stub with --led-sdk-port. A launch is a (backslash-joined)
-# command line that executes target/*/kwe-daemon, "$daemon_bin" or
-# "${KWE_DAEMON_BIN...}"; comments, assignments and systemctl/pgrep lines
-# are not launches. A deliberate real-device launch (dev-run.sh's
-# KWE_DEV_LED=1) must say so with a trailing `# led-guard: <why>` comment.
-led_guard_failures="$(
-    for script in scripts/*.sh; do
-        awk -v file="$script" '
-            { line = $0 }
-            /\\[[:space:]]*$/ { sub(/\\[[:space:]]*$/, "", line); joined = joined line " "; if (!start) start = FNR; next }
-            {
-                joined = joined line
-                if (!start) start = FNR
-                text = joined
-                sub(/^[[:space:]]+/, "", text)
-                launches = text !~ /^#/ \
-                    && text !~ /^[A-Za-z_][A-Za-z_0-9]*=["\x27]?[^[:space:]]*kwe-daemon["\x27]?[[:space:]]*$/ \
-                    && text !~ /(systemctl|pgrep|pkill|journalctl|basename|readlink)/ \
-                    && (text ~ /(^|[[:space:]"\x27\/])(target|debug)\/[^[:space:]]*kwe-daemon["\x27]?([[:space:]]|$)/ \
-                        || text ~ /^"?\$\{?daemon_bin\}?"?[[:space:]]/ \
-                        || text ~ /\$\{KWE_DAEMON_BIN[^}]*\}"?[[:space:]]/)
-                if (launches && text !~ /--no-led-worker/ && text !~ /--led-sdk-port/ \
-                    && text !~ /# led-guard: [^[:space:]]/)
-                    printf "%s:%d: kwe-daemon launched without --no-led-worker or --led-sdk-port\n", file, start
-                joined = ""; start = 0
-            }
-        ' "$script"
-    done
-)"
-if [[ -n "$led_guard_failures" ]]; then
+# MUST-FIX 4 (OpenRGB review fixes B, hardened in C2 / R3): LED sync
+# defaults on, so a script that starts kwe-daemon without --no-led-worker
+# would drive the maintainer's REAL devices through OpenRGB's SDK server
+# (127.0.0.1:6742). scripts/led-guard.sh checks every kwe-daemon launch
+# under scripts/ (paths, variables assigned a kwe-daemon path, `cargo run
+# -p kwe-daemon`; comments stripped first) for --no-led-worker or a stub
+# --led-sdk-port other than 6742. Its self-test runs first so the guard
+# itself cannot rot.
+scripts/led-guard.sh --self-test
+if ! led_guard_failures="$(scripts/led-guard.sh scripts/*.sh)"; then
     echo "FAILED: LED guard (a script would drive real OpenRGB devices):" >&2
     printf '%s\n' "$led_guard_failures" >&2
     exit 1

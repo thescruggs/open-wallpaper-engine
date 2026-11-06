@@ -30,6 +30,7 @@ use crate::{
     supervisor::{
         RendererKind, cleanup_renderer_home, env_allowlist, set_nonblocking, signal_process_group,
     },
+    workshop_cache::WorkshopCache,
 };
 
 const WORKER_ENVELOPE_VERSION: u64 = 1;
@@ -142,6 +143,10 @@ struct Inner {
     /// Shared with `CatalogFreshness`: set after a successful
     /// subscribe/unsubscribe.
     catalog_stale: Arc<AtomicBool>,
+    /// W5 review fix (R8): the daemon's offline metadata cache, told about
+    /// every successful subscribe/unsubscribe so an unsubscribed item is
+    /// not resurrected as a vanished `subscribed_missing` subscription.
+    cache: Option<Arc<Mutex<WorkshopCache>>>,
 }
 
 /// Clears its family gate on drop (panics included).
@@ -222,7 +227,46 @@ impl WorkshopService {
                 pending: Mutex::new(None),
                 gates: std::array::from_fn(|_| AtomicUsize::new(0)),
                 catalog_stale,
+                cache: None,
             }),
+        }
+    }
+
+    /// Attaches the offline metadata cache (R8). Call before the service
+    /// is cloned or shared.
+    pub fn with_cache(mut self, cache: Arc<Mutex<WorkshopCache>>) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.cache = Some(cache);
+        }
+        self
+    }
+
+    /// R8: keep the offline cache in step with a mutation Steam accepted.
+    /// A failed mutation never reaches here (the cache stays as it was).
+    fn record_mutation(&self, op: &str, params: &Value) {
+        let Some(cache) = self.inner.cache.as_ref() else {
+            return;
+        };
+        let Some(id) = params.get("id").and_then(Value::as_str) else {
+            return;
+        };
+        let Ok(mut cache) = cache.lock() else {
+            eprintln!("event=workshop.cache_lock_poisoned");
+            return;
+        };
+        let changed = match op {
+            "unsubscribe" => {
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
+                cache.forget_unsubscribed(id, now)
+            }
+            "subscribe" => cache.note_subscribed(id),
+            _ => false,
+        };
+        if changed {
+            cache.save();
         }
     }
 
@@ -386,8 +430,11 @@ impl WorkshopService {
                 into_value(result.map(|_| json!({"signed_in": false})))
             }
             JobKind::Worker { op, params } => {
-                let result = self.run_worker(op, params);
+                let result = self.run_worker(op, params.clone());
                 if result.is_ok() && matches!(op, "subscribe" | "unsubscribe") {
+                    // Cache first, so the rescan the stale flag triggers
+                    // already sees the tombstone.
+                    self.record_mutation(op, &params);
                     self.inner.catalog_stale.store(true, Ordering::Release);
                 }
                 into_value(result)
@@ -1544,6 +1591,101 @@ mod tests {
         stale.store(true, Ordering::Release);
         assert!(fresh.poll(&libs).is_some());
         assert!(!stale.load(Ordering::Acquire));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// W5 review fix (R8): after Steam accepted `workshop.unsubscribe`, the
+    /// next scan (Steam dropped the item) must not show it again as a
+    /// vanished `subscribed_missing` subscription — that kept the details
+    /// pane on "Unsubscribing…" for 120 s, then "Steam has not removed the
+    /// item yet", with Unsubscribe offered again. A failed unsubscribe
+    /// leaves the cache alone; a later re-subscribe makes the id an
+    /// ordinary cached subscription again. Same path for the Browse view
+    /// and the details pane (both call `workshop.unsubscribe`).
+    #[test]
+    fn unsubscribe_is_not_resurrected_by_the_offline_cache() {
+        use crate::workshop_cache::test_support::{catalog, item};
+        let root = temp_dir("unsub-cache");
+        let cache_dir = root.join("cache-state");
+        fs::create_dir_all(&cache_dir).unwrap();
+        let cache = Arc::new(Mutex::new(WorkshopCache::open(&cache_dir)));
+        let now = || {
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        };
+        // Two installed subscriptions get cached by a scan.
+        let mut scan = catalog(vec![
+            item("100", "subscribed_installed"),
+            item("200", "subscribed_installed"),
+        ]);
+        cache.lock().unwrap().merge_and_update(&mut scan, now());
+        let ids = |catalog: &kwe_core::Catalog| -> Vec<(String, String)> {
+            catalog
+                .items
+                .iter()
+                .map(|item| (item.workshop_id.clone(), item.workshop_state.clone()))
+                .collect()
+        };
+
+        // A failed unsubscribe of 200 leaves the cache alone: the library
+        // vanishing still shows 200 as a missing subscription.
+        let failing = write_script(
+            &root,
+            "fail.sh",
+            r#"cat >/dev/null
+echo '{"version":1,"ok":false,"error":"signed_out","detail":"no credential"}'"#,
+        );
+        let (svc, _) = service(&root, failing, Duration::from_secs(5));
+        let svc = svc.with_cache(cache.clone());
+        let result = svc.call("workshop.unsubscribe", &json!({"id": "200"}));
+        assert_eq!(result["error"], "signed_out");
+
+        // Steam accepts the unsubscribe of 100 and drops it from the scan.
+        let (svc, stale) = service(
+            &root,
+            echo_script(&root, OK_ENVELOPE),
+            Duration::from_secs(5),
+        );
+        let svc = svc.with_cache(cache.clone());
+        let result = svc.call("workshop.unsubscribe", &json!({"id": "100"}));
+        assert_eq!(result, json!({"accepted": true}));
+        assert!(stale.load(Ordering::Acquire));
+        let mut scan = catalog(vec![item("200", "subscribed_installed")]);
+        cache.lock().unwrap().merge_and_update(&mut scan, now());
+        assert_eq!(
+            ids(&scan),
+            vec![("200".to_string(), "subscribed_installed".to_string())],
+            "the unsubscribed id must not come back as subscribed_missing"
+        );
+        // ... also after a daemon restart (the tombstone persists).
+        let mut reopened = WorkshopCache::open(&cache_dir);
+        let mut scan = catalog(Vec::new());
+        reopened.merge_and_update(&mut scan, now());
+        assert_eq!(
+            ids(&scan),
+            vec![("200".to_string(), "subscribed_missing".to_string())],
+            "200 (failed unsubscribe) is still a cached subscription; 100 is gone"
+        );
+
+        // Re-subscribe through the daemon: Steam lists it again, and once
+        // its library vanishes it is a missing subscription like any other.
+        let result = svc.call("workshop.subscribe", &json!({"id": "100"}));
+        assert_eq!(result, json!({"accepted": true}));
+        let mut scan = catalog(vec![item("100", "downloading")]);
+        cache.lock().unwrap().merge_and_update(&mut scan, now());
+        let mut scan = catalog(Vec::new());
+        cache.lock().unwrap().merge_and_update(&mut scan, now());
+        let mut found = ids(&scan);
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                ("100".to_string(), "subscribed_missing".to_string()),
+                ("200".to_string(), "subscribed_missing".to_string()),
+            ]
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 }

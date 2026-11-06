@@ -40,6 +40,10 @@ Kirigami.ScrollablePage {
     // messages so a Browse-view notice never shows up here.
     property string unsubscribeRequestedFor: ""
     property bool unsubscribeConfirmOpen: false
+    // The Workshop notice only when it is about the selected item (another
+    // item's failure, e.g. from the Browse view, never shows here).
+    readonly property string paneNotice: remoteCatalog.noticeId === WallpaperSelection.selectedId
+        ? remoteCatalog.notice : ""
 
     // The Subscribed view comes first, before the Browse view ever asked:
     // learn the sign-in state (local only, no network) once a subscription
@@ -588,10 +592,10 @@ Kirigami.ScrollablePage {
             visible: detailPage.unsubscribeRequestedFor !== ""
                 && detailPage.unsubscribeRequestedFor === WallpaperSelection.selectedId
                 && !detailPage.unsubscribePending
-                && (remoteCatalog.notice !== "" || detailPage.selectedEntry.found !== true)
-            type: remoteCatalog.notice !== "" ? Kirigami.MessageType.Warning : Kirigami.MessageType.Positive
-            text: remoteCatalog.notice !== ""
-                ? remoteCatalog.notice
+                && (detailPage.paneNotice !== "" || detailPage.selectedEntry.found !== true)
+            type: detailPage.paneNotice !== "" ? Kirigami.MessageType.Warning : Kirigami.MessageType.Positive
+            text: detailPage.paneNotice !== ""
+                ? detailPage.paneNotice
                 : qsTr("Unsubscribed. Steam removed this wallpaper from your library.")
         }
         Kirigami.InlineMessage {
@@ -657,8 +661,9 @@ Kirigami.ScrollablePage {
                 enabled: !issueReporter.busy
                 Controls.DialogButtonBox.buttonRole: Controls.DialogButtonBox.AcceptRole
             }
-            onAccepted: issueReportDialog.accept()
-            onRejected: issueReportDialog.reject()
+            // No onAccepted/onRejected here: the Dialog already follows the
+            // box's roles; forwarding them again emitted accepted() twice
+            // (review fixes C2, R9).
         }
 
         onAccepted: {
@@ -669,36 +674,13 @@ Kirigami.ScrollablePage {
     }
 
     // W5: unsubscribing makes Steam delete the wallpaper's files, so it is
-    // confirmed first. Cancel (or Escape) leaves everything untouched.
-    Controls.Dialog {
+    // confirmed first (UnsubscribeDialog.qml). Cancel (or Escape) leaves
+    // everything untouched; Unsubscribe sends exactly one request (R9).
+    UnsubscribeDialog {
         id: unsubscribeDialog
-        modal: true
-        title: qsTr("Unsubscribe from Workshop item")
+        itemTitle: WallpaperSelection.selectedTitle
         visible: detailPage.unsubscribeConfirmOpen
-        standardButtons: Controls.Dialog.NoButton
-        width: Math.min(parent ? parent.width * 0.8 : 420, 420)
         onRejected: detailPage.unsubscribeConfirmOpen = false
-
-        contentItem: Controls.Label {
-            text: qsTr("Unsubscribe from %1? Steam removes its files from this computer; playlists that contain it skip it until you subscribe again.")
-                .arg(WallpaperSelection.selectedTitle)
-            wrapMode: Text.Wrap
-        }
-
-        footer: Controls.DialogButtonBox {
-            Controls.Button {
-                text: qsTr("Cancel")
-                Controls.DialogButtonBox.buttonRole: Controls.DialogButtonBox.RejectRole
-            }
-            Controls.Button {
-                text: qsTr("Unsubscribe")
-                icon.name: "list-remove-symbolic"
-                Controls.DialogButtonBox.buttonRole: Controls.DialogButtonBox.AcceptRole
-            }
-            onAccepted: unsubscribeDialog.accept()
-            onRejected: unsubscribeDialog.reject()
-        }
-
         onAccepted: {
             detailPage.unsubscribeConfirmOpen = false;
             detailPage.unsubscribeRequestedFor = WallpaperSelection.selectedId;

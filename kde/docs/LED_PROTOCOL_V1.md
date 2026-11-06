@@ -273,7 +273,8 @@ daemon parses one device shape.
   must have something real to show: a valid frame snapshot for `ambient` /
   `ambient+pulse`; for `spectrum`, fresh audio **with sound** — silent
   frames are not a source (review fixes C1: capture runs whenever an audio
-  mode is selected, so frames arrive in silence too, and spectrum used to
+  mode is selected and — since C2 — the worker is connected and not paused,
+  so frames arrive in silence too, and spectrum used to
   paint every device black for as long as nothing played). Until then the
   state is `active` + `waiting_for_source`, `driven_count: 0`, and no
   device packet is sent. `ambient+pulse` with a frame but stale audio, or in

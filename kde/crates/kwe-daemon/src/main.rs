@@ -461,9 +461,10 @@ fn main() -> Result<()> {
         wall_timeout: Duration::from_millis(arguments.inspector_wall_timeout_ms),
         resource_limits: scene_limits,
     };
-    // Review fixes B: the supervisor publishes "LED sync wants audio" here
-    // every tick; the audio capture service runs capture while it OR
-    // --audio-capture holds.
+    // Review fixes B / C2: the supervisor publishes "LED sync demands
+    // capture" here every tick (audio mode + connected to OpenRGB + not
+    // paused, debounced); the audio capture service runs capture while it
+    // OR --audio-capture holds.
     let led_audio_demand = Arc::new(AtomicBool::new(false));
     let supervisor_service = SupervisorService::start(SupervisorConfig {
         renderer_paths,
@@ -521,6 +522,7 @@ fn main() -> Result<()> {
                 })
         },
         led_audio_demand: led_audio_demand.clone(),
+        audio_capture_flag: arguments.audio_capture,
     })?;
     let supervisor = supervisor_service.handle();
     let workshop_cache = Arc::new(std::sync::Mutex::new(WorkshopCache::open(
@@ -551,7 +553,8 @@ fn main() -> Result<()> {
             workshop_runtime_dir,
         ),
         catalog_stale,
-    );
+    )
+    .with_cache(workshop_cache.clone());
     // The apply service must exist before the playlist session: the session
     // drives the same apply transaction the wallpaper.* API uses (BETA_M4c),
     // sharing its transaction lock so a playlist entry change and a user
@@ -591,7 +594,8 @@ fn main() -> Result<()> {
     let playlist = playlist_service.handle();
     // The audio capture service always runs so `audio.status` stays
     // answerable; it captures while --audio-capture was passed OR LED sync
-    // is in an audio mode (`reasons`), and is idle otherwise.
+    // demands it (`reasons`), and is idle otherwise. Without the flag its
+    // frames reach the LED worker only (C2, R2).
     let audio_worker_path = match arguments.audio_worker {
         Some(path) => path,
         None => default_audio_worker_path()?,
@@ -1149,8 +1153,9 @@ fn process_request(
                             params.frame.right,
                         ) {
                             Ok(frame) => {
+                                let from_capture = is_managed_audio_worker(peer, worker_pid);
                                 let result = supervisor_call(supervisor, |handle| {
-                                    handle.audio_frame(params.generation, frame)
+                                    handle.audio_frame(params.generation, frame, from_capture)
                                 });
                                 // The daemon's own worker drops its frames
                                 // latest-wins while no renderer is active;
@@ -1686,11 +1691,8 @@ fn log_audio_drop() {
 /// rejected it only because no renderer is currently promoted. Everything
 /// else (stale generations, other callers, unknown credentials) returns
 /// `None` and the original error result is surfaced.
-fn classify_audio_error(
-    peer: PeerCred,
-    worker_pid: &Arc<AtomicU32>,
-    result: &Value,
-) -> Option<Value> {
+/// The connection comes from the daemon's own `kwe-audio-worker`.
+fn is_managed_audio_worker(peer: PeerCred, worker_pid: &Arc<AtomicU32>) -> bool {
     let managed_pid = worker_pid.load(Ordering::Acquire);
     // Same pid AND same user: a pid alone can be recycled after the worker
     // exits, so a later connection reusing that pid must not be mistaken
@@ -1698,9 +1700,15 @@ fn classify_audio_error(
     // the real effective uid of this process.
     // SAFETY: geteuid takes no arguments and cannot fault.
     let effective_uid = unsafe { libc::geteuid() };
-    let is_managed_worker =
-        managed_pid != 0 && peer.pid != 0 && peer.pid == managed_pid && peer.uid == effective_uid;
-    if !is_managed_worker {
+    managed_pid != 0 && peer.pid != 0 && peer.pid == managed_pid && peer.uid == effective_uid
+}
+
+fn classify_audio_error(
+    peer: PeerCred,
+    worker_pid: &Arc<AtomicU32>,
+    result: &Value,
+) -> Option<Value> {
+    if !is_managed_audio_worker(peer, worker_pid) {
         return None;
     }
     if result.get("error").and_then(Value::as_str) != Some("supervisor_failed") {
@@ -2194,6 +2202,7 @@ mod tests {
             display_power_worker: None,
             led_worker,
             led_audio_demand: Default::default(),
+            audio_capture_flag: false,
         })
         .unwrap()
     }
@@ -3602,6 +3611,7 @@ with open(args.output, "wb") as frame:
             display_power_worker: None,
             led_worker: None,
             led_audio_demand: Default::default(),
+            audio_capture_flag: false,
         }
     }
 
@@ -5093,6 +5103,7 @@ args = parser.parse_args()
             display_power_worker: None,
             led_worker: None,
             led_audio_demand: Default::default(),
+            audio_capture_flag: false,
         })
         .unwrap();
         let supervisor = supervisor_service.handle();

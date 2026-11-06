@@ -18,7 +18,6 @@ ColumnLayout {
     spacing: Kirigami.Units.smallSpacing
 
     readonly property bool ready: ledSync.support === "ready"
-    readonly property bool audioMode: ledSync.mode === "spectrum" || ledSync.mode === "ambient+pulse"
     readonly property var modes: [
         { value: "ambient", text: qsTr("Ambient"),
           description: qsTr("Each device takes the colours of the matching part of the wallpaper.") },
@@ -119,7 +118,10 @@ ColumnLayout {
                               ? " " + qsTr("OpenRGB SDK protocol version %1.").arg(ledSync.protocolVersion)
                               : "") };
         case "off":
-            if (reason === "paused" || ledSync.paused)
+            // R7: follow the documented state/reason only; `off` with no
+            // reason is the user's own mode Off even while the raw pause
+            // verdict holds.
+            if (ledSync.showsPaused)
                 return { icon: "media-playback-pause", busy: false, checkAgain: false,
                          title: qsTr("Paused"),
                          detail: qsTr("Paused while a fullscreen app covers the desktop or the displays are off. Your devices show their own lighting until the wallpaper resumes.") };
@@ -254,12 +256,18 @@ ColumnLayout {
         }
     }
 
+    // Audio hint (review fixes C2): capture runs while LED sync is connected
+    // to OpenRGB in an audio mode, so "active" without audio means either
+    // nothing is playing or capture is not reaching LED sync.
     Kirigami.InlineMessage {
         Layout.fillWidth: true
         type: Kirigami.MessageType.Information
-        visible: section.ready && ledSync.enabled && section.audioMode && ledSync.hasWorkerStatus
-                 && !ledSync.audioFresh && (ledSync.state === "active" || ledSync.state === "degraded")
-        text: qsTr("No audio is reaching LED sync right now. System audio capture starts automatically for this mode; it may still be starting, or it could not capture your audio output. Until audio arrives, Spectrum stays dark and Ambient + pulse shows steady wallpaper colours.")
+        visible: section.ready && ledSync.audioHint !== ""
+        text: ledSync.audioHint === "nothing_playing"
+            ? (ledSync.mode === "spectrum"
+               ? qsTr("Nothing is playing right now. Spectrum lights your devices as soon as sound plays.")
+               : qsTr("Nothing is playing right now, so Ambient + pulse shows steady wallpaper colours until sound plays."))
+            : qsTr("No audio is reaching LED sync right now. System audio capture starts automatically while LED sync is connected in this mode; it may still be starting, or it could not capture your audio output. Until audio arrives, Spectrum stays dark and Ambient + pulse shows steady wallpaper colours.")
     }
 
     Kirigami.InlineMessage {

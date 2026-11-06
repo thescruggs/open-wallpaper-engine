@@ -129,6 +129,15 @@ deadline. One operation per family (`auth`, `query`, `details`,
 - A pending sign-in lives at most one hour.
 - After a successful `subscribe`/`unsubscribe` the daemon marks the
   catalog stale so the next `catalog` call rescans.
+- Review fix C2 (R8): a successful `unsubscribe` also drops the id from
+  the offline metadata cache (`workshop-metadata-v1.json`) and records it
+  as unsubscribed there (additive `unsubscribed` map, id → unix ms; older
+  daemons ignore it), so the rescan after Steam removed the item does not
+  synthesize it as a vanished `subscribed_missing` subscription. The mark
+  ends on a successful `subscribe` of that id, when a scan shows the id
+  subscribed more than 10 minutes after the unsubscribe (re-subscribed in
+  the Steam client; earlier sightings are Steam catching up), or after 30
+  days. A failed `unsubscribe` leaves the cache unchanged.
 - `catalog` rescans on its own when a Workshop manifest
   (`appworkshop_431960.acf`, either location) changed its modification
   time or size since the last scan, at most once every 2 s.

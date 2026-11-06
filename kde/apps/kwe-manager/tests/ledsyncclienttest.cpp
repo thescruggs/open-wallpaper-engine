@@ -267,6 +267,75 @@ private slots:
         QCOMPARE(client.paused(), paused);
     }
 
+    // Review fixes C2 (R7): the daemon reports the raw pause verdict in
+    // `paused` whatever the mode; mode Off chosen by the user is `off` with
+    // a null reason and must not read as "Paused".
+    void offWhilePausedVerdictIsTheUsersModeOff() {
+        m_daemon.state = QStringLiteral("off");
+        m_daemon.reason = QJsonValue(QJsonValue::Null);
+        m_daemon.paused = true;
+        m_daemon.led.insert(QStringLiteral("mode"), QStringLiteral("off"));
+        LedSyncClient client(m_socketPath);
+        client.refresh();
+        QTRY_COMPARE(client.state(), QStringLiteral("off"));
+        QVERIFY(client.paused());
+        QVERIFY(!client.showsPaused());
+        // The pause policy holding a lighting mode off: "Paused".
+        m_daemon.reason = QStringLiteral("paused");
+        m_daemon.led.insert(QStringLiteral("mode"), QStringLiteral("ambient"));
+        client.refresh();
+        QTRY_COMPARE(client.reason(), QStringLiteral("paused"));
+        QVERIFY(client.showsPaused());
+    }
+
+    // Review fixes C2 (R1): the hint tells "nothing is playing" (fresh and
+    // silent frames) from "no audio is reaching LED sync" (no fresh frames),
+    // and is shown only while connected in an audio mode.
+    void audioHintTellsSilenceFromMissingAudio_data() {
+        QTest::addColumn<QString>("mode");
+        QTest::addColumn<QString>("state");
+        QTest::addColumn<bool>("fresh");
+        QTest::addColumn<bool>("silent");
+        QTest::addColumn<QString>("hint");
+        QTest::newRow("spectrum no frames") << "spectrum" << "active" << false << false << "no_audio";
+        QTest::newRow("spectrum silence") << "spectrum" << "active" << true << true << "nothing_playing";
+        QTest::newRow("spectrum playing") << "spectrum" << "active" << true << false << "";
+        QTest::newRow("pulse silence") << "ambient+pulse" << "active" << true << true << "nothing_playing";
+        QTest::newRow("pulse no frames") << "ambient+pulse" << "active" << false << false << "no_audio";
+        QTest::newRow("ambient never") << "ambient" << "active" << false << false << "";
+        QTest::newRow("not connected") << "spectrum" << "server_absent" << false << false << "";
+        QTest::newRow("degraded") << "spectrum" << "degraded" << false << false << "";
+        QTest::newRow("paused off") << "spectrum" << "off" << false << false << "";
+    }
+
+    void audioHintTellsSilenceFromMissingAudio() {
+        QFETCH(QString, mode);
+        QFETCH(QString, state);
+        QFETCH(bool, fresh);
+        QFETCH(bool, silent);
+        QFETCH(QString, hint);
+        m_daemon.state = state;
+        m_daemon.led.insert(QStringLiteral("mode"), mode);
+        auto line = workerStatus(state, QJsonArray{}, false, 1, fresh);
+        auto audio = line.value(QStringLiteral("audio")).toObject();
+        audio.insert(QStringLiteral("silent"), silent);
+        line.insert(QStringLiteral("audio"), audio);
+        m_daemon.workerStatus = line;
+        LedSyncClient client(m_socketPath);
+        QSignalSpy hintChanged(&client, &LedSyncClient::audioHintChanged);
+        client.refresh();
+        QTRY_COMPARE(client.state(), state);
+        QCOMPARE(client.audioFresh(), fresh);
+        QCOMPARE(client.audioSilent(), silent);
+        QCOMPARE(client.audioHint(), hint);
+        QVERIFY(hintChanged.count() > 0);
+        // Turning LED sync off clears the hint.
+        if (!hint.isEmpty()) {
+            client.setEnabled(false);
+            QCOMPARE(client.audioHint(), QString());
+        }
+    }
+
     void activeWithTwoDevices() {
         m_daemon.state = QStringLiteral("active");
         m_daemon.led.insert(QStringLiteral("disabled_devices"), QJsonArray{StripId});

@@ -91,8 +91,13 @@ staleness is enforced daemon-side before writing, exactly like pointer input.
 ### BETA_M1d producer: `kwe-audio-worker`
 
 The daemon runs `kwe-audio-worker` while `kwe-daemon --audio-capture` was
-passed OR LED sync is enabled in an audio mode (`spectrum`,
-`ambient+pulse`; review fixes B — see `SUPERVISOR_API_V1.md` §BETA_M1d).
+passed OR LED sync demands audio (enabled in `spectrum` / `ambient+pulse`,
+connected to an OpenRGB SDK server, not paused; debounced 10 s on the
+falling edge — review fixes B / C2, see `SUPERVISOR_API_V1.md` §BETA_M1d).
+Without `--audio-capture`, the frames this worker pushes reach the LED sync
+worker **only**: renderers receive no `audio_bands` from it, exactly as
+before LED sync existed (C2, R2). With the flag, renderer delivery is gated
+by the generation and the per-wallpaper `audio` grant as always.
 It captures
 the PipeWire default sink (`pw-record --raw --format f32 --rate <rate>
 --channels 2 --target <node> -`; `<node>` from `--capture-node` or resolved

@@ -28,6 +28,9 @@ class RemoteCatalogModel : public QAbstractListModel {
   Q_PROPERTY(State state READ state NOTIFY stateChanged)
   Q_PROPERTY(QString errorMessage READ errorMessage NOTIFY errorMessageChanged)
   Q_PROPERTY(QString notice READ notice NOTIFY noticeChanged)
+  // The Workshop id the current notice is about ("" = not item-specific),
+  // so a details pane shows only its own item's outcome (review fixes C2).
+  Q_PROPERTY(QString noticeId READ noticeId NOTIFY noticeChanged)
   Q_PROPERTY(QString searchText READ searchText WRITE setSearchText NOTIFY searchTextChanged)
   Q_PROPERTY(QString sort READ sort WRITE setSort NOTIFY sortChanged)
   Q_PROPERTY(QStringList tags READ tags WRITE setTags NOTIFY tagsChanged)
@@ -75,6 +78,7 @@ public:
   State state() const { return m_state; }
   QString errorMessage() const { return m_errorMessage; }
   QString notice() const { return m_notice; }
+  QString noticeId() const { return m_noticeId; }
   QString searchText() const { return m_searchText; }
   QString sort() const { return m_sort; }
   QStringList tags() const { return m_tags; }
@@ -142,7 +146,7 @@ private:
   int rowOf(const QString &id) const;
   void setState(State state);
   void setErrorMessage(const QString &message);
-  void setNotice(const QString &message);
+  void setNotice(const QString &message, const QString &id = {});
   void setHasMore(bool value);
   void setLoadingMore(bool value);
   void rebuildIndex();
@@ -158,6 +162,7 @@ private:
   State m_state = Idle;
   QString m_errorMessage;
   QString m_notice;
+  QString m_noticeId;
   QString m_searchText;
   QString m_sort = QStringLiteral("trend_week");
   QStringList m_tags;

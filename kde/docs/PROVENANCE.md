@@ -48,6 +48,7 @@ upstream commit. See THIRD_PARTY.yml for the current linked commits.
 | `waywallen/open-wallpaper-engine` | GPL-2.0 | Behavior, format, and failure-mode reference only for the original renderer; no copied/adapted code. |
 | `Almamu/linux-wallpaperengine` | GPL-3.0 | GPL-3.0; adapted/copied code permitted now that the project is GPL-3.0-or-later — record every adapted file with a `Borrowed-From:` comment and a THIRD_PARTY.yml entry with the upstream commit. |
 | Valve Steamworks SDK / `ISteamUGC` | proprietary SDK terms | Optional isolated Steam bridge only after distribution review. |
+| OpenRGB SDK network protocol documentation (`CalcProgrammer1/OpenRGB` `Documentation/OpenRGBSDK.md`) | GPL-2.0-or-later | Protocol facts only, for the original protocol-compatible client in `kwe-openrgb` (LED sync); no code copied or adapted. THIRD_PARTY.yml `openrgb-sdk-protocol` records the revision and local files. |
 
 License labels above are planning observations and must be rechecked at the
 selected commit. Valve specifically warns that copyleft combinations with the

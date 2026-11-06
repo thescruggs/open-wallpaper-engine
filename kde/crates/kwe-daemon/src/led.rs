@@ -71,6 +71,12 @@ const REPROBE_MIN_INTERVAL: Duration = Duration::from_secs(2);
 const KILL_REAP_LIMIT: Duration = Duration::from_secs(2);
 /// stdout bytes read per tick (the pipe's capacity).
 const STDOUT_READ_BUDGET: usize = 64 * 1024;
+/// Review fixes C2 (R1): how long LED sync keeps demanding audio capture
+/// after its live reason (connected to an OpenRGB server, not paused) went
+/// away. A connect/disconnect flap or a quick pause toggle shorter than
+/// this never restarts `pw-record`; a lasting loss stops capture after it.
+/// Rising demand is immediate (no delay before capture starts).
+pub const AUDIO_DEMAND_HOLD: Duration = Duration::from_secs(10);
 
 /// How to launch the worker. `None` at the manager level (`--no-led-worker`,
 /// or a daemon that cannot resolve its own directory) = no worker at all.
@@ -89,6 +95,7 @@ struct Timings {
     status_stale: Duration,
     wedged: Duration,
     reprobe_interval: Duration,
+    audio_hold: Duration,
 }
 
 impl Default for Timings {
@@ -99,6 +106,7 @@ impl Default for Timings {
             status_stale: STATUS_STALE,
             wedged: WORKER_WEDGED,
             reprobe_interval: REPROBE_MIN_INTERVAL,
+            audio_hold: AUDIO_DEMAND_HOLD,
         }
     }
 }
@@ -319,6 +327,10 @@ pub struct LedManager {
     /// directory): remembered pre-control device modes survive a worker
     /// that died without restoring them.
     saved_modes: Option<PathBuf>,
+    /// R1: the debounced capture demand published to the audio service
+    /// (`audio_demand`), and when its live reason was last seen.
+    audio_demand: bool,
+    audio_live_at: Option<Instant>,
 }
 
 /// File name of the worker's remembered-modes file in the state directory.
@@ -347,6 +359,8 @@ impl LedManager {
             status_lines_rejected: 0,
             timings: Timings::default(),
             saved_modes: None,
+            audio_demand: false,
+            audio_live_at: None,
         }
     }
 
@@ -366,17 +380,84 @@ impl LedManager {
         }
     }
 
-    /// LED sync wants system audio: enabled, a worker is configured and
-    /// usable, and the configured mode reads audio (`spectrum`,
-    /// `ambient+pulse`). The supervisor publishes this to the audio
-    /// capture service, which runs capture while it holds (follows the
-    /// settings, not the pause verdict).
+    /// The settings call for system audio: enabled, a worker is configured
+    /// and usable, and the configured mode reads audio (`spectrum`,
+    /// `ambient+pulse`). Necessary, not sufficient, for capture: see
+    /// `audio_demand`.
     pub fn wants_audio(&self) -> bool {
         self.settings.enabled
             && self.config.is_some()
             && self.unavailable.is_none()
             && !self.budget_exhausted
             && mode_reads_audio(self.settings.mode)
+    }
+
+    /// R1: the worker reports a reachable OpenRGB server and is in a state
+    /// that consumes audio: `active` (driving, or `waiting_for_source` —
+    /// the bootstrap: Spectrum needs audio to leave it) or `off` while the
+    /// pause verdict does not hold (the transient line before a resume
+    /// reaches the worker). A stale status line (no heartbeat for
+    /// `status_stale`) does not count.
+    fn worker_connected(&self, now: Instant) -> bool {
+        let Some(running) = self.running.as_ref() else {
+            return false;
+        };
+        if running.stdin_broken {
+            return false;
+        }
+        let (Some(latest), Some(at)) = (running.reader.latest.as_ref(), running.reader.latest_at)
+        else {
+            return false;
+        };
+        if now.saturating_duration_since(at) >= self.timings.status_stale {
+            return false;
+        }
+        latest.server.reachable && matches!(latest.state, State::Active | State::Off)
+    }
+
+    /// R1: what the supervisor publishes to the audio capture service —
+    /// "LED sync demands capture now". Holds while the settings call for
+    /// audio (`wants_audio`) AND the worker is connected to an OpenRGB
+    /// server AND the pause verdict does not hold; it rises at once and
+    /// falls `AUDIO_DEMAND_HOLD` after that live reason went away (so a
+    /// flap does not restart `pw-record`). A settings change that removes
+    /// the need (disabled, non-audio mode, worker unusable) drops it at
+    /// once. Updated by `tick`.
+    pub fn audio_demand(&self) -> bool {
+        self.audio_demand
+    }
+
+    fn update_audio_demand(&mut self, now: Instant) {
+        if !self.wants_audio() {
+            if self.audio_demand {
+                eprintln!("event=led.audio_demand demand=false why=settings");
+            }
+            self.audio_demand = false;
+            self.audio_live_at = None;
+            return;
+        }
+        if !self.paused && self.worker_connected(now) {
+            self.audio_live_at = Some(now);
+            if !self.audio_demand {
+                eprintln!("event=led.audio_demand demand=true");
+            }
+            self.audio_demand = true;
+            return;
+        }
+        let held = self
+            .audio_live_at
+            .is_some_and(|at| now.saturating_duration_since(at) < self.timings.audio_hold);
+        if self.audio_demand && !held {
+            eprintln!(
+                "event=led.audio_demand demand=false why={}",
+                if self.paused {
+                    "paused"
+                } else {
+                    "not_connected"
+                }
+            );
+            self.audio_demand = false;
+        }
     }
 
     /// A running worker would use an audio frame right now (wants audio,
@@ -722,6 +803,7 @@ impl LedManager {
                 self.schedule_restart();
             }
         }
+        self.update_audio_demand(Instant::now());
     }
 
     /// Daemon shutdown, first half: ask the worker to restore and exit

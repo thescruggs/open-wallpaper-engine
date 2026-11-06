@@ -1765,6 +1765,7 @@ mod tests {
             display_power_worker: None,
             led_worker: None,
             led_audio_demand: Default::default(),
+            audio_capture_flag: false,
         }
     }
 

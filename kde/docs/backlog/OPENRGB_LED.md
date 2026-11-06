@@ -315,6 +315,59 @@
     `--silence-release-ms` (tests only); the worker integration suite runs
     them scaled, the daemon tests and `smoke-led.sh` run the defaults
     (smoke 15.9 s → 22 s).
+- **Review fixes C2 — done (uncommitted, 2026-11-06), live check pending.**
+  Daemon settings, capture demand, scripts guard, manager and the two W5
+  Workshop items of the third review. Each regression test below was
+  confirmed to FAIL with its fix reverted in place (pre-fix logic restored,
+  everything else unchanged) and to pass with it.
+  - N4 bad `led` record turned sync ON — CLOSED. Field-wise repair: valid
+    fields kept, invalid ones defaulted, `enabled` kept if a bool else
+    `false` (also a non-object `led`; serde used to read `[true]` as a
+    record); malformed device ids dropped; the repaired record is written
+    back at open, so `settings.led_reset` is logged once. Tests
+    `settings::tests::a_bad_led_record_keeps_sync_off_keeps_valid_fields_and_is_repaired_once`,
+    `supervisor::tests::a_broken_led_record_with_sync_off_never_spawns_the_worker`.
+  - R1 capture with no consumer — CLOSED. `LedManager::audio_demand`: audio
+    mode AND worker reports a reachable server in `active` (incl.
+    `waiting_for_source`, the Spectrum bootstrap) or unpaused `off`, status
+    < 15 s old, AND no pause verdict. Rises at once; falls 10 s
+    (`AUDIO_DEMAND_HOLD`) after connected-and-unpaused ended; a settings
+    change that removes the need drops it at once. `audio.status` `reasons`
+    `led_sync` = this demand (incl. the hold). Manager hint now uses
+    `audio.silent`: "Nothing is playing right now" vs "No audio is reaching
+    LED sync", shown only while `active`. Tests
+    `led::tests::audio_demand_needs_a_connected_unpaused_worker_and_is_debounced`,
+    `LedSyncClientTest::audioHintTellsSilenceFromMissingAudio`.
+  - R2 renderers started hearing LED-only capture — CLOSED. Frames from the
+    daemon's own capture worker (peer credentials) without `--audio-capture`
+    go to the LED worker only; renderers get nothing, as before LED sync.
+    With the flag, and for other `audio.forward` callers (smoke-web case 4),
+    the grant-gated path is unchanged. Test
+    `supervisor::tests::led_only_capture_never_reaches_a_granted_wallpaper_without_the_flag`.
+  - R3 guard false negatives — CLOSED. `scripts/led-guard.sh` (called by
+    `check.sh`): comments stripped quote-aware, commands split at ; | & ( ),
+    command word after assignments/wrappers/options, variables assigned a
+    kwe-daemon path (transitively, `$(command -v …)`), `cargo run -p/--bin
+    kwe-daemon`, `--led-sdk-port 6742` rejected. `--self-test` (21 bad / 19
+    good snippets) runs first in `check.sh`; the old guard flagged none of
+    the five reported misses. With the flags stripped from copies of the
+    current scripts it reports all 17 real launches; clean on the scripts.
+  - R7 "Paused" for mode Off — CLOSED. `LedSyncClient.showsPaused` = `off`
+    + reason `paused` only. Test
+    `LedSyncClientTest::offWhilePausedVerdictIsTheUsersModeOff`.
+  - NIT poll while minimised — CLOSED (`SettingsPage.qml` gates the 3 s
+    timer on the window not being minimised/hidden; QML only, not run).
+  - NIT provenance — CLOSED: `docs/PROVENANCE.md` ledger row for the
+    OpenRGB SDK protocol documentation.
+  - Test race fixed outside the slice's files:
+    `kwe-openrgb` `device_missing_at_restore_is_kept_and_restored_when_back`
+    (C1) snapshotted the stub's device list before the unacknowledged mode
+    update landed (2/30 isolated runs failed, one `check.sh` run failed);
+    it now waits for the restore first (0/60).
+  - Workshop R8/R9 and the notice-scope NIT: see
+    `WORKSHOP_BROWSER_EXECUTION.md` (W5 post-review note).
+  - Not verified live: real OpenRGB, real audio driving LEDs, the manager
+    UI (QML typecheck + C++/QML unit tests only).
 - **L5 — done (uncommitted, 2026-11-06), live check pending.**
   `scripts/smoke-led.sh` (opt-in `KWE_RUN_LED_SMOKE=1` in `check.sh`), with
   test-only helpers `crates/kwe-daemon/examples/led_smoke_stub.rs` (the

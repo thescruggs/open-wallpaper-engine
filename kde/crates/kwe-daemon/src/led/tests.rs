@@ -61,6 +61,26 @@ pub(crate) fn status_json(state: &str, mode: &str) -> String {
     )
 }
 
+/// `status_json` with the server reachable (connected) and a reason.
+pub(crate) fn connected_status_json(state: &str, mode: &str, reason: Option<&str>) -> String {
+    let reason = reason.map_or_else(|| "null".to_string(), |reason| format!("\"{reason}\""));
+    status_json(state, mode)
+        .replace(r#""reachable":false"#, r#""reachable":true"#)
+        .replace(r#""reason":null"#, &format!(r#""reason":{reason}"#))
+}
+
+/// A fake worker that re-prints `$0.status` (whatever the test last wrote
+/// there) every 50 ms, so a test can move it between states.
+pub(crate) const STATUS_FILE_BODY: &str =
+    "while :; do cat \"$0.status\" 2>/dev/null; sleep 0.05; done";
+
+pub(crate) fn set_worker_status(worker: &Path, line: &str) {
+    let path = PathBuf::from(format!("{}.status", worker.display()));
+    let temporary = PathBuf::from(format!("{}.status.tmp", worker.display()));
+    fs::write(&temporary, format!("{line}\n")).unwrap();
+    fs::rename(temporary, path).unwrap();
+}
+
 fn manager(worker: &Path, settings: LedSettings) -> LedManager {
     LedManager::new(
         Some(LedWorkerConfig {
@@ -925,6 +945,99 @@ fn audio_demand_follows_mode_enable_and_configuration() {
     assert!(led.consumes_audio());
     led.set_paused(true);
     assert!(!led.consumes_audio(), "paused: mode off");
+    drop(led);
+    fs::remove_dir_all(root).ok();
+}
+
+/// Review fixes C2 (R1): capture is demanded only while the worker is
+/// connected to an OpenRGB server (including `waiting_for_source`, the
+/// Spectrum bootstrap) and the pause verdict does not hold; losing either
+/// drops the demand only after the hold, so a flap never restarts capture;
+/// a settings change drops it at once.
+#[test]
+fn audio_demand_needs_a_connected_unpaused_worker_and_is_debounced() {
+    let root = temporary_directory("demand-live");
+    let worker = fake_worker(&root, STATUS_FILE_BODY);
+    set_worker_status(&worker, &status_json("server_absent", "spectrum"));
+    let mut led = manager(
+        &worker,
+        LedSettings {
+            mode: Mode::Spectrum,
+            ..LedSettings::default()
+        },
+    );
+    let hold = Duration::from_millis(600);
+    led.set_timings_for_test(Timings {
+        audio_hold: hold,
+        ..fast_timings()
+    });
+    // No OpenRGB server: the settings want audio, nobody would consume it.
+    tick_until(&mut led, "server_absent", |led| {
+        led.status().state == "server_absent"
+    });
+    assert!(led.wants_audio());
+    for _ in 0..20 {
+        led.tick();
+        assert!(!led.audio_demand(), "no server: no capture");
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Connected, waiting for audio (Spectrum's bootstrap): demand rises.
+    set_worker_status(
+        &worker,
+        &connected_status_json("active", "spectrum", Some("waiting_for_source")),
+    );
+    tick_until(&mut led, "demand while waiting_for_source", |led| {
+        led.audio_demand()
+    });
+
+    // A short disconnect flap (well under the hold) never drops it.
+    set_worker_status(&worker, &status_json("server_absent", "spectrum"));
+    tick_until(&mut led, "flap seen", |led| {
+        led.status().state == "server_absent"
+    });
+    assert!(led.audio_demand(), "held through the flap");
+    set_worker_status(&worker, &connected_status_json("active", "spectrum", None));
+    tick_until(&mut led, "reconnected", |led| {
+        led.status().state == "active"
+    });
+    assert!(led.audio_demand());
+
+    // A lasting disconnect drops it after the hold, not before.
+    set_worker_status(&worker, &status_json("server_absent", "spectrum"));
+    tick_until(&mut led, "absent", |led| {
+        led.status().state == "server_absent"
+    });
+    let lost = Instant::now();
+    tick_until(&mut led, "demand dropped", |led| !led.audio_demand());
+    let waited = lost.elapsed();
+    assert!(
+        waited + Duration::from_millis(150) >= hold,
+        "dropped after {waited:?}"
+    );
+
+    // Paused (fullscreen / displays off) while connected: same hold, then
+    // off; resuming brings it back at once.
+    set_worker_status(&worker, &connected_status_json("active", "spectrum", None));
+    tick_until(&mut led, "connected again", |led| led.audio_demand());
+    led.set_paused(true);
+    led.tick();
+    assert!(led.audio_demand(), "a quick pause toggle keeps capture");
+    led.set_paused(false);
+    led.tick();
+    assert!(led.audio_demand());
+    led.set_paused(true);
+    tick_until(&mut led, "paused drop", |led| !led.audio_demand());
+    led.set_paused(false);
+    tick_until(&mut led, "resumed", |led| led.audio_demand());
+
+    // A settings change that removes the need drops it on the next tick.
+    led.set_settings(LedSettings {
+        mode: Mode::Ambient,
+        ..LedSettings::default()
+    });
+    led.tick();
+    assert!(!led.audio_demand(), "ambient: no capture, no hold");
     drop(led);
     fs::remove_dir_all(root).ok();
 }

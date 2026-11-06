@@ -273,6 +273,9 @@ private slots:
     m_model->unsubscribe("801");
     QTRY_VERIFY(m_model->pendingIds().isEmpty());
     QCOMPARE(m_model->notice(), QStringLiteral("You are signed out of Steam. Sign in to continue."));
+    // Review fixes C2: the notice names its item, so another item's
+    // details pane does not show it.
+    QCOMPARE(m_model->noticeId(), QStringLiteral("801"));
 
     // Invalid ids never reach the daemon or the pending list.
     m_model->unsubscribe("0");

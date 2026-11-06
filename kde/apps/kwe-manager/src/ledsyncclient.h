@@ -40,6 +40,9 @@ class LedSyncClient final : public QObject {
     Q_PROPERTY(int protocolVersion READ protocolVersion NOTIFY statusChanged)
     Q_PROPERTY(int sdkPort READ sdkPort NOTIFY statusChanged)
     Q_PROPERTY(bool audioFresh READ audioFresh NOTIFY statusChanged)
+    // Fresh frames that carry no sound (`audio.silent`, review fixes C1):
+    // with audioFresh, "nothing is playing".
+    Q_PROPERTY(bool audioSilent READ audioSilent NOTIFY statusChanged)
     Q_PROPERTY(int deviceCount READ deviceCount NOTIFY statusChanged)
     // Devices the worker drives right now (`driven_count`); -1 when the
     // worker does not report it (older worker).
@@ -55,6 +58,16 @@ class LedSyncClient final : public QObject {
     Q_PROPERTY(int brightness READ brightness NOTIFY settingsChanged)
     Q_PROPERTY(int rateHz READ rateHz NOTIFY settingsChanged)
     Q_PROPERTY(QStringList disabledDevices READ disabledDevices NOTIFY settingsChanged)
+
+    // Review fixes C2 (R7): the state row shows "Paused" only for the
+    // documented `off` + reason `paused`; `off` with no reason is the user's
+    // own mode Off, whatever the raw `paused` verdict says.
+    Q_PROPERTY(bool showsPaused READ showsPaused NOTIFY statusChanged)
+    // Review fixes C2 (R1): the audio hint under the state row: "" (none),
+    // "nothing_playing" (audio arrives but is silent) or "no_audio" (no
+    // audio frames reach LED sync) — only while enabled, in an audio mode
+    // and connected (`active`).
+    Q_PROPERTY(QString audioHint READ audioHint NOTIFY audioHintChanged)
 
     // "Check again": false while a reprobe is in flight or the daemon's rate
     // limit (or our own matching cooldown) is running.
@@ -78,6 +91,9 @@ public:
     int protocolVersion() const { return m_protocolVersion; }
     int sdkPort() const { return m_sdkPort; }
     bool audioFresh() const { return m_audioFresh; }
+    bool audioSilent() const { return m_audioSilent; }
+    bool showsPaused() const;
+    QString audioHint() const;
     int deviceCount() const { return m_deviceCount; }
     int drivenCount() const { return m_drivenCount; }
     bool devicesTruncated() const { return m_devicesTruncated; }
@@ -108,6 +124,7 @@ signals:
     void statusChanged();
     void settingsChanged();
     void reprobeChanged();
+    void audioHintChanged();
 
 private:
     enum class Kind { Status, Reprobe, Set };
@@ -160,6 +177,7 @@ private:
     int m_protocolVersion = 0;
     int m_sdkPort = 0;
     bool m_audioFresh = false;
+    bool m_audioSilent = false;
     int m_deviceCount = 0;
     int m_drivenCount = -1;
     bool m_devicesTruncated = false;

@@ -80,6 +80,7 @@ qt_add_qml_module(kwe-manager
         qml/WorkshopBrowsePage.qml
         qml/WallpaperCard.qml
         qml/WallpaperDetail.qml
+        qml/UnsubscribeDialog.qml
         qml/WallpaperSelection.qml
 )
 

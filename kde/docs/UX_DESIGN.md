@@ -105,7 +105,8 @@ one-line description; the switch covers "off", so Off is not a picker entry
 — a daemon whose stored mode is `off` shows "Off" until another mode is
 chosen), a brightness slider (0–100 %, steps of 5), an update-rate spin box
 (1–20 Hz) and one checkbox per detected device (name, vendor, LED count).
-`led.status` is polled every 3 s only while Settings is visible.
+`led.status` is polled every 3 s only while Settings is visible and its
+window is not minimised (review fixes C2).
 
 Every state has an icon and text:
 
@@ -121,7 +122,7 @@ Every state has an icon and text:
 | `active` / `waiting_for_source` | information | Connected to OpenRGB — waiting for a wallpaper (ambient modes) / waiting for audio (spectrum; also shown while nothing is playing — silent audio is not a source); devices keep their own lighting until then; M found | — |
 | `active` | success | Syncing N devices with OpenRGB (N = worker `driven_count`; estimated from the list for an older worker); M found; SDK protocol version | — |
 | `off` / `paused` | pause | Paused while a fullscreen app covers the desktop or the displays are off | — |
-| `off` / none | stop | Mode is Off; devices keep their own lighting | — |
+| `off` / none | stop | Mode is Off; devices keep their own lighting (also while a pause verdict holds: the row follows `reason`, not the raw `paused` flag — review fixes C2) | — |
 | `degraded` | warning | LED sync is having trouble: reason in plain words; keeps retrying | Check again |
 
 Giving lighting back (review fixes C1): devices return to the lighting they
@@ -138,10 +139,18 @@ flickering source or fullscreen toggling cannot make them blink.
 for 2 s after an accepted call) the button is disabled, never an error; while
 the helper restarts it is disabled for the daemon's `retry_after_ms` (1 s
 when an older daemon sends none).
-With an audio mode selected and no fresh audio, an information message says
-no audio is reaching LED sync right now: system audio capture starts by
-itself for these modes (review fixes B), so it may still be starting or could
-not capture the audio output; no wallpaper is needed. An older daemon without `led.*` shows "LED sync needs
+Audio hint (review fixes C2): system audio capture starts by itself for the
+audio modes while LED sync is connected to OpenRGB and not paused (not for an
+audio mode with no SDK server, and it stops 10 s after a pause or a
+disconnect). While connected (`active`) in `spectrum` or `ambient+pulse`, an
+information message explains missing sound in two ways, from the worker's
+`audio` block: fresh but silent frames → "Nothing is playing right now"
+(Spectrum lights up as soon as sound plays / Ambient + pulse shows steady
+wallpaper colours); no fresh frames → "No audio is reaching LED sync right
+now" (capture may still be starting, or could not capture the audio output;
+until audio arrives Spectrum stays dark and Ambient + pulse shows steady
+wallpaper colours). No wallpaper is needed. Not shown in other states.
+An older daemon without `led.*` shows "LED sync needs
 a newer wallpaper service"; an unreachable daemon shows that the state is
 unknown and is re-checked while the page is open. A rejected write shows a
 warning with the daemon's reason and the controls return to the daemon's

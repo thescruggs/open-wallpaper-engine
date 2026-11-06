@@ -2,6 +2,7 @@
 import QtQuick
 import QtQuick.Controls as Controls
 import QtQuick.Layouts
+import QtQuick.Window
 import org.kde.kirigami as Kirigami
 
 // Per-renderer apply defaults. The values preselect the Apply controls in
@@ -20,12 +21,17 @@ Kirigami.ScrollablePage {
     ]
 
     // OpenRGB L4: poll led.status only while this page is shown (same
-    // visibility gating as the details pane's permission refresh).
+    // visibility gating as the details pane's permission refresh) and its
+    // window is on screen — not while it is minimised or hidden (review
+    // fixes C2). Restoring the window polls again at once.
+    readonly property bool windowShown: Window.window !== null
+        && Window.window.visibility !== Window.Minimized
+        && Window.window.visibility !== Window.Hidden
     Timer {
         interval: 3000
         repeat: true
         triggeredOnStart: true
-        running: settingsPage.visible
+        running: settingsPage.visible && settingsPage.windowShown
         onTriggered: ledSync.refresh()
     }
 

@@ -158,10 +158,18 @@ pub struct SupervisorConfig {
     /// (`--no-led-worker`) leaves LED sync permanently `worker_unavailable`
     /// (`not_configured`); the settings still persist.
     pub led_worker: Option<LedWorkerConfig>,
-    /// Review fixes B: "LED sync wants system audio" (`LedManager::
-    /// wants_audio`), published every tick for the audio capture service,
-    /// which runs capture while this OR `--audio-capture` holds.
+    /// Review fixes B / C2 (R1): "LED sync demands capture now"
+    /// (`LedManager::audio_demand`: audio mode, connected to an OpenRGB
+    /// server, not paused, debounced), published every tick for the audio
+    /// capture service, which runs capture while this OR `--audio-capture`
+    /// holds.
     pub led_audio_demand: Arc<AtomicBool>,
+    /// Review fixes C2 (R2): the `--audio-capture` flag. Without it,
+    /// captured audio exists only because LED sync asked for it and goes to
+    /// the LED worker ONLY — renderers receive no `audio_bands`, exactly as
+    /// before LED sync existed. With it, the per-wallpaper `audio` grant
+    /// and the generation gate decide renderer delivery as always.
+    pub audio_capture_flag: bool,
 }
 
 /// F3 detector launch parameters (see `occlusion.rs`).
@@ -757,6 +765,8 @@ enum ControlCommand {
     AudioFrame {
         generation: u64,
         frame: AudioFrame,
+        /// The daemon's own capture worker sent it (peer credentials).
+        from_capture: bool,
         reply: mpsc::Sender<Result<WorkerStatus>>,
     },
     MediaState {
@@ -834,10 +844,19 @@ impl SupervisorHandle {
         })
     }
 
-    pub fn audio_frame(&self, generation: u64, frame: AudioFrame) -> Result<WorkerStatus> {
+    /// `from_capture`: the frame comes from the daemon's own
+    /// `kwe-audio-worker` (identified by peer credentials). Without
+    /// `--audio-capture` such a frame reaches the LED worker only (R2).
+    pub fn audio_frame(
+        &self,
+        generation: u64,
+        frame: AudioFrame,
+        from_capture: bool,
+    ) -> Result<WorkerStatus> {
         self.request(|reply| ControlCommand::AudioFrame {
             generation,
             frame,
+            from_capture,
             reply,
         })
     }
@@ -1199,9 +1218,10 @@ impl SupervisorRuntime {
                 Ok(ControlCommand::AudioFrame {
                     generation,
                     frame,
+                    from_capture,
                     reply,
                 }) => {
-                    let result = self.forward_audio_frame(generation, frame);
+                    let result = self.forward_audio_frame_from(generation, frame, from_capture);
                     let _ = reply.send(result);
                 }
                 Ok(ControlCommand::MediaState {
@@ -1357,7 +1377,7 @@ impl SupervisorRuntime {
         self.led.tick();
         self.config
             .led_audio_demand
-            .store(self.led.wants_audio(), Ordering::Release);
+            .store(self.led.audio_demand(), Ordering::Release);
     }
 
     /// F3 policy switch: persists, starts/stops the detector, and applies
@@ -1804,7 +1824,19 @@ impl SupervisorRuntime {
         Ok(self.status())
     }
 
+    /// An `audio.forward` frame from any other caller (tests, an external
+    /// producer): renderer delivery follows the grant as always.
+    #[cfg(test)]
     fn forward_audio_frame(&mut self, generation: u64, frame: AudioFrame) -> Result<WorkerStatus> {
+        self.forward_audio_frame_from(generation, frame, false)
+    }
+
+    fn forward_audio_frame_from(
+        &mut self,
+        generation: u64,
+        frame: AudioFrame,
+        from_capture: bool,
+    ) -> Result<WorkerStatus> {
         // Review fixes B: the renderer-less LED path. Before any renderer
         // was ever promoted (display generation 0) the capture worker sends
         // generation 0; such a frame reaches ONLY the LED worker, and only
@@ -1826,6 +1858,16 @@ impl SupervisorRuntime {
         // the system audio from untrusted wallpaper content; the LED worker
         // is daemon-owned code the user enabled.
         self.led.offer_audio(&bytes);
+        // Review fixes C2 (R2): without `--audio-capture`, the daemon's own
+        // capture runs only for LED sync. Its frames then reach renderers
+        // never — exactly what they received before LED sync existed (no
+        // capture at all) — so a wallpaper holding the audio grant does not
+        // start hearing the system because the user picked an LED mode.
+        // Not a grant drop: nothing is counted or logged per frame. Frames
+        // from any other `audio.forward` caller keep the old path.
+        if from_capture && !self.config.audio_capture_flag {
+            return Ok(self.status());
+        }
         let worker = self
             .active
             .as_mut()
@@ -3267,6 +3309,7 @@ mod tests {
             display_power_worker: None,
             led_worker: None,
             led_audio_demand: Default::default(),
+            audio_capture_flag: false,
         }
         .validate()
         .unwrap()
@@ -4584,6 +4627,16 @@ mod tests {
         (runtime, led_worker)
     }
 
+    /// A fake LED worker that reports one connected (`server.reachable`)
+    /// `active` status line, then mirrors its stdin to `$0.stdin` — R1:
+    /// LED sync demands capture only while connected.
+    fn connected_recording_body() -> String {
+        format!(
+            "printf '%s\\n' '{}'\nexec /bin/cat > \"$0.stdin\"",
+            crate::led::tests::connected_status_json("active", "spectrum", None)
+        )
+    }
+
     fn promote_test_renderer(runtime: &mut SupervisorRuntime) -> PathBuf {
         let candidate = runtime.spawn_worker(test_spec()).unwrap();
         let home = candidate.home_path.clone();
@@ -4790,7 +4843,7 @@ mod tests {
         let (mut runtime, led_worker) = led_runtime(
             &root,
             "exec cat > \"$HOME/stdin.txt\"",
-            crate::led::tests::RECORDING_BODY,
+            &connected_recording_body(),
         );
         let demand = runtime.config.led_audio_demand.clone();
         for _ in 0..50 {
@@ -4815,8 +4868,17 @@ mod tests {
                 ..LedPatch::default()
             })
             .unwrap();
-        runtime.sync_led();
-        assert!(demand.load(Ordering::Acquire), "spectrum wants capture");
+        for _ in 0..200 {
+            runtime.sync_led();
+            if demand.load(Ordering::Acquire) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            demand.load(Ordering::Acquire),
+            "spectrum + connected wants capture"
+        );
         // Nothing promoted: the LED worker gets the frame, nobody else.
         assert_eq!(runtime.display_generation, 0);
         let status = runtime.forward_audio_frame(0, frame.clone()).unwrap();
@@ -4872,6 +4934,125 @@ mod tests {
         );
         runtime.stop_all(false);
         runtime.led.finish_shutdown();
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Review fixes C2 (R2): without `--audio-capture` the daemon's own
+    /// capture exists only for LED sync, so its frames reach the LED worker
+    /// and NO renderer — even a wallpaper holding the audio grant (before
+    /// LED sync, nothing was captured at all). With the flag, the granted
+    /// wallpaper receives them as always. Frames from any other
+    /// `audio.forward` caller keep the grant-gated path.
+    #[test]
+    fn led_only_capture_never_reaches_a_granted_wallpaper_without_the_flag() {
+        use kwe_led_protocol::Control;
+        let root = temporary_directory("led-capture-flag");
+        let (mut runtime, led_worker) = led_runtime(
+            &root,
+            "exec cat > \"$HOME/stdin.txt\"",
+            &connected_recording_body(),
+        );
+        assert!(!runtime.config.audio_capture_flag);
+        for _ in 0..50 {
+            runtime.sync_led();
+            if runtime.led.running_pid().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let home = promote_test_renderer(&mut runtime);
+        runtime
+            .grant_store
+            .set(
+                "431960-123",
+                GrantPatch {
+                    audio: Some(true),
+                    ..GrantPatch::default()
+                },
+            )
+            .unwrap();
+        runtime.sync_led();
+        let generation = runtime.display_generation;
+        let frame = AudioFrame::new(generation, vec![0.5; 32], vec![0.5; 32]).unwrap();
+        let renderer_audio = |runtime: &mut SupervisorRuntime| {
+            for _ in 0..20 {
+                runtime.service_active_input();
+                thread::sleep(Duration::from_millis(10));
+            }
+            fs::read_to_string(home.join("stdin.txt"))
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| line.contains("audio_bands"))
+                .count()
+        };
+
+        // LED-only capture: the LED worker gets every frame, the granted
+        // renderer none, and nothing counts as a grant drop.
+        let before = led_stdin(&led_worker, 1).len();
+        for _ in 0..3 {
+            let status = runtime
+                .forward_audio_frame_from(generation, frame.clone(), true)
+                .unwrap();
+            assert_eq!(status.audio_grant_dropped, 0);
+        }
+        let lines = led_stdin(&led_worker, before + 3);
+        assert!(
+            lines[before..]
+                .iter()
+                .filter(|line| matches!(line, Control::Audio(_)))
+                .count()
+                >= 3,
+            "{lines:?}"
+        );
+        assert_eq!(
+            renderer_audio(&mut runtime),
+            0,
+            "a granted wallpaper heard LED-only capture"
+        );
+        // With --audio-capture the granted wallpaper receives them.
+        runtime.config.audio_capture_flag = true;
+        runtime
+            .forward_audio_frame_from(generation, frame.clone(), true)
+            .unwrap();
+        assert_eq!(renderer_audio(&mut runtime), 1, "flag: delivered");
+        // Another caller's frame (no flag) keeps the old grant-gated path.
+        runtime.config.audio_capture_flag = false;
+        runtime
+            .forward_audio_frame_from(generation, frame.clone(), false)
+            .unwrap();
+        assert_eq!(renderer_audio(&mut runtime), 2, "external producer");
+        runtime.stop_all(false);
+        runtime.led.finish_shutdown();
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Review fixes C2 (N4): a user who turned LED sync off and whose `led`
+    /// record later fails to load (here: a mode an older daemon does not
+    /// know) keeps LED sync off — no worker is ever spawned.
+    #[test]
+    fn a_broken_led_record_with_sync_off_never_spawns_the_worker() {
+        let root = temporary_directory("led-broken-off");
+        fs::create_dir_all(root.join("state")).unwrap();
+        fs::write(
+            root.join("state").join("settings-v1.json"),
+            br#"{"schema_version":1,"led":{"enabled":false,"mode":"aurora","rate_hz":60}}"#,
+        )
+        .unwrap();
+        let (mut runtime, led_worker) = led_runtime(
+            &root,
+            "exec cat > /dev/null",
+            crate::led::tests::RECORDING_BODY,
+        );
+        for _ in 0..30 {
+            runtime.sync_led();
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(runtime.led.running_pid(), None, "no device takeover");
+        assert_eq!(runtime.led.status().state, "disabled");
+        assert!(
+            !PathBuf::from(format!("{}.argv", led_worker.display())).exists(),
+            "the worker never ran"
+        );
         fs::remove_dir_all(root).ok();
     }
 }

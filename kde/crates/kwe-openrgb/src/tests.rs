@@ -1009,6 +1009,11 @@ fn device_missing_at_restore_is_kept_and_restored_when_back() {
     );
     assert_eq!(c.saved_mode_count(), 1);
     assert_eq!(c.saved_present_count(), 0);
+    // The stub applies the (unacknowledged) mode update asynchronously:
+    // wait for device 0's restore before snapshotting the list, or the
+    // snapshot can carry its old Direct mode back (review fixes C2: this
+    // raced ~1 in 15 runs and failed check.sh).
+    assert!(wait_modes(&s, &[2]), "{:?}", active_modes(&s));
     // Back (still in Direct, as the server left it).
     let mut back = s.controllers();
     back.push(full[1].clone());

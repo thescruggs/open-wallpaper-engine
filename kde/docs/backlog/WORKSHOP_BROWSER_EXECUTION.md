@@ -112,6 +112,34 @@ awaiting orchestrator review). What it does and where:
   `latest_manifest`, then Steam updating) and a live unsubscribe from the
   details pane.
 
+**W5 post-review note (OpenRGB review fixes C2, 2026-11-06, uncommitted):**
+
+- R8 unsubscribe never registered as finished — CLOSED. After Steam accepted
+  `workshop.unsubscribe` the offline metadata cache still held the id and
+  synthesized it as `subscribed_missing` on the next scan (and kept touching
+  it, so it would never have aged out); the pane showed "Unsubscribing…" for
+  120 s, then "Steam has not removed the item yet", with Unsubscribe offered
+  again. The daemon now drops the id from the cache and records it as
+  unsubscribed (`WORKSHOP_PROTOCOL_V1.md` §2); re-subscribe works, a failed
+  unsubscribe leaves the cache alone. The Browse-view Unsubscribe had the
+  same defect (same RPC and the same `RemoteCatalogModel` pending logic) and
+  is fixed by the same change. Tests
+  `workshop::tests::unsubscribe_is_not_resurrected_by_the_offline_cache`
+  (confirmed failing with the fix removed),
+  `workshop_cache::tests::unsubscribe_tombstone_settles_and_ages_out`.
+- R9 confirmation dialog emitted `accepted` twice — CLOSED. The footer box
+  forwarded `accepted`/`rejected` to the Dialog, which already follows the
+  box's roles. The dialog is now `qml/UnsubscribeDialog.qml` without the
+  forwarding; ctest `kwe-unsubscribe-dialog-qmltest` (qmltestrunner,
+  offscreen) proves Unsubscribe → one `accepted`, Cancel / Escape → one
+  `rejected` and nothing sent (confirmed failing 2× / 2× with the old
+  handlers). The F4 issue-report dialog had the same forwarding (so its
+  `onAccepted` would run twice; reasoned from the same Qt behaviour, not
+  separately tested) and lost it too.
+- NIT notice scope — CLOSED. `RemoteCatalogModel.noticeId` names the item a
+  notice is about; the details pane shows a notice only for its own item.
+- Still not verified live: an unsubscribe against real Steam.
+
 ## 3. Task contracts
 
 Common to all: branch from `kde-owe-backend`; `./scripts/check.sh` green
