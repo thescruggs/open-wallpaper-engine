@@ -12,8 +12,14 @@ hex.workspace = true
 kwe-core = { path = "../kwe-core" }
 kwe-frame-protocol = { path = "../kwe-frame-protocol" }
 kwe-input-protocol = { path = "../kwe-input-protocol" }
+kwe-led-protocol = { path = "../kwe-led-worker/protocol" }
 kwe-report-protocol = { path = "../kwe-report-protocol" }
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+
+[dev-dependencies]
+# L3 integration tests drive the real kwe-led-worker against the in-process
+# recording stub SDK server (never shipped: dev-only feature).
+kwe-openrgb = { path = "../kwe-openrgb", features = ["stub"] }

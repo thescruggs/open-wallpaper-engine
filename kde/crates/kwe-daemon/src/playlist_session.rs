@@ -1763,6 +1763,7 @@ mod tests {
             shader_helper_path: None,
             occlusion_worker: None,
             display_power_worker: None,
+            led_worker: None,
         }
     }
 

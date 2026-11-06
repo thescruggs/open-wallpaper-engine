@@ -58,7 +58,51 @@
     and idles cheaply; L3 may still choose it.
   - Live check: SDK server not listening at 2026-11-05 (`ss -ltn` shows no
     6742) → `kwe-led-worker --probe` and the ≤10 s ambient run are pending.
-- L3–L5: pending.
+- **L3 — done (uncommitted, 2026-11-06), live check pending.**
+  `crates/kwe-daemon/src/led.rs` (lifecycle manager driven from the
+  supervisor tick), `led` record in `settings-v1.json`, `led.status` /
+  `led.reprobe` RPCs, audio tee, frame-path sync, pause → mode `off`,
+  daemon flags `--led-worker` / `--no-led-worker` / hidden `--led-sdk-port`,
+  `kwe diagnose` LED line, PKGBUILD installs `kwe-led-worker` +
+  `optdepends=('openrgb: ...')` (no pkgrel bump). Contract:
+  `docs/SUPERVISOR_API_V1.md` §LED sync.
+  - Design choices where the plan was open: (1) the worker runs whenever
+    `led.enabled` is on, **not** only while a renderer is live (L2
+    correction 5: the inventory and `server_absent` state stay visible to
+    the UI; with no renderer it gets `led_frame null` and fades); (2) the
+    manager lives inside the supervisor thread (like the F3/F4 detectors),
+    so frame path and pause verdict are read from the supervisor's own
+    state every tick — level-triggered, no hooks in the apply / playlist /
+    rollback / pause paths; nothing in it waits (async SIGTERM→grace→SIGKILL
+    reaping; only daemon shutdown waits, in parallel with renderer stop);
+    (3) **pause → `mode: off`** while `(pause_when_covered AND covered) OR
+    (pause_when_display_off AND asleep)`, even with no renderer live —
+    orchestrator choice, flagged for maintainer review; (4) the audio tee
+    is independent of the wallpaper's `audio` grant; (5) restart budget 3 per
+    10 min, 1 s apart, reset by toggling `enabled` or by `led.reprobe`; a
+    worker silent 30 s is restarted (one strike), silent 15 s reports
+    `degraded`/`worker_unresponsive`; (6) `led.reprobe` is rate-limited to one
+    accepted call per 2 s and doubles as "try the worker again" when it is
+    `not_installed` or out of restarts; (7) settings key `disabled_devices`
+    (the plan's `devices[]`), stored sorted+unique, ≤ 128.
+  - Plan corrections found: (1) audio only reaches the LED worker while the
+    daemon runs with `--audio-capture`, which the packaged unit does **not**
+    pass (default off) — `spectrum` / `ambient+pulse` get no audio on a
+    stock install; L4 must surface this or a later slice must start capture
+    while an audio-driven LED mode is selected; (2) audio frames are also
+    generation-gated (a renderer must have been promoted once), so spectrum
+    mode with no wallpaper ever applied stays dark; (3) smoke scripts that
+    start a daemon from `target/debug` will now also start the LED worker
+    against 127.0.0.1:6742 by default — harmless while no SDK server runs,
+    but such a smoke would drive the maintainer's real devices for its
+    duration (and restore them) if OpenRGB's server is on; those scripts
+    should pass `--no-led-worker` (scripts were outside L3's file scope);
+    (4) `TimeoutStopSec=5s` in the unit is enough: systemd SIGTERMs the
+    whole cgroup at once, and the worker's worst case is ≈ 3.3 s.
+  - Live check: 6742 not listening at 2026-11-06 (`ss -ltn`) → the real
+    `--probe` and ≤ 10 s run are still pending (same as L1/L2).
+- L4–L5: pending. L4 consumes `led.status` / `led.reprobe` /
+  `settings.*.led` exactly as documented in `SUPERVISOR_API_V1.md`.
 
 Requested 2026-08-29: drive OpenRGB-controlled devices (keyboard, case
 LEDs, strips) from the running wallpaper and/or the captured system
@@ -136,8 +180,8 @@ authentication; the client must only ever dial loopback.
   extension (`led: {enabled, mode, brightness, rate_hz, devices[]}`)
   with the existing quarantine-on-corrupt posture; `led.status` RPC;
   hand the worker the active frame path on renderer transitions and
-  tee audio frames. Worker runs only while enabled AND a renderer is
-  live.
+  tee audio frames. ~~Worker runs only while enabled AND a renderer is
+  live.~~ (L3: runs while enabled; see slice status.)
 - **L4 — manager UI (medium).** Settings page section: enable switch,
   mode picker, brightness/rate, detected-device list with checkboxes,
   and the actionable degraded states ("OpenRGB SDK server is not

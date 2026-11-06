@@ -244,13 +244,15 @@ rendering pauses while a fullscreen application is showing (F3), and whether
 it pauses while every display is powered down (F4).
 
 - `settings.get` → `{"audio_output": true|false, "pause_when_covered":
-  true|false, "pause_when_display_off": true|false}` (defaults `true` /
-  `false` / `false`).
-- `settings.set` `{"audio_output": false}`, `{"pause_when_covered": true}`
-  or `{"pause_when_display_off": true}` (any combination) → persists the
-  values and answers the effective record. Unknown fields, or a patch naming
-  no knob, are rejected (`invalid_params`). A record written before a pause
-  knob existed loads with it off.
+  true|false, "pause_when_display_off": true|false, "led": {...}}` (defaults
+  `true` / `false` / `false`; `led` below).
+- `settings.set` `{"audio_output": false}`, `{"pause_when_covered": true}`,
+  `{"pause_when_display_off": true}` or `{"led": {...partial...}}` (any
+  combination) → persists the values and answers the effective record.
+  Unknown fields, or a patch naming no knob (an empty `led` object counts as
+  none), are rejected (`invalid_params`). An out-of-bounds `led` value
+  rejects the **whole** request before anything in it is applied. A record
+  written before a knob existed loads with its default.
 
 ### Enforcement
 
@@ -326,6 +328,126 @@ last frame is what the display shows on wake. The verdict is dropped
 (resume) whenever the helper exits or the setting is switched off.
 `renderer.status` carries `pause_when_display_off`, `displays_asleep` and
 `display_power_detector`.
+
+### LED sync *(OpenRGB, slice L3)*
+
+Optional hardware lighting through OpenRGB's SDK server on 127.0.0.1
+(plan `docs/backlog/OPENRGB_LED.md`, worker contract
+`docs/LED_PROTOCOL_V1.md`). Maintainer decision 2026-11-05: OpenRGB is
+optional but used whenever its SDK server runs, so `led.enabled` defaults
+**on**; with no SDK server the state is the quiet `server_absent`.
+
+Settings record (`settings-v1.json` key `led`, every field optional on
+load and in `settings.set`):
+
+```json
+{"enabled": true, "mode": "ambient", "brightness": 100, "rate_hz": 10, "disabled_devices": []}
+```
+
+| Field | Default | Bounds (daemon-side; the worker re-checks) |
+|---|---|---|
+| `enabled` | `true` | bool — runs/stops `kwe-led-worker` |
+| `mode` | `ambient` | `off`, `ambient`, `spectrum`, `ambient+pulse` |
+| `brightness` | 100 | 0..=100 (%) |
+| `rate_hz` | 10 | 1..=20 |
+| `disabled_devices` | `[]` | ≤ 128 device ids (16 lowercase hex, `led.status` `worker_status.devices[].id`); `settings.set` **replaces** the list; stored sorted and unique |
+
+An invalid `led` record in the file (bad bounds, unknown mode or field)
+quarantines the file like any other schema violation. `settings.set
+{"led": {"enabled": false}}` stops the worker (SIGTERM / stdin EOF → the
+worker restores every device it controlled; 4 s grace, then SIGKILL);
+`enabled: true` spawns it with a fresh restart budget. Every other field
+reaches the running worker as one merged `led_config` line — no respawn.
+
+Daemon flags: `--led-worker <path>` (default `kwe-led-worker` beside the
+daemon), `--no-led-worker` (state stays `worker_unavailable` /
+`not_configured`), hidden `--led-sdk-port N` (tests/smokes: point the worker
+at a stub server; default the worker's 6742). The worker runs while
+`enabled` is on, whether or not a renderer is live (device inventory and the
+server state stay available to the UI). Spawn: cleared environment, own
+process group, parent-death SIGTERM, `no_new_privs`, stdin/stdout pipes
+nonblocking, stderr to the daemon journal, **no** network namespace. Restart
+budget: 3 unexpected exits per 10 min (1 s apart), then
+`worker_unavailable` / `restart_budget_exhausted` until the setting is
+toggled or `led.reprobe` is called. A missing binary is no strike. A worker
+silent for 30 s (heartbeat is 5 s) is stopped and restarted (one strike).
+
+Feeding, all latest-wins and nonblocking (one pending line per stream, a
+full pipe never blocks the supervisor thread, audio to the renderer, or
+RPCs):
+
+- `led_frame` = the ACTIVE renderer's frame file, `null` while nothing is
+  promoted; synced every supervisor tick, so apply, playlist advance,
+  restart, rollback and stop all reach it; re-sent after every worker spawn.
+- Every `audio.forward` frame that passes the generation gate is teed to the
+  worker as the renderer's exact `audio_bands` line — independent of the
+  wallpaper's `audio` grant (the grant protects captured audio from
+  untrusted wallpaper content; the LED worker is daemon code the user
+  enabled). Audio only exists while the daemon runs with `--audio-capture`
+  and a renderer has been promoted.
+- **Pause (orchestrator design choice, flagged for maintainer review):**
+  while the effective F3/F4 pause verdict holds — `(pause_when_covered AND
+  covered) OR (pause_when_display_off AND asleep)`, whether or not a
+  renderer is live — the worker is told `mode: off` (devices go back to the
+  user's own lighting); the configured mode is restored when the verdict
+  clears. A mode change made while paused is stored and applied on resume.
+
+`led.status` (no params) → always success-shaped:
+
+```json
+{"enabled": true, "state": "active", "reason": null, "paused": false,
+ "settings": {"enabled": true, "mode": "ambient", "brightness": 100, "rate_hz": 10, "disabled_devices": []},
+ "worker": {"available": true, "running": true, "pid": 4242, "stopping": false, "restarts": 0,
+            "restart_budget_exhausted": false, "last_exit": null, "status_age_ms": 180,
+            "last_restore": null, "status_lines_rejected": 0},
+ "worker_status": {"version": 1, "type": "led_status", "seq": 12, "state": "active", "reason": null,
+                   "mode": "ambient", "brightness": 100, "rate_hz": 10,
+                   "server": {"port": 6742, "reachable": true, "protocol": 5, "server_protocol": 5, "next_probe_ms": null},
+                   "frame": {"state": "ok", "sequence": 4711, "width": 1920, "height": 1080},
+                   "audio": {"fresh": false, "bands": null},
+                   "device_count": 1,
+                   "devices": [{"id": "9d0c2b7e5a1f3c44", "name": "Keyboard", "vendor": "...", "serial": "...",
+                                "location": "...", "type": 5, "leds": 104, "enabled": true, "controlled": true,
+                                "zones": [{"name": "Keys", "type": "matrix", "leds": 104, "matrix": [6, 22]}],
+                                "zones_truncated": false}],
+                   "devices_truncated": false,
+                   "counters": {"ticks": 130, "updates_sent": 256, "update_errors": 0, "frames_read": 130,
+                                "connects": 1, "disconnects": 0, "stdin_lines": 3, "stdin_rejected": 0,
+                                "stdin_ignored": 0, "audio_frames": 0}},
+ "tee": {"audio_sent": 0, "audio_coalesced": 0, "write_errors": 0}}
+```
+
+| `state` | `reason` | Meaning / UI |
+|---|---|---|
+| `disabled` | `null` | setting off |
+| `worker_unavailable` | `not_configured` \| `not_installed` \| `restart_budget_exhausted` | no worker; "Check again" = `led.reprobe` |
+| `starting` | `null` \| `restarting` \| `worker_stopping` | spawned but no status line yet / between restarts / previous worker still restoring |
+| `connecting` | `null` | worker's first probe in flight |
+| `server_absent` | `null` | **normal**: no SDK server on loopback — "enable OpenRGB's SDK server (SDK Server tab) or run `openrgb --server`" |
+| `active` | `null` | driving the enabled devices (`device_count` may be 0) |
+| `off` | `paused` \| `null` | connected, devices restored: by the pause verdict, or the user chose mode `off` |
+| `degraded` | worker reason (`timeout`, `disconnected`, `io_error`, `protocol_error`, `unsupported_version`, `device_error`, `error`) \| `worker_unresponsive` | re-probing / worker silent ≥ 15 s |
+
+`worker_status` is the worker's latest `led_status` line passed through
+(≤ 32 KiB, ≤ 32 devices × 16 zones, strings ≤ 80 chars; schema in
+`LED_PROTOCOL_V1.md`) while a worker runs, else `null`. `worker.last_restore`
+is the `restore` summary from the last stopped worker's final line.
+Errors: `led_unavailable` (no supervisor), `led_failed` (supervisor timeout).
+
+`led.reprobe` (no params, or `{}`; anything else `invalid_params`) →
+"Check again", rate-limited to one accepted call per 2 s:
+
+```json
+{"accepted": true, "action": "reprobe", "reason": null, "retry_after_ms": null, "status": {...led.status...}}
+{"accepted": false, "action": null, "reason": "rate_limited", "retry_after_ms": 1400, "status": {...}}
+```
+
+`action`: `reprobe` (the running worker probes the SDK server now and emits
+a fresh status line; a no-op while connected) or `respawn` (the worker was
+`not_installed` or out of restarts: the binary is re-checked and the budget
+reset). `reason` when not accepted: `disabled`, `not_configured`,
+`rate_limited`, `worker_restarting`. The new state arrives in a later
+`led.status` (poll; ≤ 250 ms worker-side).
 
 ## Audio and media control
 

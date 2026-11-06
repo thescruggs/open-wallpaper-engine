@@ -1,6 +1,6 @@
 # LED worker protocol v1 (`kwe-led-worker`)
 
-Contract between `kwe-daemon` (slice L3, not yet written) and the isolated
+Contract between `kwe-daemon` (slice L3, `crates/kwe-daemon/src/led.rs`) and the isolated
 OpenRGB LED sync worker (slice L2). Everything an integrator needs is here;
 the code is `crates/kwe-led-worker` (binary + library) and the wire types are
 `crates/kwe-led-worker/protocol` (package `kwe-led-protocol`). Plan:

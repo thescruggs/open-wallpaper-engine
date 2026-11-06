@@ -101,7 +101,7 @@ performance policies:
 | `control.shortcuts` | Global shortcuts | P1 | Register through KDE's shortcut facilities. |
 | `system.screensaver` | Separate screensaver wallpapers/profiles | Deferred | Requires a safe KDE lock-screen/screensaver design. |
 | `system.desktop-icons` | Show/hide desktop icons | Unsupported | Plasma owns desktop containment and icons. |
-| `system.led` | Razer/Corsair lighting | P2/backend-dependent | Future explicit OpenRGB-style plugin, off by default. |
+| `system.led` | Razer/Corsair lighting | P2/backend-dependent | Partial (daemon + worker, synthetic stub evidence only): optional OpenRGB SDK backend (`kwe-led-worker`, `docs/LED_PROTOCOL_V1.md`), used while OpenRGB's SDK server runs on loopback; `led` setting defaults on (maintainer 2026-11-05), quiet `server_absent` otherwise. Global modes only (ambient from the wallpaper frame, spectrum/pulse from captured audio); WE per-wallpaper LED projection is not supported. No live-device verification yet; manager UI pending (L4). |
 | `system.editor` | Create/edit/publish wallpapers | Deferred | Viewer/manager first; do not imply official editor compatibility. |
 | `system.mobile` | Android companion transfer | Deferred | Not part of the KDE desktop 1.0 goal. |
 

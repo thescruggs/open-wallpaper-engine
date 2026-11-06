@@ -46,6 +46,17 @@ Playlist methods (additive, API version unchanged):
   (1..=3 600 000 ms), rejected with `test_faults_disabled` unless the
   daemon runs with `--allow-test-faults`.
 
+LED sync methods (OpenRGB slice L3, additive, API version unchanged;
+full shapes in `docs/SUPERVISOR_API_V1.md` §LED sync):
+
+- `led.status` → the daemon's LED view (`state` ∈ `disabled`,
+  `worker_unavailable`, `starting`, `connecting`, `server_absent`, `active`,
+  `off`, `degraded`) plus the worker's latest bounded status line; every
+  state, including `server_absent`, is a success-shaped answer.
+- `led.reprobe` → "Check again" (rate-limited, `{accepted, action, reason,
+  retry_after_ms, status}`).
+- The `led` record rides `settings.get` / `settings.set`.
+
 This is a development transport, not a stable public API. Catalog schema and
 transport versions are separate so either can evolve explicitly.
 

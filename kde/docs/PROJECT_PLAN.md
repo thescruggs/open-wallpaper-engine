@@ -69,8 +69,10 @@ remains the CI smoke path; NVIDIA is the current native hardware lane.
 - Redistributing proprietary Wallpaper Engine runtime assets.
 - Perfect compatibility with every undocumented scene or web API.
 - Application-type wallpapers that execute arbitrary downloaded programs.
-- Hardware lighting integration, except through a future opt-in OpenRGB-style
-  backend.
+- Hardware lighting integration, except through the optional OpenRGB
+  backend (`docs/backlog/OPENRGB_LED.md`; maintainer 2026-11-05: used when
+  OpenRGB's SDK server runs, never a hard dependency; slices L0–L3 landed,
+  manager UI L4 and live verification pending).
 - Renderer and frame-transport optimization beyond release-blocking budgets.
   Profile-driven work is tracked in
   `docs/backlog/POST_RELEASE_RENDERER_OPTIMIZATION.md` and begins after the

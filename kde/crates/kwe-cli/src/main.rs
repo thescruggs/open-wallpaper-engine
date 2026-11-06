@@ -261,6 +261,14 @@ fn main() -> Result<()> {
                      killed"
                 ),
             }
+            // OpenRGB L3: LED sync lane. The worker's --probe is read-only
+            // (connect, negotiate, enumerate; no device packets) and exits 3
+            // when no SDK server answers on loopback, which is a normal
+            // state for an optional integration.
+            println!(
+                "{}",
+                led_lane(run_renderer_probe("kwe-led-worker", Duration::from_secs(5)))
+            );
             println!("Run `kwe-vulkan --json` for renderer capability details.");
         }
         Command::Preflight {
@@ -617,6 +625,35 @@ fn run_renderer_probe_confined(
     }
 }
 
+/// One `kwe diagnose` line for the LED sync worker (OpenRGB L3).
+fn led_lane(run: ProbeRun) -> String {
+    match run {
+        ProbeRun::Report(report) => {
+            let value: serde_json::Value = serde_json::from_str(report.trim()).unwrap_or_default();
+            format!(
+                "LED sync: kwe-led-worker present; OpenRGB SDK server reachable \
+                 (protocol {}, {} device(s))",
+                value["negotiated_protocol"], value["device_count"]
+            )
+        }
+        ProbeRun::Failed { exit: Some(3), .. } => "LED sync: kwe-led-worker present; OpenRGB SDK \
+             server not running (optional: enable it in OpenRGB's SDK Server tab or run \
+             `openrgb --server`)"
+            .to_string(),
+        ProbeRun::Missing => {
+            "LED sync: kwe-led-worker not found beside this binary (LED sync unavailable)"
+                .to_string()
+        }
+        ProbeRun::Failed { exit, reason } => format!(
+            "LED sync: kwe-led-worker --probe failed ({reason}, exit {})",
+            exit.map_or_else(|| "unknown".to_string(), |code| code.to_string())
+        ),
+        ProbeRun::Hung => {
+            "LED sync: kwe-led-worker --probe did not finish within 5 s; killed".to_string()
+        }
+    }
+}
+
 /// Outcome of the video backend probe lane (M1e); each failure mode prints
 /// a distinct diagnostic instead of a blanket "not found".
 enum VideoProbeOutcome {
@@ -725,4 +762,31 @@ fn shell_quote(value: &str) -> String {
         return value.into();
     }
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn led_lane_names_each_probe_outcome() {
+        let ok = led_lane(ProbeRun::Report(
+            r#"{"status":"ok","negotiated_protocol":5,"device_count":2}"#.to_string(),
+        ));
+        assert!(ok.contains("reachable (protocol 5, 2 device(s))"), "{ok}");
+        let absent = led_lane(ProbeRun::Failed {
+            exit: Some(3),
+            reason: "probe exited nonzero".into(),
+        });
+        assert!(absent.contains("not running"), "{absent}");
+        assert!(led_lane(ProbeRun::Missing).contains("not found"));
+        assert!(
+            led_lane(ProbeRun::Failed {
+                exit: Some(1),
+                reason: "probe exited nonzero".into()
+            })
+            .contains("exit 1")
+        );
+        assert!(led_lane(ProbeRun::Hung).contains("killed"));
+    }
 }

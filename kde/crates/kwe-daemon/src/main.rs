@@ -6,6 +6,7 @@ mod apply;
 mod audio;
 mod grants;
 mod inspect;
+mod led;
 mod occlusion;
 mod persist;
 mod playlist_session;
@@ -38,12 +39,14 @@ use grants::GrantPatch;
 use inspect::InspectConfig;
 use kwe_core::{Catalog, ProjectKind, ScanLimits, default_steam_roots, scan_installed};
 use kwe_input_protocol::{AudioFrame, MediaState, PointerButton, PointerPhase};
+use led::LedWorkerConfig;
 use playlist_session::{
     ImportPlaylist, PlaylistSessionConfig, PlaylistSessionHandle, PlaylistSessionService,
     SessionError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use settings::LedPatch;
 use supervisor::{
     ContentSpec, OcclusionWorkerConfig, RendererKind, RendererResourceLimits, ScalingMode,
     StartSpec, SupervisorConfig, SupervisorHandle, SupervisorService, TestFault, WorkerStatus,
@@ -142,6 +145,18 @@ struct Arguments {
     display_power_worker: Option<PathBuf>,
     #[arg(long)]
     no_display_power_worker: bool,
+    /// OpenRGB L3: LED sync worker (`kwe-led-worker`). Default: beside the
+    /// daemon executable. Spawned while the `led.enabled` setting is on
+    /// (default on); a missing binary is the quiet `worker_unavailable`
+    /// state. `--no-led-worker` disables it entirely.
+    #[arg(long = "led-worker")]
+    led_worker: Option<PathBuf>,
+    #[arg(long)]
+    no_led_worker: bool,
+    /// OpenRGB SDK port on 127.0.0.1 handed to the LED worker (tests and
+    /// smokes point it at a stub server). Default: the worker's 6742.
+    #[arg(long = "led-sdk-port", hide = true, value_parser = clap::value_parser!(u16).range(1..))]
+    led_sdk_port: Option<u16>,
     /// Wallpaper Engine assets root (S1), passed to the scene worker and
     /// to scene preflight so model layers can resolve their material
     /// textures. Default: the first existing
@@ -487,6 +502,18 @@ fn main() -> Result<()> {
                 .map(|worker_path| OcclusionWorkerConfig {
                     worker_path,
                     socket: socket.clone(),
+                })
+        },
+        led_worker: if arguments.no_led_worker {
+            None
+        } else {
+            arguments
+                .led_worker
+                .clone()
+                .or_else(default_led_worker_path)
+                .map(|worker_path| LedWorkerConfig {
+                    worker_path,
+                    port: arguments.led_sdk_port,
                 })
         },
     })?;
@@ -1199,12 +1226,25 @@ fn process_request(
                     Ok(params)
                         if params.audio_output.is_none()
                             && params.pause_when_covered.is_none()
-                            && params.pause_when_display_off.is_none() =>
+                            && params.pause_when_display_off.is_none()
+                            && params.led.as_ref().is_none_or(LedPatch::is_empty) =>
                     {
                         json!({
                             "error": "invalid_params",
-                            "detail": "settings.set needs at least one of audio_output, pause_when_covered, pause_when_display_off"
+                            "detail": "settings.set needs at least one of audio_output, pause_when_covered, pause_when_display_off, led"
                         })
+                    }
+                    // LED bounds are checked before anything in the request
+                    // is applied, so a bad patch changes nothing.
+                    Ok(SettingsSetParams {
+                        led: Some(ref led), ..
+                    }) if led.validate().is_err() => {
+                        let detail = led
+                            .validate()
+                            .err()
+                            .map(|error| error.to_string())
+                            .unwrap_or_default();
+                        json!({"error": "invalid_params", "detail": detail})
                     }
                     Ok(params) => permissions_call(supervisor, |handle| {
                         if let Some(enabled) = params.audio_output {
@@ -1216,11 +1256,34 @@ fn process_request(
                         if let Some(enabled) = params.pause_when_display_off {
                             handle.pause_when_display_off_set(enabled)?;
                         }
+                        if let Some(led) = params.led.filter(|led| !led.is_empty()) {
+                            handle.led_settings_set(led)?;
+                        }
                         settings_record(handle)
                     }),
                     Err(error) => {
                         json!({"error": "invalid_params", "detail": error.to_string()})
                     }
+                }
+            }
+            // OpenRGB L3: the daemon's view of LED sync plus the worker's
+            // latest status line. `server_absent` is a normal state, so
+            // every state is a success-shaped answer.
+            "led.status" => led_call(supervisor, |handle| handle.led_status()),
+            // "Check again": probe the SDK server now (or, when the worker
+            // is unavailable or out of restarts, try to start it again).
+            // Rate-limited; a refused call is still a success-shaped answer
+            // with `accepted: false` and a reason.
+            "led.reprobe" => {
+                if request.params.is_null()
+                    || request
+                        .params
+                        .as_object()
+                        .is_some_and(|params| params.is_empty())
+                {
+                    led_call(supervisor, |handle| handle.led_reprobe())
+                } else {
+                    json!({"error": "invalid_params", "detail": "led.reprobe takes no params"})
                 }
             }
             // F3: an occlusion verdict from the daemon's detector helper (or
@@ -1446,6 +1509,8 @@ struct SettingsSetParams {
     audio_output: Option<bool>,
     pause_when_covered: Option<bool>,
     pause_when_display_off: Option<bool>,
+    /// OpenRGB L3: a partial `led` record (see `settings::LedPatch`).
+    led: Option<LedPatch>,
 }
 
 /// `display.power.report` params (F4): every output the helper knows about
@@ -1473,6 +1538,7 @@ fn settings_record(handle: &SupervisorHandle) -> Result<Value> {
         "audio_output": handle.audio_output_get()?,
         "pause_when_covered": handle.pause_when_covered_get()?,
         "pause_when_display_off": handle.pause_when_display_off_get()?,
+        "led": handle.led_settings_get()?,
     }))
 }
 
@@ -1670,6 +1736,23 @@ fn permissions_call<T: Serialize>(
     }
 }
 
+/// OpenRGB L3 RPC helper: `led_unavailable` without a supervisor,
+/// `led_failed` when the supervisor did not answer.
+fn led_call<T: Serialize>(
+    supervisor: Option<&SupervisorHandle>,
+    call: impl FnOnce(&SupervisorHandle) -> Result<T>,
+) -> Value {
+    let Some(supervisor) = supervisor else {
+        return json!({"error": "led_unavailable"});
+    };
+    match call(supervisor) {
+        Ok(value) => serde_json::to_value(value).unwrap_or_else(
+            |error| json!({"error": "serialization_failed", "detail": error.to_string()}),
+        ),
+        Err(error) => json!({"error": "led_failed", "detail": error.to_string()}),
+    }
+}
+
 /// Live wallpaper apply RPC helper (BETA_M4a): maps the transaction result
 /// to the wire contract error codes (docs/SUPERVISOR_API_V1.md).
 fn apply_call(
@@ -1864,6 +1947,14 @@ fn default_display_power_worker_path() -> Option<PathBuf> {
     Some(directory.join("kwe-display-power-worker"))
 }
 
+/// Default `kwe-led-worker` beside the daemon executable (OpenRGB L3);
+/// optional — a missing file is reported as `worker_unavailable`.
+fn default_led_worker_path() -> Option<PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    let directory = executable.parent()?;
+    Some(directory.join("kwe-led-worker"))
+}
+
 /// Default `kwe-workshop-worker` beside the daemon executable.
 fn default_workshop_worker_path() -> Option<PathBuf> {
     let executable = std::env::current_exe().ok()?;
@@ -2041,6 +2132,10 @@ mod tests {
     /// permissions.* round trips; the test binary is a valid renderer path
     /// and no worker is ever launched by these tests.
     fn supervisor_service() -> SupervisorService {
+        supervisor_service_with_led(None)
+    }
+
+    fn supervisor_service_with_led(led_worker: Option<LedWorkerConfig>) -> SupervisorService {
         let dir = std::env::temp_dir().join(format!(
             "kwe-daemon-api-{}-{}",
             std::process::id(),
@@ -2087,6 +2182,7 @@ mod tests {
             shader_helper_path: None,
             occlusion_worker: None,
             display_power_worker: None,
+            led_worker,
         })
         .unwrap()
     }
@@ -2212,6 +2308,142 @@ mod tests {
         .unwrap();
         assert!(!ok);
         assert_eq!(result["error"], "invalid_params");
+    }
+
+    /// OpenRGB L3: `led.status` / `led.reprobe` / `settings.*.led` shapes.
+    #[test]
+    fn led_settings_round_trip_and_reject_bad_values_without_partial_apply() {
+        let service = supervisor_service();
+        let handle = service.handle();
+        let (ok, result) =
+            process_with_supervisor(r#"{"version":1,"method":"settings.get"}"#, &handle);
+        assert!(ok, "{result}");
+        assert_eq!(
+            result["led"],
+            json!({"enabled":true,"mode":"ambient","brightness":100,"rate_hz":10,"disabled_devices":[]})
+        );
+        let (ok, result) = process_with_supervisor(
+            r#"{"version":1,"method":"settings.set","params":{"led":{"mode":"ambient+pulse","brightness":40,"disabled_devices":["ffffffffffffffff","0123456789abcdef"]}}}"#,
+            &handle,
+        );
+        assert!(ok, "{result}");
+        assert_eq!(result["led"]["mode"], "ambient+pulse");
+        assert_eq!(result["led"]["brightness"], 40);
+        assert_eq!(result["led"]["rate_hz"], 10);
+        assert_eq!(
+            result["led"]["disabled_devices"],
+            json!(["0123456789abcdef", "ffffffffffffffff"])
+        );
+        // A bad LED value rejects the whole request: audio_output in the
+        // same request must not be applied.
+        for bad in [
+            r#"{"version":1,"method":"settings.set","params":{"audio_output":false,"led":{"rate_hz":21}}}"#,
+            r#"{"version":1,"method":"settings.set","params":{"audio_output":false,"led":{"brightness":101}}}"#,
+            r#"{"version":1,"method":"settings.set","params":{"audio_output":false,"led":{"mode":"disco"}}}"#,
+            r#"{"version":1,"method":"settings.set","params":{"audio_output":false,"led":{"disabled_devices":["XYZ"]}}}"#,
+            r#"{"version":1,"method":"settings.set","params":{"audio_output":false,"led":{"bogus":1}}}"#,
+            r#"{"version":1,"method":"settings.set","params":{"led":{}}}"#,
+        ] {
+            let (ok, result) = process_with_supervisor(bad, &handle);
+            assert!(!ok, "{bad} -> {result}");
+            assert_eq!(result["error"], "invalid_params", "{bad}");
+        }
+        let (_, result) =
+            process_with_supervisor(r#"{"version":1,"method":"settings.get"}"#, &handle);
+        assert_eq!(result["audio_output"], true, "nothing was applied");
+        assert_eq!(result["led"]["brightness"], 40);
+    }
+
+    #[test]
+    fn led_status_and_reprobe_without_a_worker_are_success_shaped() {
+        let service = supervisor_service();
+        let handle = service.handle();
+        let (ok, result) =
+            process_with_supervisor(r#"{"version":1,"method":"led.status"}"#, &handle);
+        assert!(ok, "{result}");
+        assert_eq!(result["state"], "worker_unavailable");
+        assert_eq!(result["reason"], "not_configured");
+        assert_eq!(result["enabled"], true);
+        assert_eq!(result["worker"]["available"], false);
+        assert!(result["worker_status"].is_null());
+        let (ok, result) =
+            process_with_supervisor(r#"{"version":1,"method":"led.reprobe"}"#, &handle);
+        assert!(ok, "{result}");
+        assert_eq!(result["accepted"], false);
+        assert_eq!(result["reason"], "not_configured");
+        assert_eq!(result["status"]["state"], "worker_unavailable");
+        let (ok, result) = process_with_supervisor(
+            r#"{"version":1,"method":"led.reprobe","params":{"x":1}}"#,
+            &handle,
+        );
+        assert!(!ok);
+        assert_eq!(result["error"], "invalid_params");
+        let (ok, result) = process_with_supervisor(
+            r#"{"version":1,"method":"settings.set","params":{"led":{"enabled":false}}}"#,
+            &handle,
+        );
+        assert!(ok, "{result}");
+        let (_, result) =
+            process_with_supervisor(r#"{"version":1,"method":"led.status"}"#, &handle);
+        assert_eq!(result["state"], "disabled");
+    }
+
+    /// `server_absent` is a normal, success-shaped answer (fake worker that
+    /// reports it, so this never depends on a built real worker).
+    #[test]
+    fn led_status_reports_server_absent_as_success_and_reprobe_is_rate_limited() {
+        let root = crate::led::tests::temporary_directory("rpc-absent");
+        let body = format!(
+            "printf '%s\\n' '{}'\nexec /bin/cat > \"$0.stdin\"",
+            crate::led::tests::status_json("server_absent", "ambient")
+        );
+        let worker = crate::led::tests::fake_worker(&root, &body);
+        let service = supervisor_service_with_led(Some(LedWorkerConfig {
+            worker_path: worker.clone(),
+            port: None,
+        }));
+        let handle = service.handle();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let result = loop {
+            let (ok, result) =
+                process_with_supervisor(r#"{"version":1,"method":"led.status"}"#, &handle);
+            assert!(ok, "{result}");
+            if result["state"] == "server_absent" {
+                break result;
+            }
+            assert!(std::time::Instant::now() < deadline, "{result}");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(result.get("error").is_none());
+        assert!(result["reason"].is_null());
+        assert_eq!(result["worker"]["running"], true);
+        assert_eq!(result["worker_status"]["state"], "server_absent");
+        assert_eq!(result["worker_status"]["server"]["reachable"], false);
+        let (ok, result) =
+            process_with_supervisor(r#"{"version":1,"method":"led.reprobe"}"#, &handle);
+        assert!(ok, "{result}");
+        assert_eq!(result["accepted"], true);
+        assert_eq!(result["action"], "reprobe");
+        let (ok, result) = process_with_supervisor(
+            r#"{"version":1,"method":"led.reprobe","params":{}}"#,
+            &handle,
+        );
+        assert!(ok, "{result}");
+        assert_eq!(result["accepted"], false);
+        assert_eq!(result["reason"], "rate_limited");
+        // The worker received the reprobe and a status request.
+        let stdin = PathBuf::from(format!("{}.stdin", worker.display()));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let text = std::fs::read_to_string(&stdin).unwrap_or_default();
+            if text.contains("led_reprobe") && text.contains("led_status_request") {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "{text}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(service);
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -3356,6 +3588,7 @@ with open(args.output, "wb") as frame:
             shader_helper_path: None,
             occlusion_worker: None,
             display_power_worker: None,
+            led_worker: None,
         }
     }
 
@@ -4845,6 +5078,7 @@ args = parser.parse_args()
             shader_helper_path: None,
             occlusion_worker: None,
             display_power_worker: None,
+            led_worker: None,
         })
         .unwrap();
         let supervisor = supervisor_service.handle();

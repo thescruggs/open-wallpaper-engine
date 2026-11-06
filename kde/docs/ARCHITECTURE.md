@@ -137,6 +137,22 @@ no password is handled and no Steamworks SDK is linked. Steam's local
 VDF manifests remain the offline source of truth for installed content.
 See ADR 0005.
 
+### LED sync worker (OpenRGB, optional)
+
+`kwe-led-worker` (slices L2/L3, `docs/LED_PROTOCOL_V1.md`) is the only
+process with LED or network code for hardware lighting: it samples the
+active renderer's frame file read-only, takes a tee of the captured audio
+bands, and drives OpenRGB-managed devices over the SDK protocol on
+**127.0.0.1 only**. The daemon owns it exactly like the audio worker — one
+child, spawned while the `led.enabled` setting is on (default on), cleared
+environment, own process group, parent-death SIGTERM, bounded restarts
+(3 per 10 min), SIGTERM with a 4 s grace so devices are restored — and talks
+to it only through nonblocking NDJSON pipes (latest wins, never blocking the
+supervisor thread). It must not get a private network namespace. OpenRGB is
+optional: no SDK server is the quiet `server_absent` state, and a missing
+worker binary is `worker_unavailable`. RPCs `led.status` / `led.reprobe` and
+the `led` settings record are in `docs/SUPERVISOR_API_V1.md`.
+
 ## Recovery state machine
 
 `DISCOVERED -> PREFLIGHT_OK -> CANARY -> ACTIVE -> DEGRADED`

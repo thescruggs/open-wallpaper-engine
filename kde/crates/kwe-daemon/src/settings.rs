@@ -16,8 +16,17 @@
 //! holding the last frame until a display wakes; the supervisor runs the
 //! display power helper only while this is on.
 //!
+//! `led` (OpenRGB L3) — the LED sync record `{enabled, mode, brightness,
+//! rate_hz, disabled_devices}`; the supervisor runs `kwe-led-worker` while
+//! `enabled` is on and forwards every other field to it live
+//! (`docs/LED_PROTOCOL_V1.md`, `docs/SUPERVISOR_API_V1.md` §LED sync).
+//!
 //! Defaults: audio enabled (the behavior before this store existed), both
-//! pause policies off. Persistence is atomic; a corrupt file is quarantined with the
+//! pause policies off, LED sync on in `ambient` at 100 % / 10 Hz with every
+//! device enabled (maintainer decision 2026-11-05: OpenRGB is optional but
+//! used when its SDK server runs). A file written before a field existed
+//! loads with that field's default; an out-of-bounds LED value fails
+//! validation and quarantines the file like any other schema violation. Persistence is atomic; a corrupt file is quarantined with the
 //! rename-to-invalid pattern and the store starts fresh, mirroring
 //! `grants::GrantStore`.
 
@@ -29,6 +38,10 @@ use std::{
 };
 
 use anyhow::{Result, bail};
+use kwe_led_protocol::{
+    BRIGHTNESS_DEFAULT, BRIGHTNESS_MAX, MAX_DISABLED_DEVICES, Mode, RATE_DEFAULT_HZ, RATE_MAX_HZ,
+    RATE_MIN_HZ, is_device_id,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::persist::{atomic_write, ensure_private_dir, quarantine_invalid_state};
@@ -39,6 +52,147 @@ const MAX_SETTINGS_BYTES: u64 = 16 * 1024;
 
 fn default_audio_output() -> bool {
     true
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_led_brightness() -> u8 {
+    BRIGHTNESS_DEFAULT
+}
+
+fn default_led_rate_hz() -> u8 {
+    RATE_DEFAULT_HZ
+}
+
+/// OpenRGB LED sync settings (slice L3). Every field defaults individually,
+/// so a partial record (or none at all) loads with the documented defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LedSettings {
+    /// Use OpenRGB while its SDK server answers on loopback (default on).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub mode: Mode,
+    /// Brightness cap in percent, 0..=100.
+    #[serde(default = "default_led_brightness")]
+    pub brightness: u8,
+    /// LED update rate, 1..=20 Hz.
+    #[serde(default = "default_led_rate_hz")]
+    pub rate_hz: u8,
+    /// Device ids (`kwe_led_protocol::device_id`, 16 lowercase hex digits)
+    /// the worker must leave alone; sorted, unique, at most 128.
+    #[serde(default)]
+    pub disabled_devices: Vec<String>,
+}
+
+impl Default for LedSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mode: Mode::Ambient,
+            brightness: BRIGHTNESS_DEFAULT,
+            rate_hz: RATE_DEFAULT_HZ,
+            disabled_devices: Vec::new(),
+        }
+    }
+}
+
+impl LedSettings {
+    /// Daemon-side bounds (the worker re-checks every line it receives).
+    pub fn validate(&self) -> Result<()> {
+        validate_led_values(
+            Some(self.brightness),
+            Some(self.rate_hz),
+            Some(&self.disabled_devices),
+        )?;
+        let mut sorted = self.disabled_devices.clone();
+        sorted.sort();
+        sorted.dedup();
+        if sorted != self.disabled_devices {
+            bail!("led.disabled_devices must be sorted and unique");
+        }
+        Ok(())
+    }
+
+    /// The record with `patch` applied; ids are normalized (sorted, unique).
+    pub fn patched(&self, patch: &LedPatch) -> Result<Self> {
+        patch.validate()?;
+        let mut next = self.clone();
+        if let Some(enabled) = patch.enabled {
+            next.enabled = enabled;
+        }
+        if let Some(mode) = patch.mode {
+            next.mode = mode;
+        }
+        if let Some(brightness) = patch.brightness {
+            next.brightness = brightness;
+        }
+        if let Some(rate_hz) = patch.rate_hz {
+            next.rate_hz = rate_hz;
+        }
+        if let Some(devices) = &patch.disabled_devices {
+            let mut devices = devices.clone();
+            devices.sort();
+            devices.dedup();
+            next.disabled_devices = devices;
+        }
+        next.validate()?;
+        Ok(next)
+    }
+}
+
+/// `settings.set {"led": {...}}`: every field optional; present fields
+/// replace their value, `disabled_devices` replaces the whole list.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LedPatch {
+    pub enabled: Option<bool>,
+    pub mode: Option<Mode>,
+    pub brightness: Option<u8>,
+    pub rate_hz: Option<u8>,
+    pub disabled_devices: Option<Vec<String>>,
+}
+
+impl LedPatch {
+    /// Bounds that do not depend on the current record, so the RPC layer
+    /// can reject a bad patch before any other setting in the same request
+    /// is applied.
+    pub fn validate(&self) -> Result<()> {
+        validate_led_values(
+            self.brightness,
+            self.rate_hz,
+            self.disabled_devices.as_deref(),
+        )
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+fn validate_led_values(
+    brightness: Option<u8>,
+    rate_hz: Option<u8>,
+    devices: Option<&[String]>,
+) -> Result<()> {
+    if brightness.is_some_and(|value| value > BRIGHTNESS_MAX) {
+        bail!("led.brightness must be 0..={BRIGHTNESS_MAX}");
+    }
+    if rate_hz.is_some_and(|value| !(RATE_MIN_HZ..=RATE_MAX_HZ).contains(&value)) {
+        bail!("led.rate_hz must be {RATE_MIN_HZ}..={RATE_MAX_HZ}");
+    }
+    if let Some(devices) = devices {
+        if devices.len() > MAX_DISABLED_DEVICES {
+            bail!("led.disabled_devices holds at most {MAX_DISABLED_DEVICES} ids");
+        }
+        if !devices.iter().all(|id| is_device_id(id)) {
+            bail!("led.disabled_devices entries must be 16 lowercase hex digits");
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -53,6 +207,10 @@ struct PersistedSettings {
     /// Additive (F4): files written before the field existed load as `false`.
     #[serde(default)]
     pause_when_display_off: bool,
+    /// Additive (OpenRGB L3): files written before the record existed load
+    /// with `LedSettings::default()` (sync on).
+    #[serde(default)]
+    led: LedSettings,
 }
 
 impl Default for PersistedSettings {
@@ -62,6 +220,7 @@ impl Default for PersistedSettings {
             audio_output: true,
             pause_when_covered: false,
             pause_when_display_off: false,
+            led: LedSettings::default(),
         }
     }
 }
@@ -135,6 +294,24 @@ impl SettingsStore {
         Ok(true)
     }
 
+    pub fn led(&self) -> &LedSettings {
+        &self.state.led
+    }
+
+    /// OpenRGB L3: persists a validated LED record atomically. Returns
+    /// whether it changed.
+    pub fn set_led(&mut self, led: LedSettings) -> Result<bool> {
+        led.validate()?;
+        if self.state.led == led {
+            return Ok(false);
+        }
+        let mut next = self.state.clone();
+        next.led = led;
+        self.save(&next)?;
+        self.state = next;
+        Ok(true)
+    }
+
     fn save(&self, state: &PersistedSettings) -> Result<()> {
         let bytes = serde_json::to_vec_pretty(state)?;
         if bytes.len() as u64 > MAX_SETTINGS_BYTES {
@@ -175,7 +352,13 @@ impl SettingsStore {
             return PersistedSettings::default();
         }
         match serde_json::from_slice::<PersistedSettings>(&bytes) {
-            Ok(state) if state.schema_version == 1 => state,
+            Ok(state) if state.schema_version == 1 => match state.led.validate() {
+                Ok(()) => state,
+                Err(error) => {
+                    Self::quarantine(path, &format!("invalid led record: {error}"));
+                    PersistedSettings::default()
+                }
+            },
             Ok(_) => {
                 Self::quarantine(path, "unsupported schema");
                 PersistedSettings::default()
@@ -298,5 +481,124 @@ mod tests {
         .unwrap();
         let store = SettingsStore::open(&directory).unwrap();
         assert!(store.audio_output());
+    }
+
+    #[test]
+    fn led_defaults_on_and_loads_from_a_file_written_before_l3() {
+        let directory = temporary_directory("led-legacy");
+        std::fs::write(
+            directory.join(SETTINGS_FILE),
+            br#"{"schema_version":1,"audio_output":false,"pause_when_covered":true,"pause_when_display_off":true}"#,
+        )
+        .unwrap();
+        let store = SettingsStore::open(&directory).unwrap();
+        assert!(!store.audio_output(), "the old fields survive");
+        assert!(store.pause_when_display_off());
+        let led = store.led();
+        assert!(led.enabled, "LED sync defaults on (maintainer 2026-11-05)");
+        assert_eq!(led.mode, Mode::Ambient);
+        assert_eq!(led.brightness, 100);
+        assert_eq!(led.rate_hz, 10);
+        assert!(led.disabled_devices.is_empty());
+        assert!(directory.join(SETTINGS_FILE).exists(), "not quarantined");
+
+        // A partial record fills the missing fields with their defaults.
+        std::fs::write(
+            directory.join(SETTINGS_FILE),
+            br#"{"schema_version":1,"led":{"mode":"spectrum"}}"#,
+        )
+        .unwrap();
+        let store = SettingsStore::open(&directory).unwrap();
+        assert!(store.led().enabled);
+        assert_eq!(store.led().mode, Mode::Spectrum);
+        assert_eq!(store.led().rate_hz, 10);
+    }
+
+    #[test]
+    fn led_round_trips_and_patches_normalize_device_ids() {
+        let directory = temporary_directory("led-roundtrip");
+        let mut store = SettingsStore::open(&directory).unwrap();
+        let next = store
+            .led()
+            .patched(&LedPatch {
+                enabled: Some(false),
+                mode: Some(Mode::AmbientPulse),
+                brightness: Some(0),
+                rate_hz: Some(20),
+                disabled_devices: Some(vec![
+                    "ffffffffffffffff".into(),
+                    "0123456789abcdef".into(),
+                    "ffffffffffffffff".into(),
+                ]),
+            })
+            .unwrap();
+        assert_eq!(
+            next.disabled_devices,
+            vec![
+                "0123456789abcdef".to_string(),
+                "ffffffffffffffff".to_string()
+            ]
+        );
+        assert!(store.set_led(next.clone()).unwrap());
+        assert!(!store.set_led(next.clone()).unwrap(), "no-op set");
+        let reloaded = SettingsStore::open(&directory).unwrap();
+        assert_eq!(reloaded.led(), &next);
+        assert!(reloaded.audio_output(), "other knobs untouched");
+    }
+
+    #[test]
+    fn led_bounds_are_enforced_on_patch_and_quarantined_on_load() {
+        let base = LedSettings::default();
+        for patch in [
+            LedPatch {
+                brightness: Some(101),
+                ..LedPatch::default()
+            },
+            LedPatch {
+                rate_hz: Some(0),
+                ..LedPatch::default()
+            },
+            LedPatch {
+                rate_hz: Some(21),
+                ..LedPatch::default()
+            },
+            LedPatch {
+                disabled_devices: Some(vec!["0123456789ABCDEF".into()]),
+                ..LedPatch::default()
+            },
+            LedPatch {
+                disabled_devices: Some(vec!["0123".into()]),
+                ..LedPatch::default()
+            },
+            LedPatch {
+                disabled_devices: Some(
+                    (0..=MAX_DISABLED_DEVICES)
+                        .map(|i| format!("{i:016x}"))
+                        .collect(),
+                ),
+                ..LedPatch::default()
+            },
+        ] {
+            assert!(patch.validate().is_err(), "{patch:?}");
+            assert!(base.patched(&patch).is_err(), "{patch:?}");
+        }
+
+        let directory = temporary_directory("led-bounds");
+        let path = directory.join(SETTINGS_FILE);
+        for bad in [
+            &br#"{"schema_version":1,"led":{"rate_hz":50}}"#[..],
+            br#"{"schema_version":1,"led":{"brightness":300}}"#,
+            br#"{"schema_version":1,"led":{"mode":"disco"}}"#,
+            br#"{"schema_version":1,"led":{"enabled":true,"extra":1}}"#,
+            br#"{"schema_version":1,"led":{"disabled_devices":["nothex"]}}"#,
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            let store = SettingsStore::open(&directory).unwrap();
+            assert_eq!(store.led(), &LedSettings::default());
+            assert!(
+                !path.exists(),
+                "invalid led record must quarantine the file"
+            );
+        }
     }
 }

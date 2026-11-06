@@ -35,6 +35,9 @@ depends=(
     'libdrm'
     'mesa'
 )
+optdepends=(
+    'openrgb: LED sync with the wallpaper and audio'
+)
 provides=("kde-wallpaper-engine=${pkgver}")
 conflicts=('kde-wallpaper-engine')
 # The binaries are already stripped release builds; the CEF runtime must not

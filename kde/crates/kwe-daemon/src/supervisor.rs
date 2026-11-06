@@ -25,11 +25,12 @@ use std::{
 };
 
 use crate::grants::{Grant, GrantPatch, GrantStore};
+use crate::led::{LedManager, LedStatusReport, LedWorkerConfig, ReprobeOutcome};
 use crate::occlusion::{OcclusionDetector, OcclusionDetectorStatus};
 #[cfg(test)]
 use crate::persist::unix_nanos;
 use crate::persist::{atomic_write, ensure_private_dir, unix_seconds};
-use crate::settings::SettingsStore;
+use crate::settings::{LedPatch, LedSettings, SettingsStore};
 use anyhow::{Context, Result, anyhow, bail};
 use kwe_core::{preflight_scene, preflight_video, preflight_web};
 use kwe_frame_protocol::{FrameSnapshot, FrameSpec, ProtocolError, SharedFrameReader};
@@ -152,6 +153,10 @@ pub struct SupervisorConfig {
     /// reports back to. `None` disables the automatic detector; the policy
     /// then only reacts to explicit `display.power.report` calls.
     pub display_power_worker: Option<OcclusionWorkerConfig>,
+    /// OpenRGB L3: the `kwe-led-worker` launch parameters. `None`
+    /// (`--no-led-worker`) leaves LED sync permanently `worker_unavailable`
+    /// (`not_configured`); the settings still persist.
+    pub led_worker: Option<LedWorkerConfig>,
 }
 
 /// F3 detector launch parameters (see `occlusion.rs`).
@@ -771,6 +776,11 @@ enum ControlCommand {
     PauseWhenDisplayOffSet(bool, mpsc::Sender<Result<bool>>),
     /// F4: the helper's (or a test's) verdict — every output powered down.
     DisplayPowerReport(bool, mpsc::Sender<Result<WorkerStatus>>),
+    /// OpenRGB L3: LED settings record, live status, "Check again".
+    LedSettingsGet(mpsc::Sender<Result<LedSettings>>),
+    LedSettingsSet(LedPatch, mpsc::Sender<Result<LedSettings>>),
+    LedStatus(mpsc::Sender<Result<LedStatusReport>>),
+    LedReprobe(mpsc::Sender<Result<LedReprobeReply>>),
     QuarantinedIds(mpsc::Sender<BTreeSet<String>>),
     Shutdown,
 }
@@ -890,6 +900,24 @@ impl SupervisorHandle {
         self.request(|reply| ControlCommand::DisplayPowerReport(asleep, reply))
     }
 
+    pub fn led_settings_get(&self) -> Result<LedSettings> {
+        self.request_value(ControlCommand::LedSettingsGet)
+    }
+
+    /// Persists the patched LED record and applies it live (spawn/stop on
+    /// `enabled`, one `led_config` line for everything else).
+    pub fn led_settings_set(&self, patch: LedPatch) -> Result<LedSettings> {
+        self.request_value(|reply| ControlCommand::LedSettingsSet(patch, reply))
+    }
+
+    pub fn led_status(&self) -> Result<LedStatusReport> {
+        self.request_value(ControlCommand::LedStatus)
+    }
+
+    pub fn led_reprobe(&self) -> Result<LedReprobeReply> {
+        self.request_value(ControlCommand::LedReprobe)
+    }
+
     pub fn permissions_list(&self) -> Result<BTreeMap<String, Grant>> {
         self.request_value(ControlCommand::PermissionsList)
     }
@@ -934,6 +962,14 @@ impl SupervisorHandle {
             .recv_timeout(COMMAND_TIMEOUT)
             .map_err(|_| anyhow!("supervisor command timed out"))?
     }
+}
+
+/// `led.reprobe` answer: the outcome plus the status after it.
+#[derive(Debug, Clone, Serialize)]
+pub struct LedReprobeReply {
+    #[serde(flatten)]
+    pub outcome: ReprobeOutcome,
+    pub status: LedStatusReport,
 }
 
 pub struct SupervisorService {
@@ -1056,6 +1092,9 @@ struct SupervisorRuntime {
     /// F4: display power helper + latest verdict.
     display_power: OcclusionDetector,
     displays_asleep: bool,
+    /// OpenRGB L3: `kwe-led-worker` lifecycle, fed the active frame file,
+    /// the pause verdict, and a tee of every accepted audio frame.
+    led: LedManager,
 }
 
 impl SupervisorRuntime {
@@ -1092,6 +1131,7 @@ impl SupervisorRuntime {
                 .unwrap_or_default(),
         );
         display_power.set_enabled(settings_store.pause_when_display_off());
+        let led = LedManager::new(config.led_worker.clone(), settings_store.led().clone());
         Self {
             config,
             store,
@@ -1113,6 +1153,7 @@ impl SupervisorRuntime {
             desktop_covered: false,
             display_power,
             displays_asleep: false,
+            led,
         }
     }
 
@@ -1213,6 +1254,23 @@ impl SupervisorRuntime {
                     self.sync_render_pause();
                     let _ = reply.send(Ok(self.status()));
                 }
+                Ok(ControlCommand::LedSettingsGet(reply)) => {
+                    let _ = reply.send(Ok(self.settings_store.led().clone()));
+                }
+                Ok(ControlCommand::LedSettingsSet(patch, reply)) => {
+                    let result = self.set_led_settings(&patch);
+                    let _ = reply.send(result);
+                }
+                Ok(ControlCommand::LedStatus(reply)) => {
+                    let _ = reply.send(Ok(self.led.status()));
+                }
+                Ok(ControlCommand::LedReprobe(reply)) => {
+                    let outcome = self.led.reprobe();
+                    let _ = reply.send(Ok(LedReprobeReply {
+                        outcome,
+                        status: self.led.status(),
+                    }));
+                }
                 Ok(ControlCommand::QuarantinedIds(reply)) => {
                     let ids = self
                         .persisted
@@ -1224,9 +1282,13 @@ impl SupervisorRuntime {
                     let _ = reply.send(ids);
                 }
                 Ok(ControlCommand::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    // LED first and asynchronously: its restore runs while
+                    // the renderers stop, then its grace is waited out.
+                    self.led.begin_shutdown();
                     self.stop_all(false);
                     self.occlusion.shutdown();
                     self.display_power.shutdown();
+                    self.led.finish_shutdown();
                     return;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -1255,6 +1317,38 @@ impl SupervisorRuntime {
             eprintln!("event=settings.audio_respawn_deferred detail={error}");
         }
         Ok(self.settings_store.audio_output())
+    }
+
+    /// OpenRGB L3: persist first (the record only changes once the write
+    /// succeeded), then apply live.
+    fn set_led_settings(&mut self, patch: &LedPatch) -> Result<LedSettings> {
+        let next = self.settings_store.led().patched(patch)?;
+        if self.settings_store.set_led(next.clone())? {
+            eprintln!(
+                "event=led.settings enabled={} mode={} brightness={} rate_hz={} disabled_devices={}",
+                next.enabled,
+                next.mode.as_str(),
+                next.brightness,
+                next.rate_hz,
+                next.disabled_devices.len()
+            );
+            self.led.set_settings(next.clone());
+        }
+        Ok(next)
+    }
+
+    /// OpenRGB L3: level-triggered sync of the LED worker with the
+    /// supervisor's own state — the active renderer's frame file (`None`
+    /// when nothing is promoted) and the F3/F4 pause verdict — then one
+    /// non-blocking lifecycle tick. Runs at the end of every supervisor
+    /// tick, so apply, playlist advance, restart, rollback, stop, and every
+    /// pause transition reach the worker without hooks in those paths.
+    fn sync_led(&mut self) {
+        let frame = self.active.as_ref().map(|worker| worker.frame_path.clone());
+        self.led.set_frame(frame.as_deref());
+        let paused = self.effective_render_pause();
+        self.led.set_paused(paused);
+        self.led.tick();
     }
 
     /// F3 policy switch: persists, starts/stops the detector, and applies
@@ -1705,6 +1799,13 @@ impl SupervisorRuntime {
         if generation == 0 || generation != self.display_generation {
             bail!("audio frame display generation is stale or invalid");
         }
+        let bytes = encode_audio_frame(&frame)?;
+        // OpenRGB L3: tee the exact renderer line to the LED worker. Never
+        // blocks (nonblocking pipe, one pending line, latest wins), and is
+        // independent of the wallpaper's audio grant: the grant protects
+        // the system audio from untrusted wallpaper content; the LED worker
+        // is daemon-owned code the user enabled.
+        self.led.offer_audio(&bytes);
         let worker = self
             .active
             .as_mut()
@@ -1718,7 +1819,6 @@ impl SupervisorRuntime {
             log_audio_grant_drop();
             return Ok(self.status());
         }
-        let bytes = encode_audio_frame(&frame)?;
         queue_control_message(
             &worker.input,
             bytes,
@@ -1786,6 +1886,11 @@ impl SupervisorRuntime {
     }
 
     fn tick(&mut self) {
+        self.tick_renderers();
+        self.sync_led();
+    }
+
+    fn tick_renderers(&mut self) {
         self.service_active_input();
         // F3: reap/restart the detector; losing it drops any covered verdict
         // so the wallpaper resumes rather than staying frozen.
@@ -2383,12 +2488,12 @@ fn inspect_worker(
     None
 }
 
-enum PipeWrite {
+pub(crate) enum PipeWrite {
     Written,
     WouldBlock,
 }
 
-fn try_write_input(input: &ChildStdin, bytes: &[u8]) -> io::Result<PipeWrite> {
+pub(crate) fn try_write_input(input: &ChildStdin, bytes: &[u8]) -> io::Result<PipeWrite> {
     if bytes.is_empty() || bytes.len() > MAX_INPUT_MESSAGE_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -3140,6 +3245,7 @@ mod tests {
             shader_helper_path: None,
             occlusion_worker: None,
             display_power_worker: None,
+            led_worker: None,
         }
         .validate()
         .unwrap()
@@ -4429,5 +4535,225 @@ mod tests {
         // A missing renderer is part of the identity too.
         fs::remove_file(&script).unwrap();
         assert!(build_identity(&config).contains("test=missing"));
+    }
+
+    /// OpenRGB L3: a supervisor whose LED worker is the recording fake.
+    fn led_runtime(
+        root: &Path,
+        renderer_body: &str,
+        led_body: &str,
+    ) -> (SupervisorRuntime, PathBuf) {
+        let renderer = script_renderer(root, "renderer", renderer_body);
+        let led_worker = crate::led::tests::fake_worker(root, led_body);
+        let mut config = validated_config(root);
+        config.renderer_paths = BTreeMap::from([(RendererKind::Test, renderer)]);
+        config.led_worker = Some(LedWorkerConfig {
+            worker_path: led_worker.clone(),
+            port: None,
+        });
+        let config = config.validate().unwrap();
+        let (store, state) = StateStore::open(root.join("state")).unwrap();
+        let runtime = SupervisorRuntime::new(
+            config,
+            store,
+            state,
+            GrantStore::open(&root.join("state")).unwrap(),
+            SettingsStore::open(&root.join("state")).unwrap(),
+        );
+        (runtime, led_worker)
+    }
+
+    fn promote_test_renderer(runtime: &mut SupervisorRuntime) -> PathBuf {
+        let candidate = runtime.spawn_worker(test_spec()).unwrap();
+        let home = candidate.home_path.clone();
+        runtime.candidate = Some(candidate);
+        runtime.promote_candidate(FrameSnapshot {
+            spec: FrameSpec::new(160, 90).unwrap(),
+            sequence: 1,
+            producer_state: kwe_frame_protocol::ProducerState::Running,
+            pixels: vec![0; 160 * 90 * 4],
+        });
+        assert!(runtime.active.is_some());
+        home
+    }
+
+    fn led_stdin(worker: &Path, count: usize) -> Vec<kwe_led_protocol::Control> {
+        let path = PathBuf::from(format!("{}.stdin", worker.display()));
+        for _ in 0..1000 {
+            if let Ok(text) = fs::read_to_string(&path) {
+                let lines: Vec<_> = text
+                    .lines()
+                    .map(|line| kwe_led_protocol::decode_control(line.as_bytes()).unwrap())
+                    .collect();
+                if lines.len() >= count {
+                    return lines;
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("LED fake never mirrored {count} line(s)");
+    }
+
+    /// OpenRGB L3: the supervisor's own state reaches the LED worker —
+    /// `led_frame` follows the ACTIVE renderer's frame file (null when none
+    /// is promoted), the F3/F4 pause verdict becomes mode `off`, resume
+    /// restores the configured mode, and `led.*` settings apply live.
+    #[test]
+    fn led_worker_follows_the_active_frame_and_the_pause_verdict() {
+        use kwe_led_protocol::{ConfigPatch, Control, Mode};
+        let root = temporary_directory("led-sync");
+        let (mut runtime, led_worker) = led_runtime(
+            &root,
+            "exec cat > \"$HOME/stdin.txt\"",
+            crate::led::tests::RECORDING_BODY,
+        );
+        for _ in 0..50 {
+            runtime.sync_led();
+            if runtime.led.running_pid().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let led_pid = runtime.led.running_pid().expect("enabled by default");
+        assert_eq!(led_stdin(&led_worker, 1)[0], Control::Frame(None));
+
+        let _home = promote_test_renderer(&mut runtime);
+        let frame = runtime.active.as_ref().unwrap().frame_path.clone();
+        runtime.sync_led();
+        assert_eq!(led_stdin(&led_worker, 2)[1], Control::Frame(Some(frame)));
+
+        // Covered with the policy on → off; uncovered → configured mode.
+        runtime.set_pause_when_covered(true).unwrap();
+        let _ = runtime.occlusion_report_for_test(true);
+        runtime.sync_led();
+        let off = Control::Config(ConfigPatch {
+            mode: Some(Mode::Off),
+            ..ConfigPatch::default()
+        });
+        assert_eq!(led_stdin(&led_worker, 3)[2], off);
+        let _ = runtime.occlusion_report_for_test(false);
+        runtime.sync_led();
+        assert_eq!(
+            led_stdin(&led_worker, 4)[3],
+            Control::Config(ConfigPatch {
+                mode: Some(Mode::Ambient),
+                ..ConfigPatch::default()
+            })
+        );
+        // Displays asleep (F4) pauses too.
+        runtime.set_pause_when_display_off(true).unwrap();
+        let _ = runtime.display_power_report_for_test(true);
+        runtime.sync_led();
+        assert_eq!(led_stdin(&led_worker, 5)[4], off);
+        let _ = runtime.display_power_report_for_test(false);
+
+        // settings.set led.* is live: one led_config, persisted.
+        runtime.sync_led();
+        let settings = runtime
+            .set_led_settings(&LedPatch {
+                rate_hz: Some(5),
+                ..LedPatch::default()
+            })
+            .unwrap();
+        assert_eq!(settings.rate_hz, 5);
+        let lines = led_stdin(&led_worker, 7);
+        assert_eq!(
+            lines[6],
+            Control::Config(ConfigPatch {
+                rate_hz: Some(5),
+                ..ConfigPatch::default()
+            })
+        );
+        assert_eq!(runtime.settings_store.led().rate_hz, 5);
+
+        // Stop → no renderer live → led_frame null; same LED process.
+        runtime.stop_selected().unwrap();
+        runtime.sync_led();
+        assert_eq!(led_stdin(&led_worker, 8)[7], Control::Frame(None));
+        assert_eq!(runtime.led.running_pid(), Some(led_pid));
+
+        // Disabling stops the worker (and shutdown would wait for it).
+        runtime
+            .set_led_settings(&LedPatch {
+                enabled: Some(false),
+                ..LedPatch::default()
+            })
+            .unwrap();
+        assert_eq!(runtime.led.running_pid(), None);
+        runtime.led.finish_shutdown();
+        // SAFETY: signal 0 only probes existence.
+        assert_ne!(unsafe { libc::kill(led_pid as i32, 0) }, 0);
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// OpenRGB L3: an LED worker that never reads its stdin must not delay
+    /// audio to the renderer — every frame still reaches the renderer pipe
+    /// path and the forwarding loop stays fast.
+    #[test]
+    fn a_stalled_led_worker_never_delays_audio_to_the_renderer() {
+        let root = temporary_directory("led-stall");
+        let (mut runtime, _led_worker) = led_runtime(
+            &root,
+            "exec cat > \"$HOME/stdin.txt\"",
+            "exec /bin/sleep 60",
+        );
+        for _ in 0..50 {
+            runtime.sync_led();
+            if runtime.led.running_pid().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(runtime.led.running_pid().is_some());
+        let home = promote_test_renderer(&mut runtime);
+        runtime
+            .grant_store
+            .set(
+                "431960-123",
+                GrantPatch {
+                    audio: Some(true),
+                    ..GrantPatch::default()
+                },
+            )
+            .unwrap();
+        let generation = runtime.display_generation;
+        let frame = AudioFrame::new(generation, vec![0.25; 64], vec![0.75; 64]).unwrap();
+        let started = Instant::now();
+        for i in 0..3000 {
+            runtime
+                .forward_audio_frame(generation, frame.clone())
+                .unwrap();
+            if i % 50 == 0 {
+                runtime.service_active_input();
+                runtime.sync_led();
+            }
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "forwarding took {elapsed:?}"
+        );
+        let tee = runtime.led.status().tee;
+        assert!(tee.audio_coalesced > 2000, "LED pipe must be full: {tee:?}");
+        // The renderer kept receiving the exact audio line.
+        let expected = String::from_utf8(encode_audio_frame(&frame).unwrap()).unwrap();
+        let path = home.join("stdin.txt");
+        let mut delivered = 0;
+        for _ in 0..200 {
+            runtime.service_active_input();
+            delivered = fs::read_to_string(&path)
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| format!("{line}\n") == expected)
+                .count();
+            if delivered >= 100 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(delivered >= 100, "renderer got {delivered} audio lines");
+        runtime.stop_all(false);
+        runtime.led.finish_shutdown();
+        fs::remove_dir_all(root).ok();
     }
 }

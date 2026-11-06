@@ -294,6 +294,8 @@ dependencies = [
  "kwe-core",
  "kwe-frame-protocol",
  "kwe-input-protocol",
+ "kwe-led-protocol",
+ "kwe-openrgb",
  "kwe-report-protocol",
  "libc",
  "serde",
