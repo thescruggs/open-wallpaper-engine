@@ -5592,4 +5592,58 @@ args = parser.parse_args()
         assert!(refresh());
         let _ = std::fs::remove_dir_all(&root);
     }
+    #[test]
+    fn manifest_rescan_surfaces_update_available() {
+        // W5: Steam records a newer published version next to the installed
+        // one; the next catalog refresh carries it to the manager.
+        let root = temp_dir("catalog-update");
+        std::fs::create_dir_all(root.join("steamapps/workshop/content/431960/100")).unwrap();
+        std::fs::write(
+            root.join("steamapps/workshop/content/431960/100/project.json"),
+            br#"{"title":"Synthetic 100","type":"scene","tags":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("steamapps/libraryfolders.vdf"),
+            "\"LibraryFolders\" { }\n",
+        )
+        .unwrap();
+        let manifest = root.join("steamapps/workshop/appworkshop_431960.acf");
+        let write_manifest = |latest: &str| {
+            std::fs::write(
+                &manifest,
+                format!(
+                    "\"AppWorkshop\" {{ \"WorkshopItemsInstalled\" {{ \"100\" {{ \"manifest\" \"7\" }} }} \
+                     \"WorkshopItemDetails\" {{ \"100\" {{ \"manifest\" \"7\" \"subscribedby\" \"42\" \
+                     \"latest_manifest\" \"{latest}\" }} }} }}\n"
+                ),
+            )
+            .unwrap();
+        };
+        write_manifest("7");
+        let roots = vec![root.clone()];
+        let catalog = Arc::new(RwLock::new(scan_installed(&roots, &ScanLimits::default())));
+        let cache = Arc::new(std::sync::Mutex::new(WorkshopCache::open(
+            &root.join("state"),
+        )));
+        let stale = Arc::new(AtomicBool::new(false));
+        let freshness = CatalogFreshness::new(Duration::from_millis(50), stale);
+        freshness.record(&catalog_library_paths(&catalog));
+        let wire = |c: &Arc<RwLock<Catalog>>| serde_json::to_value(&*c.read().unwrap()).unwrap();
+        assert_eq!(wire(&catalog)["stats"]["update_available"], 0);
+        assert_eq!(
+            wire(&catalog)["items"][0]["workshop_update_available"],
+            false
+        );
+
+        // A longer id also changes the size, so a coarse mtime cannot hide it.
+        write_manifest("80");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(refresh_catalog_if_stale(&catalog, &roots, &cache, None, &freshness).unwrap());
+        let value = wire(&catalog);
+        assert_eq!(value["stats"]["update_available"], 1);
+        assert_eq!(value["items"][0]["workshop_update_available"], true);
+        assert_eq!(value["items"][0]["workshop_state"], "subscribed_installed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

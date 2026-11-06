@@ -132,3 +132,32 @@ deadline. One operation per family (`auth`, `query`, `details`,
 - `catalog` rescans on its own when a Workshop manifest
   (`appworkshop_431960.acf`, either location) changed its modification
   time or size since the last scan, at most once every 2 s.
+
+## 3. Subscription fields in the `catalog` result
+
+The local catalog (`catalog` RPC, `kwe_core::Catalog`) carries what Steam's
+manifest says about each subscription. Added in W5 (2026-11-05), additive:
+older readers ignore the fields, and a catalog without them reads as
+`false` / `0`.
+
+| field | where | meaning |
+|---|---|---|
+| `workshop_state` | item | unchanged: `local`, `subscribed_installed`, `subscribed_missing`, `downloading` |
+| `workshop_update_available` | item | `bool`. Steam has a newer published version than the files on disk. Only ever `true` for `subscribed_installed`. Display state only: apply and playlists still go by `workshop_state`. |
+| `update_available` | `stats` | count of items with `workshop_update_available` |
+
+Derivation (`kwe-core/src/scan.rs::update_available`), from the item's
+`WorkshopItemDetails` entry in `appworkshop_431960.acf`:
+
+1. `latest_manifest` against the installed `manifest` — the
+   `WorkshopItemsInstalled` entry when it has one, else the details entry.
+   Different ids mean an update.
+2. Only when no manifest pair exists: `latest_timeupdated` greater than
+   the installed `timeupdated`.
+3. Anything missing, empty, `0` or unparsable means "up to date". The
+   manifest-level `NeedsUpdate` flag is not used: it is per app, not per
+   item.
+
+Steam downloads the update by itself; the manager only shows it (text
+and icon). The flag clears on the next manifest-triggered rescan after
+Steam rewrites the manifest.

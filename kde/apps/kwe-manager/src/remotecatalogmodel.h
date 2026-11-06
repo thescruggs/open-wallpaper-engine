@@ -34,6 +34,10 @@ class RemoteCatalogModel : public QAbstractListModel {
   Q_PROPERTY(bool hasMore READ hasMore NOTIFY hasMoreChanged)
   Q_PROPERTY(bool loadingMore READ loadingMore NOTIFY loadingMoreChanged)
   Q_PROPERTY(int count READ rowCount NOTIFY countChanged)
+  // Ids with a subscribe/unsubscribe request in flight or awaiting the local
+  // catalog, whether or not they are a Browse row: the details pane of the
+  // Subscribed view follows its own unsubscribe through this list (W5).
+  Q_PROPERTY(QStringList pendingIds READ pendingIds NOTIFY pendingIdsChanged)
 
 public:
   enum State { Idle, Loading, Ready, Empty, Offline, SignedOut, RateLimited, Failed };
@@ -76,6 +80,7 @@ public:
   QStringList tags() const { return m_tags; }
   bool hasMore() const { return m_hasMore; }
   bool loadingMore() const { return m_loadingMore; }
+  QStringList pendingIds() const;
   void setSearchText(const QString &text);
   void setSort(const QString &sort);
   void setTags(const QStringList &tags);
@@ -102,6 +107,7 @@ signals:
   void hasMoreChanged();
   void loadingMoreChanged();
   void countChanged();
+  void pendingIdsChanged();
   void detailsReady(const QString &workshopId, const QString &description);
   void detailsFailed(const QString &workshopId, const QString &message);
 

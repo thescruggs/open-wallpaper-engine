@@ -126,6 +126,12 @@ Unsubscribe affordance on subscribed items, "update available"
 surfacing from `NeedsUpdate` manifest fields, and a subscribed-count
 badge on the tab.
 
+> 2026-11-05: implemented on `workshop-w5`, uncommitted, awaiting review.
+> Details and the choices made are in `WORKSHOP_BROWSER_EXECUTION.md`
+> ("W5 status"). Correction: the per-item signal is `latest_manifest` /
+> `latest_timeupdated` in `WorkshopItemDetails`; `NeedsUpdate` is one
+> app-wide flag and is not used.
+
 ## Order and rough effort
 
 W0 (half a day, standalone — worth doing before everything else) →

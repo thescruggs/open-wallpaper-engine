@@ -367,6 +367,7 @@ fn synthesized_item(id: &str, entry: &CachedItem) -> CatalogItem {
         requested_permissions: Vec::new(),
         workshop_state: "subscribed_missing".into(),
         workshop_progress: entry.workshop_progress,
+        workshop_update_available: false,
         diagnostics: Vec::new(),
     };
     item.diagnostics.push(Diagnostic {
@@ -441,6 +442,7 @@ mod tests {
             requested_permissions: Vec::new(),
             workshop_state: "subscribed_missing".into(),
             workshop_progress: None,
+            workshop_update_available: false,
             diagnostics: Vec::new(),
         }
     }
@@ -523,6 +525,7 @@ mod tests {
             requested_permissions: Vec::new(),
             workshop_state: "subscribed_installed".into(),
             workshop_progress: None,
+            workshop_update_available: false,
             diagnostics: Vec::new(),
         });
         cache.merge_and_update(&mut catalog, now_ms());
@@ -553,6 +556,7 @@ mod tests {
             requested_permissions: Vec::new(),
             workshop_state: "local".into(),
             workshop_progress: None,
+            workshop_update_available: false,
             diagnostics: Vec::new(),
         });
         cache.merge_and_update(&mut catalog, now_ms());

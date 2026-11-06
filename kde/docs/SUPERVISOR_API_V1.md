@@ -869,6 +869,9 @@ SIGKILL of the group, 4 MiB response cap).
   `rescan` before answering.
 - `kwe-daemon --workshop-worker PATH` overrides the worker binary (default:
   `kwe-workshop-worker` beside the daemon).
+- `catalog` items carry `workshop_update_available` and `stats` carries
+  `update_available` (W5, additive; derivation in
+  `docs/WORKSHOP_PROTOCOL_V1.md` section 3).
 
 ## Current limits
 

@@ -98,7 +98,16 @@ Kirigami.ApplicationWindow {
             },
             Kirigami.Action {
                 icon.name: "folder-download-symbolic"
-                text: qsTr("Workshop")
+                // W5: the subscribed count rides in the label (the same
+                // number as the Subscribed view's heading), so it is read
+                // out with the tab and needs no newer-Kirigami badge type.
+                text: catalogStats.subscribedCount > 0
+                    ? qsTr("Workshop (%1)").arg(catalogStats.subscribedCount)
+                    : qsTr("Workshop")
+                tooltip: catalogStats.updateAvailableCount > 0
+                    ? qsTr("%1 subscribed, %2 with an update available")
+                        .arg(catalogStats.subscribedCount).arg(catalogStats.updateAvailableCount)
+                    : qsTr("%1 subscribed").arg(catalogStats.subscribedCount)
                 checked: workshopPage.visible
                 onTriggered: {
                     if (!workshopPage.visible) {

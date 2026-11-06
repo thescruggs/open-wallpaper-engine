@@ -25,6 +25,30 @@ Kirigami.ScrollablePage {
     // hand right after seeing a problem; nothing here is uploaded anywhere.
     property bool issueReportOpen: false
 
+    // W5: the selected item's live Workshop state, re-read whenever the
+    // catalog changes (every catalogStats property notifies on that), so the
+    // pane follows Steam's downloads, updates and removals.
+    readonly property var selectedEntry: catalogStats.totalCount >= 0
+        ? catalogStats.itemById(WallpaperSelection.selectedId) : ({})
+    readonly property bool selectedSubscribed: selectedEntry.workshopState === "subscribed_installed"
+        || selectedEntry.workshopState === "subscribed_missing"
+        || selectedEntry.workshopState === "downloading"
+    readonly property bool selectedUpdateAvailable: selectedEntry.updateAvailable === true
+    readonly property bool workshopSignedIn: workshopClient.authState === WorkshopClient.SignedIn
+    readonly property bool unsubscribePending: remoteCatalog.pendingIds.indexOf(WallpaperSelection.selectedId) >= 0
+    // The item this pane last asked Steam to drop; scopes the outcome
+    // messages so a Browse-view notice never shows up here.
+    property string unsubscribeRequestedFor: ""
+    property bool unsubscribeConfirmOpen: false
+
+    // The Subscribed view comes first, before the Browse view ever asked:
+    // learn the sign-in state (local only, no network) once a subscription
+    // is selected, so Unsubscribe can be offered.
+    onSelectedSubscribedChanged: {
+        if (selectedSubscribed && workshopClient.authState === WorkshopClient.Unknown)
+            workshopClient.refreshAuthStatus();
+    }
+
     function openIssueReport() {
         issueReportNoteField.text = "";
         detailPage.issueReportOpen = true;
@@ -178,6 +202,15 @@ Kirigami.ScrollablePage {
             text: qsTr("Workshop %1 · %2").arg(WallpaperSelection.selectedId).arg(WallpaperSelection.selectedKind)
             opacity: 0.75
             wrapMode: Text.Wrap
+        }
+        // W5: Steam's manifest lists a newer version than the files on disk.
+        // Steam fetches it by itself; the wallpaper keeps working meanwhile.
+        Kirigami.InlineMessage {
+            Layout.fillWidth: true
+            visible: WallpaperSelection.selectedId !== "" && detailPage.selectedUpdateAvailable
+            type: Kirigami.MessageType.Information
+            icon.name: "update-low-symbolic"
+            text: qsTr("Update available. Steam downloads the newer version on its own while the Steam client runs; this wallpaper keeps working until then.")
         }
         // BETA_M2c: the daemon owns each wallpaper's grant record
         // (permissions-v1.json); the toggles below read and write it through
@@ -530,6 +563,37 @@ Kirigami.ScrollablePage {
             onClicked: workshopClient.openItem(WallpaperSelection.selectedId)
             Accessible.description: qsTr("Open the canonical Workshop item in the Steam client")
         }
+        // W5: unsubscribe a subscribed item from where it is shown. Same
+        // workshop.unsubscribe call and pending tracking as the Browse view.
+        Controls.Button {
+            Layout.fillWidth: true
+            visible: WallpaperSelection.selectedId !== "" && detailPage.selectedSubscribed
+                && detailPage.workshopSignedIn
+            enabled: !detailPage.unsubscribePending
+            text: detailPage.unsubscribePending ? qsTr("Unsubscribing…") : qsTr("Unsubscribe")
+            icon.name: "list-remove-symbolic"
+            Accessible.description: qsTr("Unsubscribe from this Workshop item; Steam then removes its files")
+            onClicked: detailPage.unsubscribeConfirmOpen = true
+        }
+        Controls.Label {
+            Layout.fillWidth: true
+            visible: WallpaperSelection.selectedId !== "" && detailPage.selectedSubscribed
+                && !detailPage.workshopSignedIn
+            text: qsTr("To unsubscribe here, sign in to Steam in the Workshop Browse view, or unsubscribe in the Steam client.")
+            wrapMode: Text.Wrap
+            opacity: 0.75
+        }
+        Kirigami.InlineMessage {
+            Layout.fillWidth: true
+            visible: detailPage.unsubscribeRequestedFor !== ""
+                && detailPage.unsubscribeRequestedFor === WallpaperSelection.selectedId
+                && !detailPage.unsubscribePending
+                && (remoteCatalog.notice !== "" || detailPage.selectedEntry.found !== true)
+            type: remoteCatalog.notice !== "" ? Kirigami.MessageType.Warning : Kirigami.MessageType.Positive
+            text: remoteCatalog.notice !== ""
+                ? remoteCatalog.notice
+                : qsTr("Unsubscribed. Steam removed this wallpaper from your library.")
+        }
         Kirigami.InlineMessage {
             Layout.fillWidth: true
             visible: workshopClient.errorMessage !== ""
@@ -601,6 +665,44 @@ Kirigami.ScrollablePage {
             issueReporter.record(WallpaperSelection.selectedId, WallpaperSelection.selectedTitle,
                 WallpaperSelection.selectedKind, issueReportNoteField.text);
             detailPage.issueReportOpen = false;
+        }
+    }
+
+    // W5: unsubscribing makes Steam delete the wallpaper's files, so it is
+    // confirmed first. Cancel (or Escape) leaves everything untouched.
+    Controls.Dialog {
+        id: unsubscribeDialog
+        modal: true
+        title: qsTr("Unsubscribe from Workshop item")
+        visible: detailPage.unsubscribeConfirmOpen
+        standardButtons: Controls.Dialog.NoButton
+        width: Math.min(parent ? parent.width * 0.8 : 420, 420)
+        onRejected: detailPage.unsubscribeConfirmOpen = false
+
+        contentItem: Controls.Label {
+            text: qsTr("Unsubscribe from %1? Steam removes its files from this computer; playlists that contain it skip it until you subscribe again.")
+                .arg(WallpaperSelection.selectedTitle)
+            wrapMode: Text.Wrap
+        }
+
+        footer: Controls.DialogButtonBox {
+            Controls.Button {
+                text: qsTr("Cancel")
+                Controls.DialogButtonBox.buttonRole: Controls.DialogButtonBox.RejectRole
+            }
+            Controls.Button {
+                text: qsTr("Unsubscribe")
+                icon.name: "list-remove-symbolic"
+                Controls.DialogButtonBox.buttonRole: Controls.DialogButtonBox.AcceptRole
+            }
+            onAccepted: unsubscribeDialog.accept()
+            onRejected: unsubscribeDialog.reject()
+        }
+
+        onAccepted: {
+            detailPage.unsubscribeConfirmOpen = false;
+            detailPage.unsubscribeRequestedFor = WallpaperSelection.selectedId;
+            remoteCatalog.unsubscribe(WallpaperSelection.selectedId);
         }
     }
 }

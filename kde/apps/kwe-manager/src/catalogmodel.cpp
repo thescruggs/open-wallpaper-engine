@@ -44,6 +44,7 @@ QVariant CatalogModel::data(const QModelIndex &index, int role) const {
     case EntryUrlRole: return item.entryUrl;
     case DiagnosticSummaryRole: return item.diagnosticSummary;
     case RequestedPermissionsRole: return item.requestedPermissions;
+    case WorkshopUpdateAvailableRole: return item.updateAvailable;
     default: return {};
     }
 }
@@ -65,6 +66,7 @@ QHash<int, QByteArray> CatalogModel::roleNames() const {
         {EntryUrlRole, "entryUrl"},
         {DiagnosticSummaryRole, "diagnosticSummary"},
         {RequestedPermissionsRole, "requestedPermissions"},
+        {WorkshopUpdateAvailableRole, "workshopUpdateAvailable"},
     };
 }
 
@@ -85,6 +87,7 @@ void CatalogModel::replaceFromCatalog(const QJsonObject &catalog) {
     int subscribed = 0;
     int missing = 0;
     int downloading = 0;
+    int updates = 0;
     const auto values = catalog.value(QStringLiteral("items")).toArray();
     replacement.reserve(values.size());
     for (const auto &value : values) {
@@ -97,6 +100,11 @@ void CatalogModel::replaceFromCatalog(const QJsonObject &catalog) {
         item.detail = object.value(QStringLiteral("compatibility_detail")).toString();
         item.workshopState = object.value(QStringLiteral("workshop_state")).toString();
         item.workshopProgress = object.value(QStringLiteral("workshop_progress")).toInt(-1);
+        // Absent before W5 (older daemon): reads as false. Only an installed
+        // subscription can carry it; the daemon guarantees that, the model
+        // re-checks so a confused payload never shows it on other states.
+        item.updateAvailable = item.workshopState == QStringLiteral("subscribed_installed")
+            && object.value(QStringLiteral("workshop_update_available")).toBool(false);
         item.contentRoot = object.value(QStringLiteral("content_root")).toString();
         const auto entry = object.value(QStringLiteral("entry_file")).toString();
         if (!entry.isEmpty()) item.entryUrl = QUrl::fromLocalFile(entry);
@@ -122,6 +130,7 @@ void CatalogModel::replaceFromCatalog(const QJsonObject &catalog) {
         if (item.workshopState == QStringLiteral("subscribed_installed")) ++subscribed;
         if (item.workshopState == QStringLiteral("subscribed_missing")) ++missing;
         if (item.workshopState == QStringLiteral("downloading")) ++downloading;
+        if (item.updateAvailable) ++updates;
         replacement.push_back(std::move(item));
     }
     beginResetModel();
@@ -136,6 +145,7 @@ void CatalogModel::replaceFromCatalog(const QJsonObject &catalog) {
     m_subscribedCount = subscribed;
     m_missingCount = missing;
     m_downloadingCount = downloading;
+    m_updateAvailableCount = updates;
     endResetModel();
     emit statsChanged();
 }
@@ -170,6 +180,8 @@ QVariantMap CatalogModel::itemById(const QString &workshopId) const {
                 {QStringLiteral("title"), item.title},
                 {QStringLiteral("kind"), item.kind},
                 {QStringLiteral("previewUrl"), item.previewUrl},
+                {QStringLiteral("workshopState"), item.workshopState},
+                {QStringLiteral("updateAvailable"), item.updateAvailable},
             };
         }
     }
@@ -178,6 +190,8 @@ QVariantMap CatalogModel::itemById(const QString &workshopId) const {
         {QStringLiteral("title"), workshopId},
         {QStringLiteral("kind"), QString()},
         {QStringLiteral("previewUrl"), QUrl()},
+        {QStringLiteral("workshopState"), QString()},
+        {QStringLiteral("updateAvailable"), false},
     };
 }
 

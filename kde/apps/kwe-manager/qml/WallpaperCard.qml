@@ -23,6 +23,8 @@ Item {
     required property int diagnosticCount
     required property string workshopState
     required property int workshopProgress
+    // W5: Steam lists a newer version than the installed one (display only).
+    required property bool workshopUpdateAvailable
     required property bool favorite
     required property var tags
     required property url entryUrl
@@ -50,7 +52,9 @@ Item {
         hoverEnabled: true
         activeFocusOnTab: true
         // Qt 6.11: multi-argument String.arg() throws; chain single-arg calls.
-        Accessible.name: qsTr("%1, %2 wallpaper, %3")
+        Accessible.name: (cardRoot.workshopUpdateAvailable
+                ? qsTr("%1, %2 wallpaper, %3, update available")
+                : qsTr("%1, %2 wallpaper, %3"))
             .arg(cardRoot.title).arg(cardRoot.kind)
             .arg(WallpaperSelection.compatibilityLabel(cardRoot.compatibility))
         Accessible.description: !cardRoot.selectionMode ? ""
@@ -179,8 +183,22 @@ Item {
                 }
                 Controls.Label {
                     visible: cardRoot.workshopView && cardRoot.workshopState === "subscribed_installed"
+                        && !cardRoot.workshopUpdateAvailable
                     text: qsTr("Installed")
                     color: Kirigami.Theme.positiveTextColor
+                }
+                // Icon and text, never colour alone (UX_DESIGN.md).
+                Kirigami.Icon {
+                    visible: cardRoot.workshopUpdateAvailable
+                    implicitWidth: Kirigami.Units.iconSizes.small
+                    implicitHeight: Kirigami.Units.iconSizes.small
+                    source: "update-low-symbolic"
+                    Accessible.ignored: true
+                }
+                Controls.Label {
+                    visible: cardRoot.workshopUpdateAvailable
+                    text: qsTr("Update available")
+                    color: Kirigami.Theme.neutralTextColor
                 }
             }
         }

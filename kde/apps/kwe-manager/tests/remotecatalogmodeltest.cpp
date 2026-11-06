@@ -234,6 +234,52 @@ private slots:
     QVERIFY(m_model->notice().contains("Steam client"));
   }
 
+  // W5: the Subscribed view's details pane unsubscribes items that are not
+  // Browse rows; pendingIds carries the state until the local catalog drops
+  // the item, and a failure clears it with a notice.
+  void unsubscribeWithoutBrowseRowTracksPendingIds() {
+    bool fail = false;
+    m_daemon.handler = [&fail](const QString &, const QJsonObject &) {
+      return fail ? Fake::errorAnswer("signed_out") : Fake::okAnswer({{"accepted", true}});
+    };
+    const QJsonObject installed{{"items", QJsonArray{QJsonObject{
+        {"workshop_id", "801"}, {"title", "Fake"}, {"workshop_state", "subscribed_installed"}}}}};
+    m_local->replaceFromCatalog(installed);
+    QSignalSpy pendingSpy(m_model.get(), &RemoteCatalogModel::pendingIdsChanged);
+    QCOMPARE(m_model->rowCount(), 0);
+
+    m_model->unsubscribe("801");
+    QCOMPARE(m_model->pendingIds(), QStringList{"801"});
+    QCOMPARE(pendingSpy.count(), 1);
+    QTRY_COMPARE(m_daemon.count("workshop.unsubscribe"), 1);
+    QCOMPARE(m_daemon.paramsLog.last().value("id").toString(), QStringLiteral("801"));
+    QTest::qWait(50);
+    // Steam accepted, but the item is still on disk: still pending, and a
+    // second click is ignored rather than sent twice.
+    QCOMPARE(m_model->pendingIds(), QStringList{"801"});
+    m_model->unsubscribe("801");
+    QTest::qWait(50);
+    QCOMPARE(m_daemon.count("workshop.unsubscribe"), 1);
+
+    // Steam removed it: the next catalog clears the pending state quietly.
+    m_local->replaceFromCatalog(QJsonObject{{"items", QJsonArray{}}});
+    QVERIFY(m_model->pendingIds().isEmpty());
+    QCOMPARE(pendingSpy.count(), 2);
+    QVERIFY(m_model->notice().isEmpty());
+
+    // Failure: cleared immediately, with the reason as the notice.
+    m_local->replaceFromCatalog(installed);
+    fail = true;
+    m_model->unsubscribe("801");
+    QTRY_VERIFY(m_model->pendingIds().isEmpty());
+    QCOMPARE(m_model->notice(), QStringLiteral("You are signed out of Steam. Sign in to continue."));
+
+    // Invalid ids never reach the daemon or the pending list.
+    m_model->unsubscribe("0");
+    m_model->unsubscribe("abc");
+    QVERIFY(m_model->pendingIds().isEmpty());
+  }
+
   void detailsEmitsDescription() {
     m_daemon.handler = [](const QString &, const QJsonObject &) {
       QJsonObject d = item("701");

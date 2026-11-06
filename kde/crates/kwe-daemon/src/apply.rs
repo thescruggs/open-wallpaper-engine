@@ -3254,6 +3254,7 @@ mod tests {
                 requested_permissions: Vec::new(),
                 workshop_state: "local".into(),
                 workshop_progress: None,
+                workshop_update_available: false,
                 diagnostics: Vec::new(),
             }
         }

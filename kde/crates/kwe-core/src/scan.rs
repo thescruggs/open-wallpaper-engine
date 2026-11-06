@@ -52,6 +52,10 @@ pub struct CatalogStats {
     pub subscribed: usize,
     pub missing: usize,
     pub downloading: usize,
+    /// Installed subscriptions Steam has a newer version of
+    /// (`workshop_update_available`). Absent in catalogs written before W5.
+    #[serde(default)]
+    pub update_available: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,7 +82,20 @@ pub struct CatalogItem {
     pub requested_permissions: Vec<String>,
     pub workshop_state: String,
     pub workshop_progress: Option<u8>,
+    /// Steam's manifest records a newer published version than the one on
+    /// disk (`latest_manifest` differs from the installed `manifest`). Only
+    /// ever true for `subscribed_installed` items; Steam itself downloads
+    /// the update, this is display state and never gates apply.
+    #[serde(default)]
+    pub workshop_update_available: bool,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+/// What one subscription's manifest entries say beyond "subscribed".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ManifestEntry {
+    progress: Option<u8>,
+    update_available: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,12 +232,13 @@ pub fn discover_libraries(steam_roots: &[PathBuf]) -> (Vec<SteamLibrary>, Vec<Di
 pub fn scan_installed(steam_roots: &[PathBuf], limits: &ScanLimits) -> Catalog {
     let (libraries, mut diagnostics) = discover_libraries(steam_roots);
     let mut subscribed_ids = BTreeSet::new();
-    let mut workshop_progress = std::collections::BTreeMap::new();
+    let mut workshop_entries: std::collections::BTreeMap<String, ManifestEntry> =
+        std::collections::BTreeMap::new();
     for library in &libraries {
         match read_workshop_subscriptions(&library.path) {
             Ok(items) => {
                 subscribed_ids.extend(items.keys().cloned());
-                workshop_progress.extend(items);
+                workshop_entries.extend(items);
             }
             Err(error) => diagnostics.push(diag(
                 "steam.workshop_manifest_invalid",
@@ -277,13 +295,19 @@ pub fn scan_installed(steam_roots: &[PathBuf], limits: &ScanLimits) -> Catalog {
     for item in &mut items {
         installed_ids.insert(item.workshop_id.clone());
         if subscribed_ids.contains(&item.workshop_id) {
-            item.workshop_progress = workshop_progress.get(&item.workshop_id).copied().flatten();
-            item.workshop_state = if item.workshop_progress.is_some_and(|value| value < 100) {
+            let entry = workshop_entries
+                .get(&item.workshop_id)
+                .copied()
+                .unwrap_or_default();
+            item.workshop_progress = entry.progress;
+            let downloading = item.workshop_progress.is_some_and(|value| value < 100);
+            item.workshop_state = if downloading {
                 "downloading"
             } else {
                 "subscribed_installed"
             }
             .into();
+            item.workshop_update_available = !downloading && entry.update_available;
         }
     }
     for workshop_id in subscribed_ids
@@ -305,7 +329,10 @@ pub fn scan_installed(steam_roots: &[PathBuf], limits: &ScanLimits) -> Catalog {
             tags: Vec::new(),
             requested_permissions: Vec::new(),
             workshop_state: "subscribed_missing".into(),
-            workshop_progress: workshop_progress.get(workshop_id).copied().flatten(),
+            workshop_progress: workshop_entries
+                .get(workshop_id)
+                .and_then(|entry| entry.progress),
+            workshop_update_available: false,
             diagnostics: Vec::new(),
         };
         item.diagnostics.push(diag(
@@ -357,6 +384,7 @@ fn scan_project(root: &Path, limits: &ScanLimits) -> CatalogItem {
         requested_permissions: Vec::new(),
         workshop_state: "local".into(),
         workshop_progress: None,
+        workshop_update_available: false,
         diagnostics: Vec::new(),
     };
     let metadata = match fs::symlink_metadata(&project_file) {
@@ -509,6 +537,7 @@ fn scan_project(root: &Path, limits: &ScanLimits) -> CatalogItem {
         requested_permissions,
         workshop_state: "local".into(),
         workshop_progress: None,
+        workshop_update_available: false,
         diagnostics: item_diagnostics,
     }
 }
@@ -591,7 +620,7 @@ fn collect_library_paths(root: &KvValue, output: &mut BTreeSet<PathBuf>) {
 
 fn read_workshop_subscriptions(
     root: &Path,
-) -> Result<std::collections::BTreeMap<String, Option<u8>>, String> {
+) -> Result<std::collections::BTreeMap<String, ManifestEntry>, String> {
     // Steam writes the record to `steamapps/workshop/`; the bare `steamapps/`
     // location is kept for layouts that still carry it there.
     let name = format!("appworkshop_{WALLPAPER_ENGINE_APP_ID}.acf");
@@ -632,10 +661,17 @@ fn read_workshop_subscriptions(
     if let Some(items) = section("workshopitems") {
         for (key, value) in items {
             if valid_id(key) {
-                ids.insert(key.clone(), workshop_progress(value));
+                ids.insert(
+                    key.clone(),
+                    ManifestEntry {
+                        progress: workshop_progress(value),
+                        update_available: false,
+                    },
+                );
             }
         }
     }
+    let installed = section("workshopitemsinstalled");
     // Borrowed-From: waywallen/open-wallpaper-engine@b8180ad:waywallen/plugins/
     // org.waywallen.open-wallpaper-engine/wallpaper_engine/workshop.lua
     // (GPL-2.0, idea only, no code copied: `subscribedby` in
@@ -651,18 +687,54 @@ fn read_workshop_subscriptions(
                     .is_some_and(|by| !by.is_empty() && by != "0")
             });
             if valid_id(key) && subscribed {
-                ids.entry(key.clone()).or_insert(None);
+                let installed_entry = installed.and_then(|items| items.get(key));
+                let entry = ids.entry(key.clone()).or_default();
+                entry.update_available = update_available(installed_entry, value);
             }
         }
-    } else if let Some(installed) = section("workshopitemsinstalled") {
+    } else if let Some(installed) = installed {
         // No details section to consult: everything Steam unpacked counts.
         for key in installed.keys() {
             if valid_id(key) {
-                ids.entry(key.clone()).or_insert(None);
+                ids.entry(key.clone()).or_default();
             }
         }
     }
     Ok(ids)
+}
+
+/// True when Steam's manifest says a newer published version exists than the
+/// one on disk. Steam writes `latest_manifest` / `latest_timeupdated` into an
+/// item's `WorkshopItemDetails` entry next to the installed `manifest` /
+/// `timeupdated`; the `WorkshopItemsInstalled` entry carries what is actually
+/// unpacked and wins over the details copy when both are present. Manifest
+/// ids are compared first (opaque strings); the update times only when no
+/// manifest pair is available. A missing, empty or `0` latest value never
+/// reports an update: unknown shapes fail closed to "up to date".
+fn update_available(installed: Option<&KvValue>, details: &KvValue) -> bool {
+    fn field<'a>(value: Option<&'a KvValue>, name: &str) -> Option<&'a str> {
+        value?
+            .object()?
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .and_then(|(_, value)| value.string())
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && *value != "0")
+    }
+    let details = Some(details);
+    let current = |name: &str| field(installed, name).or_else(|| field(details, name));
+    if let (Some(latest), Some(current)) = (field(details, "latest_manifest"), current("manifest"))
+    {
+        return latest != current;
+    }
+    let time = |value: Option<&str>| value.and_then(|value| value.parse::<u64>().ok());
+    match (
+        time(field(details, "latest_timeupdated")),
+        time(current("timeupdated")),
+    ) {
+        (Some(latest), Some(current)) => latest > current,
+        _ => false,
+    }
 }
 
 fn workshop_progress(value: &KvValue) -> Option<u8> {
@@ -746,6 +818,9 @@ impl CatalogStats {
                 stats.missing += 1;
             } else if item.workshop_state == "downloading" {
                 stats.downloading += 1;
+            }
+            if item.workshop_update_available {
+                stats.update_available += 1;
             }
         }
         stats
@@ -953,6 +1028,149 @@ mod tests {
         assert_eq!(state("200"), Some("subscribed_missing"));
         assert_eq!(state("300"), None);
         assert_eq!(state("not-an-id"), None);
+    }
+
+    /// Synthetic manifest in the shape Steam writes once an item has a newer
+    /// published version: `latest_manifest` / `latest_timeupdated` next to the
+    /// installed `manifest` / `timeupdated` in `WorkshopItemDetails`.
+    fn update_fixture(name: &str, installed: &str, details: &str) -> Catalog {
+        workshop_fixture(
+            name,
+            "steamapps/workshop/appworkshop_431960.acf",
+            &format!(
+                r#""AppWorkshop" {{ "NeedsUpdate" "1"
+                    "WorkshopItemsInstalled" {{ "100" {{ {installed} }} }}
+                    "WorkshopItemDetails" {{
+                        "100" {{ "subscribedby" "42" {details} }}
+                        "200" {{ "subscribedby" "42" "manifest" "8" "latest_manifest" "9" }}
+                    }} }}"#
+            ),
+        )
+    }
+
+    fn update_flag(catalog: &Catalog, id: &str) -> Option<bool> {
+        catalog
+            .items
+            .iter()
+            .find(|item| item.workshop_id == id)
+            .map(|item| item.workshop_update_available)
+    }
+
+    #[test]
+    fn newer_latest_manifest_marks_installed_item_updatable() {
+        let catalog = update_fixture(
+            "workshop-update-manifest",
+            r#""manifest" "7" "timeupdated" "10""#,
+            r#""manifest" "7" "timeupdated" "10" "latest_manifest" "8" "latest_timeupdated" "20""#,
+        );
+        assert_eq!(update_flag(&catalog, "100"), Some(true));
+        // The flag is display state only: the item stays playable.
+        assert!(
+            catalog
+                .items
+                .iter()
+                .any(|item| item.workshop_id == "100"
+                    && item.workshop_state == "subscribed_installed")
+        );
+        // A subscription without local files is "awaiting download", never
+        // "update available", whatever its manifest says.
+        assert_eq!(update_flag(&catalog, "200"), Some(false));
+        assert_eq!(catalog.stats.update_available, 1);
+        assert_eq!(catalog.stats.subscribed, 1);
+    }
+
+    #[test]
+    fn matching_latest_manifest_is_up_to_date() {
+        let catalog = update_fixture(
+            "workshop-update-current",
+            r#""manifest" "8" "timeupdated" "10""#,
+            r#""manifest" "8" "timeupdated" "10" "latest_manifest" "8" "latest_timeupdated" "99""#,
+        );
+        // Manifest ids agree, so a newer-looking time does not override them.
+        assert_eq!(update_flag(&catalog, "100"), Some(false));
+        assert_eq!(catalog.stats.update_available, 0);
+    }
+
+    #[test]
+    fn installed_manifest_wins_over_details_copy() {
+        // Steam already updated the details entry but the unpacked files are
+        // still the old version.
+        let catalog = update_fixture(
+            "workshop-update-installed-old",
+            r#""manifest" "7""#,
+            r#""manifest" "8" "latest_manifest" "8""#,
+        );
+        assert_eq!(update_flag(&catalog, "100"), Some(true));
+    }
+
+    #[test]
+    fn update_time_is_the_fallback_without_manifest_ids() {
+        let newer = update_fixture(
+            "workshop-update-time",
+            r#""timeupdated" "10""#,
+            r#""timeupdated" "10" "latest_timeupdated" "20""#,
+        );
+        assert_eq!(update_flag(&newer, "100"), Some(true));
+        let older = update_fixture(
+            "workshop-update-time-old",
+            r#""timeupdated" "30""#,
+            r#""timeupdated" "30" "latest_timeupdated" "20""#,
+        );
+        assert_eq!(update_flag(&older, "100"), Some(false));
+    }
+
+    #[test]
+    fn absent_or_zero_latest_fields_report_no_update() {
+        for (name, details) in [
+            ("workshop-update-none", r#""manifest" "7""#),
+            (
+                "workshop-update-zero",
+                r#""manifest" "7" "latest_manifest" "0""#,
+            ),
+            (
+                "workshop-update-empty",
+                r#""manifest" "7" "latest_manifest" """#,
+            ),
+            (
+                "workshop-update-garbage-time",
+                r#""latest_timeupdated" "soon""#,
+            ),
+        ] {
+            let catalog = update_fixture(name, r#""manifest" "7" "timeupdated" "1""#, details);
+            assert_eq!(update_flag(&catalog, "100"), Some(false), "{name}");
+        }
+    }
+
+    #[test]
+    fn modern_manifest_fixture_has_no_updates() {
+        let catalog = workshop_fixture(
+            "workshop-modern-no-update",
+            "steamapps/workshop/appworkshop_431960.acf",
+            MODERN_MANIFEST,
+        );
+        assert_eq!(catalog.stats.update_available, 0);
+        assert_eq!(update_flag(&catalog, "100"), Some(false));
+    }
+
+    #[test]
+    fn catalog_written_before_update_fields_still_parses() {
+        let item: CatalogItem = serde_json::from_value(serde_json::json!({
+            "workshop_id": "100", "title": "t", "kind": "scene",
+            "compatibility": "renderer_dependent", "compatibility_detail": "",
+            "content_root": "/x", "project_file": "/x/project.json",
+            "entry_file": null, "preview_file": null, "metadata_hash": null,
+            "tags": [], "requested_permissions": [],
+            "workshop_state": "subscribed_installed", "workshop_progress": null,
+            "diagnostics": []
+        }))
+        .unwrap();
+        assert!(!item.workshop_update_available);
+        let stats: CatalogStats = serde_json::from_value(serde_json::json!({
+            "total": 1, "scene": 1, "video": 0, "web": 0, "unknown": 0,
+            "invalid": 0, "subscribed": 1, "missing": 0, "downloading": 0
+        }))
+        .unwrap();
+        assert_eq!(stats.update_available, 0);
     }
 
     #[test]

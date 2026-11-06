@@ -81,6 +81,37 @@ against scripted responses and gets its first real run from the
 installed package. Not built: sign-out revocation at Steam (file is
 deleted locally), author names, the `downloading` state.
 
+**W5 status 2026-11-05:** implemented on `workshop-w5` (uncommitted,
+awaiting orchestrator review). What it does and where:
+
+- *Update available.* `kwe-core/src/scan.rs` compares an item's
+  `latest_manifest` in `WorkshopItemDetails` with the installed `manifest`
+  (`WorkshopItemsInstalled` first), with `latest_timeupdated` >
+  `timeupdated` as the fallback when there are no manifest ids. The target's
+  real manifest has both fields on every item (checked 2026-11-05, key names
+  only; all up to date that day). `NeedsUpdate` is app-wide and not used.
+  New additive catalog fields `workshop_update_available` (item) and
+  `stats.update_available` (`WORKSHOP_PROTOCOL_V1.md` section 3). Display
+  only: it never changes `workshop_state`, so apply and playlists are
+  unaffected (C7). Shown as icon `update-low-symbolic` + "Update available"
+  on the card (both galleries), a count in the gallery heading row, and an
+  information message in the details pane.
+- *Unsubscribe.* W3 had it only in the Browse detail sheet. The details pane
+  of both galleries now offers Unsubscribe for any subscribed item
+  (installed, missing, downloading) when signed in, behind a confirmation
+  (Steam deletes the files). It reuses `RemoteCatalogModel::unsubscribe`,
+  which already tracked pending changes by id, plus a new `pendingIds`
+  property for items that are not Browse rows. Signed out, a hint points to
+  the Browse sign-in or the Steam client. No new RPC.
+- *Count badge.* The Workshop navigation tab reads "Workshop (N)" with N =
+  installed subscriptions (the Subscribed heading's number); its tooltip adds
+  the update count. Text rather than `Kirigami.Badge`: that type needs
+  Kirigami 6.25 and a custom `NavigationTabBar.delegate` (6.23), and the
+  package does not pin a Kirigami version.
+- Not verified live: a real Steam update cycle (manifest gaining a newer
+  `latest_manifest`, then Steam updating) and a live unsubscribe from the
+  details pane.
+
 ## 3. Task contracts
 
 Common to all: branch from `kde-owe-backend`; `./scripts/check.sh` green

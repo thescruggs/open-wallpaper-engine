@@ -504,6 +504,18 @@ Kirigami.Page {
                 visible: catalogStats.downloadingCount > 0
                 text: qsTr("%1 downloading").arg(catalogStats.downloadingCount)
             }
+            Kirigami.Icon {
+                visible: catalogStats.updateAvailableCount > 0
+                implicitWidth: Kirigami.Units.iconSizes.small
+                implicitHeight: Kirigami.Units.iconSizes.small
+                source: "update-low-symbolic"
+                Accessible.ignored: true
+            }
+            Controls.Label {
+                visible: catalogStats.updateAvailableCount > 0
+                text: qsTr("%1 update(s) available").arg(catalogStats.updateAvailableCount)
+                Accessible.name: text
+            }
             Controls.Label {
                 visible: catalogStats.issueCount > 0
                 text: qsTr("%1 need attention").arg(catalogStats.issueCount)

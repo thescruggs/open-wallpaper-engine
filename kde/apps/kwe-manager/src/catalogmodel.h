@@ -16,6 +16,8 @@ struct WallpaperItem {
     QString detail;
     QString workshopState;
     int workshopProgress = -1;
+    // W5: Steam's manifest lists a newer published version (display only).
+    bool updateAvailable = false;
     QUrl previewUrl;
     QString contentRoot;
     QUrl entryUrl;
@@ -36,6 +38,7 @@ class CatalogModel final : public QAbstractListModel {
     Q_PROPERTY(int subscribedCount READ subscribedCount NOTIFY statsChanged)
     Q_PROPERTY(int missingCount READ missingCount NOTIFY statsChanged)
     Q_PROPERTY(int downloadingCount READ downloadingCount NOTIFY statsChanged)
+    Q_PROPERTY(int updateAvailableCount READ updateAvailableCount NOTIFY statsChanged)
 
 public:
     enum Role {
@@ -54,6 +57,7 @@ public:
         EntryUrlRole,
         DiagnosticSummaryRole,
         RequestedPermissionsRole,
+        WorkshopUpdateAvailableRole,
     };
     Q_ENUM(Role)
 
@@ -63,9 +67,10 @@ public:
     QHash<int, QByteArray> roleNames() const override;
     void replaceFromCatalog(const QJsonObject &catalog);
     Q_INVOKABLE void toggleFavorite(const QString &workshopId);
-    // Lookup for views that hold bare workshop ids (playlist entries):
-    // returns found/title/kind/previewUrl; a missing id keeps the id as the
-    // title so stale entries stay identifiable.
+    // Lookup for views that hold bare workshop ids (playlist entries, the
+    // details pane): returns found/title/kind/previewUrl/workshopState/
+    // updateAvailable; a missing id keeps the id as the title so stale
+    // entries stay identifiable.
     Q_INVOKABLE QVariantMap itemById(const QString &workshopId) const;
     bool isFavorite(const QString &workshopId) const;
     // True when the local catalog already lists this Workshop id (the
@@ -80,6 +85,7 @@ public:
     int subscribedCount() const { return m_subscribedCount; }
     int missingCount() const { return m_missingCount; }
     int downloadingCount() const { return m_downloadingCount; }
+    int updateAvailableCount() const { return m_updateAvailableCount; }
 
 signals:
     void statsChanged();
@@ -100,6 +106,7 @@ private:
     int m_subscribedCount = 0;
     int m_missingCount = 0;
     int m_downloadingCount = 0;
+    int m_updateAvailableCount = 0;
     QSet<QString> m_favorites;
     QSet<QString> m_ids;
 };

@@ -76,6 +76,54 @@ private slots:
         QCOMPARE(m_filter.playlistFilter(), QStringLiteral("all"));
         QCOMPARE(m_filter.rowCount(), 5);
     }
+
+    // W5: the daemon's per-item update flag reaches the role, the count and
+    // the details lookup; it is ignored on anything but an installed
+    // subscription, and absent (older daemon) reads as false.
+    void updateAvailableReachesRoleCountAndLookup() {
+        CatalogModel model;
+        QSignalSpy stats(&model, &CatalogModel::statsChanged);
+        auto flagged = [](QJsonObject object, bool value) {
+            object.insert(QStringLiteral("workshop_update_available"), value);
+            return object;
+        };
+        model.replaceFromCatalog(QJsonObject{{QStringLiteral("items"), QJsonArray{
+            flagged(item(QStringLiteral("1"), QStringLiteral("A"), QStringLiteral("scene")), true),
+            flagged(item(QStringLiteral("2"), QStringLiteral("B"), QStringLiteral("scene")), false),
+            item(QStringLiteral("3"), QStringLiteral("C"), QStringLiteral("scene")),
+            flagged(item(QStringLiteral("4"), QStringLiteral("D"), QStringLiteral("scene"),
+                         QStringLiteral("subscribed_missing")), true),
+            flagged(item(QStringLiteral("5"), QStringLiteral("E"), QStringLiteral("scene"),
+                         QStringLiteral("local")), true),
+        }}});
+        QCOMPARE(stats.count(), 1);
+        QCOMPARE(model.updateAvailableCount(), 1);
+        QCOMPARE(model.subscribedCount(), 3);
+        const auto role = [&model](int row) {
+            return model.data(model.index(row), CatalogModel::WorkshopUpdateAvailableRole).toBool();
+        };
+        QVERIFY(role(0));
+        QVERIFY(!role(1));
+        QVERIFY(!role(2));
+        QVERIFY(!role(3));
+        QVERIFY(!role(4));
+        QVERIFY(model.roleNames().values().contains("workshopUpdateAvailable"));
+        const auto entry = model.itemById(QStringLiteral("1"));
+        QCOMPARE(entry.value(QStringLiteral("updateAvailable")).toBool(), true);
+        QCOMPARE(entry.value(QStringLiteral("workshopState")).toString(),
+                 QStringLiteral("subscribed_installed"));
+        const auto gone = model.itemById(QStringLiteral("999"));
+        QCOMPARE(gone.value(QStringLiteral("found")).toBool(), false);
+        QCOMPARE(gone.value(QStringLiteral("updateAvailable")).toBool(), false);
+        QCOMPARE(gone.value(QStringLiteral("workshopState")).toString(), QString());
+
+        // Steam finished the update: the flag and the count drop.
+        model.replaceFromCatalog(QJsonObject{{QStringLiteral("items"), QJsonArray{
+            flagged(item(QStringLiteral("1"), QStringLiteral("A"), QStringLiteral("scene")), false),
+        }}});
+        QCOMPARE(model.updateAvailableCount(), 0);
+        QVERIFY(!role(0));
+    }
 };
 
 QTEST_MAIN(WallpaperFilterModelTest)

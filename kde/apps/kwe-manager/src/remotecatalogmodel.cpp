@@ -283,6 +283,7 @@ void RemoteCatalogModel::mutate(const QString &workshopId, bool unsubscribe) {
   change.unsubscribe = unsubscribe;
   change.age.start();
   m_changes.insert(workshopId, change);
+  emit pendingIdsChanged();
   const int row = rowOf(workshopId);
   if (row >= 0) {
     m_rows[row].pending = true;
@@ -308,8 +309,15 @@ void RemoteCatalogModel::mutate(const QString &workshopId, bool unsubscribe) {
                  BusyRetries);
 }
 
+QStringList RemoteCatalogModel::pendingIds() const {
+  QStringList ids = m_changes.keys();
+  ids.sort();
+  return ids;
+}
+
 void RemoteCatalogModel::clearPending(const QString &id, const QString &note) {
-  m_changes.remove(id);
+  if (m_changes.remove(id) > 0)
+    emit pendingIdsChanged();
   const int row = rowOf(id);
   if (row >= 0) {
     m_rows[row].pending = false;
