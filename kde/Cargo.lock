@@ -324,6 +324,14 @@ name = "kwe-mpv"
 version = "0.1.0-alpha.1"
 
 [[package]]
+name = "kwe-openrgb"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "kwe-report-protocol"
 version = "0.1.0-alpha.1"
 dependencies = [

@@ -100,6 +100,25 @@ entries:
     review_date: 2026-10-03
     notes: Package shape (Plasma/Shell, X-Plasma-APIVersion 2, lockscreenmainscript), context properties (authenticator, kscreenlocker_userName, config), root signals, and the PLASMA_DEFAULT_SHELL selection rule only; the QML is original and no KDE implementation code was copied or adapted.
 
+  - id: openrgb-sdk-protocol
+    project: OpenRGB SDK network protocol documentation
+    url: https://gitlab.com/CalcProgrammer1/OpenRGB/-/blob/master/Documentation/OpenRGBSDK.md
+    revision: CalcProgrammer1/OpenRGB@dc0e9b2fd3657c8f5c5162dc7b504a75912222c8 (last commit touching Documentation/OpenRGBSDK.md, 2026-08-28), fetched 2026-11-05; target server openrgb 1.1-1.1 (CachyOS) installed, live check pending
+    license_observed: GPL-2.0-or-later (OpenRGB repository, documentation included); protocol facts only were used
+    use: protocol-compatible
+    approved_for_code_use: false
+    local_files:
+      - crates/kwe-openrgb/src/lib.rs
+      - crates/kwe-openrgb/src/wire.rs
+      - crates/kwe-openrgb/src/model.rs
+      - crates/kwe-openrgb/src/client.rs
+      - crates/kwe-openrgb/src/stub.rs
+      - crates/kwe-openrgb/examples/probe.rs
+      - docs/OPENRGB_CLIENT.md
+    reviewer: Claude implementation; human dependency/provenance review pending (OPENRGB_LED.md L0 gate)
+    review_date: 2026-11-05
+    notes: Independent client (and test stub server) written from the published packet layouts — header, packet ids 0/1/10/40/50/100/1050/1051/1100/1101, version-gated controller/mode/zone/segment/matrix/LED field order for protocol 1..=5, and the negotiation rule. No OpenRGB source or third-party client library (e.g. the openrgb crate) was read, copied, or adapted; no documentation prose is reproduced. Byte order, colour layout, and data_size semantics are not stated in the document and are assumptions pending the live probe (docs/OPENRGB_CLIENT.md).
+
   - id: kde-plasma-wallpaper-api
     project: KDE Plasma WallpaperItem and Plasma/Wallpaper package interface
     url: https://api.kde.org/qml-org-kde-plasma-plasmoid-wallpaperitem.html

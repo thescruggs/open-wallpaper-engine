@@ -21,6 +21,26 @@
   client is built against a stub server and ships a probe for the live
   check.
 
+## Slice status
+
+- **L0+L1 — done (uncommitted, 2026-11-05), live probe pending.**
+  `crates/kwe-openrgb` (contract: `docs/OPENRGB_CLIENT.md`; provenance:
+  `THIRD_PARTY.yml` `openrgb-sdk-protocol`). Protocol 1..=5, loopback-only
+  config, bounded everything, `ServerAbsent` as a distinct quiet outcome,
+  recording stub server (feature `stub`), `probe` and `stub_server`
+  examples. 30 unit tests against the stub.
+  - Plan corrections found: installed OpenRGB is now `1.1-1.1` (not
+    1.0rc3); still SDK server off (6742 refused at 2026-11-05). The probe
+    lives in L1 as an example, so L2's `--probe` can reuse the same
+    output shape. Byte order / colour layout / `data_size` semantics are
+    not in the published doc — the first live probe must confirm them.
+  - Live check to run when the maintainer enables the SDK server:
+    `cargo run -p kwe-openrgb --example probe` (read-only), then once
+    `-- --set-color FF0000 --hold-ms 1500`.
+  - Maintainer gate still open: dependency/provenance approval (here: no
+    new dependency; protocol-compatible ledger entry).
+- L2–L5: pending.
+
 Requested 2026-08-29: drive OpenRGB-controlled devices (keyboard, case
 LEDs, strips) from the running wallpaper and/or the captured system
 audio — the analog of Wallpaper Engine's Windows "LED integration",

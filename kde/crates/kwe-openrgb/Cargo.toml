@@ -1,0 +1,23 @@
+[package]
+name = "kwe-openrgb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Minimal bounded synchronous client for the OpenRGB SDK network protocol (loopback only)"
+
+[features]
+# Exposes `kwe_openrgb::stub`, an in-process recording stub SDK server for
+# tests in this crate, the LED worker, and smoke scripts. Never enabled in
+# shipped binaries.
+stub = []
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[[example]]
+name = "stub_server"
+required-features = ["stub"]
