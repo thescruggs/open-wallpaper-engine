@@ -1,0 +1,136 @@
+# OpenRGB LED sync with audio response — plan (in progress since 2026-11-05)
+
+## Maintainer decisions and plan changes (2026-11-05)
+
+- Maintainer, 2026-11-05: "Make openrgb optional but utilize if it is
+  running." This replaces the "global opt-in, default off" policy below:
+  - OpenRGB is never a hard dependency (`optdepends`, decision 4 = yes).
+  - `led.enabled` defaults to **on** and means "use OpenRGB when its SDK
+    server answers on loopback". The SDK server is off by default in
+    OpenRGB, so turning it on is the opt-in.
+  - No reachable SDK server is a normal quiet state (`led.status` =
+    `server_absent`, bounded slow re-probe), never an error, a restart
+    strike, or a log storm. The Settings switch still turns LED sync off.
+- Decisions 1, 2, 3, 5: the orchestrator took the recommended option for
+  the overnight run; the maintainer may revise.
+  1. In-repo minimal sync client (`kwe-openrgb`), no new dependency.
+  2. Default mode `ambient`.
+  3. All controllers, with per-device disable.
+  5. Restore the previous per-device mode on stop (best effort).
+- L0 is folded into L1: the SDK server was off when work started, so the
+  client is built against a stub server and ships a probe for the live
+  check.
+
+Requested 2026-08-29: drive OpenRGB-controlled devices (keyboard, case
+LEDs, strips) from the running wallpaper and/or the captured system
+audio — the analog of Wallpaper Engine's Windows "LED integration",
+built on the daemon's existing isolation and bounds.
+
+## What already exists (measured on the target machine)
+
+- **Audio**: `kwe-audio-worker` already captures system audio via
+  `pw-record` and produces normalized 16/32/64-band stereo `AudioFrame`s
+  (`kwe_core::audio::analyze_stereo`), delivered to the daemon over
+  `audio.forward` and forwarded latest-wins to the active renderer. The
+  LED path can tee this exact stream — no new capture code.
+- **Frames**: every renderer publishes BGRA frames into a two-slot
+  seqlock file (`kwe-frame-protocol`); the daemon knows the active
+  worker's `frame_file` path. A read-only consumer can sample it at its
+  own (low) rate without touching any renderer.
+- **Settings surface**: `settings-v1.json` + `settings.get/set` RPCs +
+  the manager's Settings page (added for the wallpaper-audio switch) are
+  the natural home for LED configuration.
+- **OpenRGB on the target**: `openrgb 1.0rc3` installed, GUI running
+  (`--startminimized`) but the SDK server is OFF (port 6742 refused).
+  The integration requires the SDK server (GUI toggle, `--server`, or
+  `openrgb.service`); the UI must surface this state with the fix hint.
+
+## Architecture
+
+One new isolated worker, `kwe-led-worker`, owned by the daemon exactly
+like `kwe-audio-worker` (spawn, bounded restarts, SIGTERM+grace,
+status): no LED or network code in renderers, the daemon, or
+plasmashell. Data flows IN over stdin (NDJSON, same wire crate as
+renderer input); LED output goes to the OpenRGB SDK on 127.0.0.1:6742.
+
+Sources → mapping → sink, all inside the worker:
+
+- **Ambient source**: open the active wallpaper's frame file read-only,
+  take a stable seqlock snapshot at ≤10 Hz, downsample edge regions /
+  dominant color per configured zone (ambilight-style; cheap: a few
+  thousand pixel reads per tick).
+- **Audio source**: the daemon tees each accepted `audio.forward` frame
+  to the worker's stdin (latest-wins, exactly the renderer discipline).
+  Bands → per-zone hue/brightness (spectrum across a keyboard, bass
+  pulse for single-zone devices).
+- **Modes**: `off | ambient | spectrum | ambient+pulse` (ambient color,
+  audio-modulated brightness). Global brightness cap. Update rate
+  bounded (default 10 Hz, max 20 — cheap RGB controllers stall on USB
+  storms) with latest-wins coalescing.
+- **Sink**: OpenRGB SDK client. On connect: negotiate protocol version,
+  enumerate controllers/zones, honor a device allowlist. `UpdateLeds`
+  per tick. Disconnect/absent server → bounded reconnect backoff and a
+  truthful `led.status`; on worker stop, restore devices to their prior
+  mode (best effort) so the user's static lighting comes back.
+
+Policy (superseded 2026-11-05, see the top of this file): LED control is
+outward-facing device control → ~~global opt-in, default off~~. The SDK protocol has no
+authentication; the client must only ever dial loopback.
+
+## Slices (issue-sized, in order)
+
+- **L0 — spike + dependency decision (small).** Hand-rolled probe
+  against the live SDK server (enumerate, set colors, restore). Decide:
+  minimal in-repo sync client (~300 lines, protocol ≥3; fits the
+  repo's bounded-deps posture) vs the async `openrgb` crate (pulls
+  tokio into a threaded daemon — likely rejected). **Maintainer gate:
+  dependency/provenance approval before any dependent code merges.**
+- **L1 — `kwe-openrgb` client crate (medium).** Sync, bounded
+  (timeouts, max packet size, max controllers/leds), typed packets for
+  the needed subset only. Unit tests against an in-process stub server.
+- **L2 — `kwe-led-worker` (large).** Sources, mapping modes, sink,
+  rate bounds, `--probe` (JSON: server reachable, controller inventory)
+  for diagnostics, standalone CLI mode for development. Unit tests for
+  the mapping math; stub-server integration test.
+- **L3 — daemon integration (medium).** `led.rs` lifecycle manager
+  (clone the `audio.rs` pattern: restart budget, status); settings
+  extension (`led: {enabled, mode, brightness, rate_hz, devices[]}`)
+  with the existing quarantine-on-corrupt posture; `led.status` RPC;
+  hand the worker the active frame path on renderer transitions and
+  tee audio frames. Worker runs only while enabled AND a renderer is
+  live.
+- **L4 — manager UI (medium).** Settings page section: enable switch,
+  mode picker, brightness/rate, detected-device list with checkboxes,
+  and the actionable degraded states ("OpenRGB SDK server is not
+  running — enable it in OpenRGB's settings or `openrgb --server`").
+- **L5 — verification (small).** `scripts/smoke-led.sh` against a fake
+  SDK server that records packets (asserts: opt-in gating, rate bound,
+  restore-on-stop); live verify on the real devices.
+- **L6 (defer) — per-wallpaper LED profiles.** WE project.json LED
+  projection config compatibility; research scope first — global modes
+  cover the request.
+
+Rough order: L0 half a day; L1+L2 the bulk (2–3 days together); L3+L4
+a day; L5 half a day.
+
+## Open decisions for the maintainer
+
+1. Dependency: in-repo minimal client (recommended) vs `openrgb` crate.
+2. Default mode once enabled (suggest `ambient`).
+3. Device selection default: all controllers vs explicit allowlist
+   (suggest all, with per-device disable).
+4. Whether the package should `optdepends=('openrgb: LED sync')`.
+5. Restore-on-stop semantics: previous per-device mode vs a configured
+   "idle" color.
+
+## Risks
+
+- OpenRGB 1.x SDK protocol versioning (negotiate, refuse unknown).
+- Slow/flaky USB controllers: keep per-device update budgets; a stalled
+  device must not stall the tick (per-device latest-wins).
+- Frame-file lifecycle races on wallpaper switch (reopen on ENOENT /
+  generation change; the seqlock read discipline already handles the
+  writer side).
+- The worker must never hold the frame file open across renderer
+  quarantine/replace in a way that blocks cleanup (open per tick or
+  reopen on invalidation).
