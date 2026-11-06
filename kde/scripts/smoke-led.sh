@@ -183,8 +183,9 @@ for _ in range(200):
     break
 PY
 )"
-[[ "$sdk_port" =~ ^[0-9]+$ ]] || fail "no free loopback port"
-(( sdk_port != REAL_SDK_PORT )) || fail "refusing to use the real OpenRGB SDK port $REAL_SDK_PORT"
+[[ "$sdk_port" =~ ^[0-9]{1,5}$ ]] || fail "no free loopback port"
+# Base 10 forced: in (( )) a leading zero would read 06742 as octal.
+(( 10#$sdk_port != REAL_SDK_PORT )) || fail "refusing to use the real OpenRGB SDK port $REAL_SDK_PORT"
 echo "smoke-led: stub SDK port $sdk_port (state $smoke_root)"
 
 mkfifo "$smoke_root/stub.in" "$smoke_root/stub.out"

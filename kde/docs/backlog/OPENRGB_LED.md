@@ -392,7 +392,7 @@
   strays). Wall time 15.7–15.9 s; passed 3/3 consecutive runs.
   - Not covered: audio modes end to end (would need a null-sink capture in
     the LED smoke); live devices (6742 still not listening).
-- **Review fixes D — done (uncommitted, 2026-11-06), live check pending.**
+- **Review fixes D — done (commit `51cab7c`, 2026-11-06), live check pending.**
   Last fix slice before the first live test on real RGB hardware. Each new
   regression test was run against the pre-fix code (HEAD `7de122b` in a
   scratch worktree, new tests copied in) and FAILED there; passes now.
@@ -444,6 +444,30 @@
     no longer re-caches it, so it can never outlive the tombstone and be
     synthesized as `subscribed_missing`. Test
     `workshop_cache::tests::steam_lag_scan_never_outlives_the_tombstone`.
+- **Review fixes E — done (uncommitted, 2026-11-06), live check pending.**
+  Four recommended fixes from the verification pass on `51cab7c`.
+  - R1 shutdown restore pass budget — the pass's limit is now measured
+    from `begin_shutdown` (where the worker's stop grace starts), not from
+    `finish_shutdown` (after the renderers stopped): a wedged worker
+    SIGKILLed at its grace leaves the pass 0.5 s whatever the renderers
+    took. Test `led::tests::shutdown_restore_pass_is_budgeted_from_the_start_of_shutdown`.
+  - R2 spectrum flapping on quiet material — level hysteresis: sound
+    starts at 6.4e-4 (≈ −56 dBFS) and, once present for the 1 s takeover
+    dwell, continues down to 3.2e-4 (≈ −62 dBFS); one rule for the spectrum source/release,
+    `audio.silent`, auto-gain and the pulse. Test
+    `engine::tests::quiet_swelling_music_takes_over_once_and_never_releases`
+    (9 takeovers before, ≤ 1 / 0 releases now).
+  - R4 `ambient+pulse` dip-then-snap at pauses — without sound the pulse
+    eases to 1 with the 0.25 s release τ at once (no dip to 50 %, no
+    snap after 3 s). Test
+    `engine::tests::ambient_pulse_pause_and_track_end_never_dip_or_snap`.
+  - R3 guard exemption — a comparison with 6742 exempts a port variable
+    only when it guards an abort (`exit`/`return`/`fail` after `&&`/`||`
+    with the right polarity, or in the matching `if` branch);
+    `dev-run.sh` refuses `KWE_DEV_LED_SDK_PORT` unless plain digits and
+    ≠ 6742 compared base 10 (`06742`, `+6742` refused); `smoke-led.sh`
+    compares `10#$sdk_port`. Self-test 58 bad / 36 good (incl. the
+    verifier's e1, e2, e14).
   - **Open items — need the first live test** (nothing here was verified
     against real hardware or real capture):
     - real OpenRGB wire compatibility (installed OpenRGB 1.1; only the
@@ -458,6 +482,15 @@
       here): spectrum bars therefore show loudness across the window, and
       "bass" is the window's first eighth — expect a lively but not
       frequency-accurate display.
+    - What to watch for in that first live test (review fixes E):
+      - Spectrum shows loudness over time slices of a 43 ms window, not
+        frequencies (above): bars move with loudness, not pitch.
+      - After a sudden loud hit, LEDs stay dim for ≈ 2–3 s while the
+        auto-gain's reference decays (10 dB/s).
+      - An always-on noisy source on the default sink (≈ −50 dBFS mic
+        loopback / line-in) is sound: Spectrum stays taken over and
+        `ambient+pulse` never goes steady. Hiss between ≈ −62 and
+        −56 dBFS does the same once real sound has started it.
 
 Requested 2026-08-29: drive OpenRGB-controlled devices (keyboard, case
 LEDs, strips) from the running wallpaper and/or the captured system

@@ -419,10 +419,13 @@ under the normal trust rules and never takes a device over
 (`LED_PROTOCOL_V1.md` §Remembered modes file). Bounded: SIGKILL after 3 s
 (`RESTORE_PASS_LIMIT`; the worker itself ends within ≈ 2.5 s), reaped from
 the supervisor tick, never awaited there; at shutdown it is awaited in
-place for at most the rest of `stop grace + 0.5 s` (≥ 0.5 s, ≤ 3 s). It is
+place for at most the rest of `stop grace + 0.5 s` counted from the start
+of shutdown (when the worker's stop grace began, not after the renderers
+stopped; review fixes E) (≥ 0.5 s, ≤ 3 s). It is
 never a restart strike, is skipped entirely when no saved-modes file
 exists or no worker binary is runnable, and a normal spawn waits for it to
-finish (≤ 3 s). Log lines: `event=led.worker.restore_pass pid=N
+finish or be given up (≤ 5 s: the 3 s limit, then SIGKILL, plus at most
+the 2 s kill-reap limit before an unreaped pass is dropped). Log lines: `event=led.worker.restore_pass pid=N
 detail=started|finished exit=...|killed_at_limit`. Not surfaced in
 `led.status`.
 

@@ -350,6 +350,30 @@ pub struct LedManager {
     /// no successor will run, one restore-only pass settles it.
     restore_owed: bool,
     restore_pass: Option<RestorePass>,
+    /// Review fixes E (R1): when daemon shutdown began (`begin_shutdown`,
+    /// where the worker's stop grace starts). The shutdown restore pass
+    /// is budgeted from here, not from `finish_shutdown`, which runs only
+    /// after the renderers and other helpers have been stopped.
+    shutdown_started: Option<Instant>,
+}
+
+/// The shutdown restore pass's limit (review fixes E, R1): whatever is left
+/// of `stop_grace + 0.5 s` since shutdown began (`begin_shutdown`, where the
+/// worker's stop grace starts), at least 0.5 s and at most
+/// [`RESTORE_PASS_LIMIT`]. So the pass ends by `shutdown start +
+/// stop_grace + 0.5 s` whenever the worker stop and the renderer stops
+/// together took at most `stop_grace` (a wedged worker SIGKILLed at its 4 s grace leaves
+/// it 0.5 s), inside `TimeoutStopSec=5s`; it no longer grows by the time
+/// the renderers took to stop. Pure, so the arithmetic is unit tested.
+fn shutdown_restore_budget(
+    shutdown_started: Instant,
+    stop_grace: Duration,
+    now: Instant,
+) -> Duration {
+    let floor = Duration::from_millis(500);
+    (shutdown_started + stop_grace + floor)
+        .saturating_duration_since(now)
+        .clamp(floor, RESTORE_PASS_LIMIT)
 }
 
 /// File name of the worker's remembered-modes file in the state directory.
@@ -382,6 +406,7 @@ impl LedManager {
             audio_live_at: None,
             restore_owed: false,
             restore_pass: None,
+            shutdown_started: None,
         }
     }
 
@@ -939,6 +964,7 @@ impl LedManager {
     /// Daemon shutdown, first half: ask the worker to restore and exit
     /// (non-blocking), so renderers can be stopped in parallel.
     pub fn begin_shutdown(&mut self) {
+        self.shutdown_started.get_or_insert_with(Instant::now);
         self.next_spawn_at = None;
         self.begin_stop("shutdown");
     }
@@ -966,19 +992,21 @@ impl LedManager {
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
-        self.finish_restore_pass(started);
+        self.finish_restore_pass();
     }
 
     /// Shutdown, R-a: no successor will ever run, so a restore owed for an
-    /// uncleanly ended worker is done now (bounded: whatever is left of
-    /// `stop_grace + 0.5 s` since shutdown began, at least 0.5 s and at most
-    /// [`RESTORE_PASS_LIMIT`] — inside `TimeoutStopSec=5s` in the usual
-    /// case, where no worker was still stopping).
-    fn finish_restore_pass(&mut self, started: Instant) {
+    /// uncleanly ended worker is done now, bounded by
+    /// [`shutdown_restore_budget`] from when shutdown began.
+    fn finish_restore_pass(&mut self) {
         if self.restore_owed && self.restore_pass.is_none() {
-            let left = (started + self.timings.stop_grace + Duration::from_millis(500))
-                .saturating_duration_since(Instant::now());
-            self.start_restore_pass(left.clamp(Duration::from_millis(500), RESTORE_PASS_LIMIT));
+            let now = Instant::now();
+            let started = self.shutdown_started.unwrap_or(now);
+            self.start_restore_pass(shutdown_restore_budget(
+                started,
+                self.timings.stop_grace,
+                now,
+            ));
         }
         let backstop = Instant::now() + RESTORE_PASS_LIMIT + KILL_REAP_LIMIT * 2;
         while self.restore_pass.is_some() {

@@ -100,7 +100,7 @@ NDJSON, one JSON object per line, ≤ **4096 bytes** including the newline
 
 | Type | Semantics |
 |---|---|
-| `audio_bands` | The renderer line from `kwe-input-protocol`, unchanged and validated by its own decoder. Latest wins; `sequence` is ignored. Fresh for 500 ms, then treated as "no audio". A frame whose **window level** — the sum of its mono raw bands `mean(l, r)` — is below **6.4e-4** (≈ −56 dBFS) is **silence** (review fixes D, M1; see §Audio levels): fresh but not a source. |
+| `audio_bands` | The renderer line from `kwe-input-protocol`, unchanged and validated by its own decoder. Latest wins; `sequence` is ignored. Fresh for 500 ms, then treated as "no audio". A frame whose **window level** — the sum of its mono raw bands `mean(l, r)` — is below **6.4e-4** (≈ −56 dBFS) is **silence** (review fixes D, M1; see §Audio levels) unless sound has started (≥ 6.4e-4 present for the 1 s takeover dwell) — it then continues down to **3.2e-4** (≈ −62 dBFS; review fixes E, R2): fresh but not a source. |
 | `led_config` | Every field optional; a present field replaces the current value, absent keeps it. `mode` ∈ `off`, `ambient`, `spectrum`, `ambient+pulse`; `brightness` 0..=100; `rate_hz` 1..=20; `disabled_devices` (≤128 ids) **replaces the whole set** (`[]` enables all). Unknown fields or out-of-range values reject the whole line (nothing applied). |
 | `led_frame` | The active renderer's frame file; `null` = no renderer live. Absolute UTF-8 path ≤4096 bytes, no NUL, no `.`/`..` components. Existence is not required (checked per tick). |
 | `led_status_request` | Emit a status line as soon as the rate limit allows (≤250 ms). |
@@ -179,7 +179,7 @@ heartbeat older than ~15 s while the process lives means it is wedged.
 | `frame.state` | `none` (no path), `ok`, `absent` (no file), `invalid` (bad header, truncated, symlink, not a regular file), `busy` (writer mid-publish on every attempt, or nothing published yet) |
 | `frame.sequence/width/height` | of the last accepted snapshot |
 | `audio.fresh`, `audio.bands` | an `audio_bands` line arrived within 500 ms; its band count |
-| `audio.silent` | fresh frames arrive but carry no sound (window level < 6.4e-4, ≈ −56 dBFS, for the last 500 ms; review fixes D — was "every `sqrt(band)` < 0.05", which called −20 dBFS music silent). With `waiting_for_source` in `spectrum`: `fresh:true, silent:true` = nothing is playing; `fresh:false` = no audio frames at all. *Additive (review fixes C1)*: decodes as `false` from an older worker |
+| `audio.silent` | fresh frames arrive but carry no sound for the last 500 ms (the §Audio levels rule: sound starts at window level 6.4e-4 ≈ −56 dBFS and, once present for the 1 s dwell, continues down to 3.2e-4 ≈ −62 dBFS — review fixes E; review fixes D — was "every `sqrt(band)` < 0.05", which called −20 dBFS music silent). With `waiting_for_source` in `spectrum`: `fresh:true, silent:true` = nothing is playing; `fresh:false` = no audio frames at all. *Additive (review fixes C1)*: decodes as `false` from an older worker |
 | `device_count` | controllers the server reported |
 | `devices[]` | ≤32 listed; `devices_truncated` when more exist or the line had to shrink. `id` is the key for `disabled_devices`; display strings are cut to 80 chars; ≤16 zones per device (`zones_truncated`). Zone `type` ∈ `single`, `linear`, `matrix`, `unknown`; `matrix` = `[height, width]` |
 | `enabled` | not in `disabled_devices` |
@@ -279,8 +279,8 @@ daemon parses one device shape.
   so frames arrive in silence too, and spectrum used to
   paint every device black for as long as nothing played). Until then the
   state is `active` + `waiting_for_source`, `driven_count: 0`, and no
-  device packet is sent. `ambient+pulse` with a frame but stale audio, or in
-  sustained silence, drives steady ambient.
+  device packet is sent. `ambient+pulse` with a frame but stale audio, or
+  without sound, drives steady ambient (eased in, see §Modes and mapping).
 - When the source goes away the last colours are held, then every device is
   **released**: its remembered mode restored exactly as for mode `off`
   (never driven to black). Hold: 2 s after the last valid frame (ambient
@@ -520,9 +520,14 @@ each (was 9.66 s before review fixes A), < 0.5 s idle with no server
   beats): the colours stay between **50 % and 100 %** of plain ambient —
   measured with real-level fixtures: beats of −20 dBFS bass over a
   −40 dBFS bed swing red 173..233 of 255, steady −10 dBFS music sits at
-  238..248. Without fresh audio, or after 3 s of silence, the factor is 1
-  (plain ambient); a quiet moment shorter than that inside music still
-  pulses down to the 50 % floor.
+  238..248. Without sound (a silent frame by the §Audio levels rule, or
+  no fresh audio) the factor **eases to 1** (plain ambient) with the pulse
+  release time constant, 0.25 s, at once — review fixes E (R4): a pause
+  or a track end never dips the colours and never snaps back; each step
+  into steady ambient is ≤ `0.5 × (1 − e^(−dt/0.25 s))` (≤ 0.091 per tick
+  at 20 Hz; measured 0.009–0.011 after −10 dBFS music). Was: a pause
+  pulled them to the 50 % floor, then after 3 s they jumped to 100 %
+  with the 30 ms attack.
 ### Audio levels (review fixes D, M1)
 
 `kwe_core::audio::analyze_stereo` (renderer path, unchanged) divides each
@@ -538,8 +543,23 @@ open items.) The worker therefore:
 
 - **Silence** = window level `Σ mean(l, r)` < **6.4e-4** (≈ −56 dBFS):
   digital silence, dither and noise-floor hiss (≤ −60 dBFS) are silent;
-  quiet-but-audible music (≥ −50 dBFS) is sound. Drives `audio.silent`,
-  the `spectrum` source and its 3 s silence release, and the pulse.
+  quiet-but-audible music (≥ −50 dBFS) is sound. **Level hysteresis**
+  (review fixes E, R2): once sound has started — frames ≥ 6.4e-4 present
+  (one within 500 ms) continuously for the takeover dwell, 1 s, the test
+  a `spectrum` takeover makes — following frames stay sound down to
+  **3.2e-4** (≈ −62 dBFS: −62 dBFS noise 3.3–3.6e-4,
+  tone 3.1–3.3e-4), until one falls below it or the frames stop for
+  more than 500 ms; until then a frame below 6.4e-4 is silence. This one
+  rule drives `audio.silent`, the `spectrum` source and its 3 s silence
+  release, the auto-gain, and the pulse. Hiss that never stays at or
+  above −56 dBFS for the dwell (−58 dBFS, or −56.5 dBFS blipping over
+  it) never takes over; quiet tonal music swelling
+  ±10 dB around −48 dBFS (troughs −58 dBFS, 4.8–5.3e-4) no longer
+  releases in its troughs (was 9 take/release cycles in 3 min);
+  digital silence and −65 dBFS hiss (≤ 2.6e-4) still release after
+  3 s. Cost: hiss between ≈ −62 and −56 dBFS that follows sound keeps it
+  going (spectrum stays taken over, shown dim; `ambient+pulse` does not
+  go steady — computed ≈ 60 % for −60 dBFS hiss at the gain floor).
 - **Automatic gain** for display: a running peak of `max(raw) × bands`
   with **instant attack**, **decay 10 dB/s**, and a **floor of 6.4e-3**
   (the loudest band of −37 dBFS noise). Display band = `sqrt(clamp(raw ×
@@ -551,7 +571,8 @@ open items.) The worker therefore:
   −10 → −30 dBFS drop); between beats (≤ 0.5 s) the reference falls
   ≤ 5 dB, so beats still read as beats; material just above the silence
   floor peaks at ≈ 37 % instead of being amplified to full brightness;
-  −40 dBFS music still reaches ≈ 85 % on its loudest LEDs.
+  −40 dBFS noise: loudest display band ≈ 93 % per frame (peak 99 %),
+  brightest spectrum LED ≈ 85 % (216/255, below).
 - Measured brightest channel in `spectrum` (brightness 100, stub devices,
   real `analyze_stereo` fixtures): −20 dBFS noise 232/255, −20 dBFS bass
   tone 207, −10 dBFS 232, −40 dBFS noise 216, −40 dBFS bass 207; no
@@ -580,7 +601,7 @@ open items.) The worker therefore:
 | restore on stop | 1.5 s; final flush 0.3 s; SIGTERM → exit ≤ 3.35 s |
 | device operations per tick | started within 0.5 s; stop checked between devices |
 | idle ticks | none while disconnected (sleep to next probe); 4 Hz waiting for a source; 1 Hz in mode `off` |
-| hysteresis | takeover dwell 1 s; ≥ 5 s from a release to the next takeover (one user mode switch / device enable skips it); spectrum silence release 3 s (window level < 6.4e-4 ≈ −56 dBFS) |
+| hysteresis | takeover dwell 1 s; ≥ 5 s from a release to the next takeover (one user mode switch / device enable skips it); spectrum silence release 3 s (sound starts at window level 6.4e-4 ≈ −56 dBFS, continues down to 3.2e-4 ≈ −62 dBFS) |
 | audio gain | running peak: instant attack, 10 dB/s decay, floor 6.4e-3 (`max(raw) × bands`) |
 | restore-only pass | operations started within 2 s, exits ≈ ≤ 2.5 s; daemon SIGKILLs at 3 s |
 | saved-modes trust | same boot id + mtime within 60 s; liveness touch every 5 s while the file exists |
@@ -636,3 +657,9 @@ integration tests: stale / foreign-boot leftovers with the real binary,
 hysteresis timings (dwell 150 ms, retake 400 ms, silence 600 ms) through
 the hidden flags; the daemon tests and `scripts/smoke-led.sh` run the
 defaults.
+Review fixes E added engine tests: quiet tonal music swelling ±10 dB
+around −48 dBFS is ≤ 1 takeover and 0 releases over 3 simulated minutes;
+`ambient+pulse` through a 2 s pause and a track end never dips below its
+level at the pause start (tolerance 0.02) nor steps more than 0.1 per
+tick; −58 dBFS hiss never takes over. Daemon: the shutdown restore pass
+budget is measured from `begin_shutdown`.

@@ -61,9 +61,14 @@ fi
 # it elsewhere instead.
 # (check.sh's LED guard accepts the opt-in launch only through its explicit
 # `led-guard:` marker.)
-if [[ "${KWE_DEV_LED_SDK_PORT:-}" == "6742" ]]; then
-    echo "dev-run: KWE_DEV_LED_SDK_PORT=6742 is the real OpenRGB port; use KWE_DEV_LED=1 to drive real devices" >&2
-    exit 2
+if [[ -n "${KWE_DEV_LED_SDK_PORT:-}" ]]; then
+    # The daemon parses the port as a base-10 number (`06742` and `+6742`
+    # are 6742): accept plain digits only, compared numerically with base 10
+    # forced (a string compare let 06742 through; bare (( )) reads it octal).
+    if [[ ! "$KWE_DEV_LED_SDK_PORT" =~ ^[0-9]{1,5}$ ]] || (( 10#$KWE_DEV_LED_SDK_PORT == 6742 )); then
+        echo "dev-run: KWE_DEV_LED_SDK_PORT=$KWE_DEV_LED_SDK_PORT is the real OpenRGB port (6742) or not a plain port number; use KWE_DEV_LED=1 to drive real devices" >&2
+        exit 2
+    fi
 fi
 if [[ -n "${KWE_DEV_LED_SDK_PORT:-}" ]]; then
     target/debug/kwe-daemon --socket "$socket_path" --led-worker target/debug/kwe-led-worker \

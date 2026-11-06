@@ -43,11 +43,34 @@ pub const FRAME_NOW: Duration = Duration::from_millis(500);
 /// 6.4e-4 (≈ −56 dBFS) keeps digital silence, dither and noise-floor hiss
 /// (−60 dBFS and below) silent and quiet-but-audible music (−50 dBFS and
 /// up) sound, with ≥ 4 dB margin on either side and 16 dB to −40 dBFS.
+///
+/// This is the level sound must **reach** to start (a frame that never
+/// got here is silence: hiss under it, or only blipping over it, never
+/// takes over). Once sound has started it continues down to
+/// [`SOUND_HOLD_LEVEL`] (review fixes E, R2).
 pub const SILENCE_LEVEL: f32 = 6.4e-4;
+/// Level hysteresis (review fixes E, R2): once sound has started —
+/// frames reaching [`SILENCE_LEVEL`] present (one within [`AUDIO_FRESH`])
+/// continuously for the takeover dwell (1 s), the same test a `spectrum`
+/// takeover makes — following frames count as sound until one falls below
+/// this; a gap in the frames longer than [`AUDIO_FRESH`] resets it.
+/// One rule drives everything audio: the `spectrum` source and its 3 s
+/// silence release, status `audio.silent`, the auto-gain, and the
+/// `ambient+pulse` silence behaviour.
+///
+/// 3.2e-4 = half of [`SILENCE_LEVEL`] (6 dB): ≈ −62 dBFS (window level of
+/// −62 dBFS noise 3.3e-4..3.6e-4, tone 3.1e-4..3.3e-4). Quiet tonal
+/// material swelling ±10 dB around −48 dBFS reaches −58 dBFS in its
+/// troughs (4.8e-4..5.3e-4, ≥ 3.5 dB above) and no longer releases there;
+/// digital silence and hiss at −65 dBFS (≤ 2.6e-4, ≥ 1.8 dB below) still
+/// release after 3 s. Cost: hiss between ≈ −62 and −56 dBFS that follows
+/// sound keeps it going (it never starts it).
+pub const SOUND_HOLD_LEVEL: f32 = 3.2e-4;
 /// `spectrum` releases the devices after this long without sound even
-/// while (silent) audio frames keep arriving; `ambient+pulse` stops pulsing
-/// (steady ambient). Gaps between songs or sentences are shorter, so they
-/// neither release nor stop the pulse.
+/// while (silent) audio frames keep arriving. Gaps between songs or
+/// sentences are shorter, so they do not release. (`ambient+pulse` does not
+/// wait for it: without sound it eases to steady ambient at once, see
+/// [`PULSE_RESTING_TAUS`].)
 pub const SILENCE_RELEASE: Duration = Duration::from_secs(3);
 /// A source must be present continuously this long before devices are
 /// taken over (filters blips: a single audio burst, a frame published for
@@ -95,6 +118,13 @@ pub const PULSE_TAUS: Taus = Taus {
 /// the running peak). Review fixes D: 0.2 sat near-dark between beats; in
 /// sustained silence the colours are steady 100 % ambient (unchanged).
 pub const PULSE_FLOOR: f32 = 0.5;
+/// `ambient+pulse` without sound (a silent frame, or no fresh audio)
+/// eases the pulse up to 1 with the pulse release time constant (review
+/// fixes E, R4): a pause never dips to [`PULSE_FLOOR`], and the step into
+/// steady ambient is at most `0.5 × (1 − e^(−dt/0.25 s))` per tick
+/// (≤ 0.091 at 20 Hz). Was: silent frames pulled it to the floor, then it
+/// snapped to 1 with the 30 ms attack after 3 s.
+pub const PULSE_RESTING_TAUS: Taus = Taus::symmetric(0.25);
 
 /// Default probe backoff: 1 s doubling to 60 s.
 pub const BACKOFF_MIN: Duration = Duration::from_secs(1);
@@ -493,8 +523,20 @@ pub struct Engine {
     audio: Option<(Instant, Vec<f32>)>,
     /// Display gain shared by spectrum and the bass pulse.
     gain: AutoGain,
-    /// When the last audio frame with sound (≥ [`SILENCE_LEVEL`]) arrived.
+    /// When the last audio frame with sound arrived (see [`SOUND_HOLD_LEVEL`]).
     loud_at: Option<Instant>,
+    /// The latest audio frame was sound: it reached [`SILENCE_LEVEL`], or
+    /// sound is held and it stayed ≥ [`SOUND_HOLD_LEVEL`].
+    sounding: bool,
+    /// Level hysteresis (R2): sound has started — frames reaching
+    /// [`SILENCE_LEVEL`] were present (one within [`AUDIO_FRESH`])
+    /// continuously for [`Timings::takeover_dwell`] — so quieter frames
+    /// down to [`SOUND_HOLD_LEVEL`] still count as sound.
+    sound_held: bool,
+    /// Last frame reaching [`SILENCE_LEVEL`], and the start of the current
+    /// unbroken stretch of such frames (none more than [`AUDIO_FRESH`] apart).
+    start_level_at: Option<Instant>,
+    start_level_since: Option<Instant>,
     /// Start of the current unbroken stretch with a source present now.
     live_since: Option<Instant>,
     /// When devices were last given back (a release that restored any).
@@ -552,6 +594,10 @@ impl Engine {
             audio: None,
             gain: AutoGain::default(),
             loud_at: None,
+            sounding: false,
+            sound_held: false,
+            start_level_at: None,
+            start_level_since: None,
             live_since: None,
             released_at: None,
             retake_bypass: false,
@@ -712,13 +758,38 @@ impl Engine {
     pub fn set_audio(&mut self, now: Instant, left: &[f32], right: &[f32]) {
         self.counters.audio_frames = self.counters.audio_frames.saturating_add(1);
         let raw = mono_raw(left, right);
-        let sound = window_level(&raw) >= SILENCE_LEVEL;
-        if sound {
-            self.loud_at = Some(now);
-        }
+        let level = window_level(&raw);
         let dt = self.audio.as_ref().map_or(0.0, |(t, _)| {
             now.saturating_duration_since(*t).as_secs_f32()
         });
+        // Level hysteresis (R2): sound starts at SILENCE_LEVEL (held once
+        // present for the takeover dwell, exactly what a spectrum takeover
+        // needs) and, while held and frames keep arriving, continues down
+        // to SOUND_HOLD_LEVEL. Isolated frames over SILENCE_LEVEL in hiss
+        // never start it.
+        if !Self::within(self.audio.as_ref().map(|(t, _)| *t), now, AUDIO_FRESH) {
+            self.sound_held = false;
+        }
+        if level >= SILENCE_LEVEL {
+            if !Self::within(self.start_level_at, now, AUDIO_FRESH) {
+                self.start_level_since = Some(now);
+            }
+            self.start_level_at = Some(now);
+        }
+        if self.start_level_since.is_some_and(|since| {
+            Self::within(self.start_level_at, now, AUDIO_FRESH)
+                && now.saturating_duration_since(since) >= self.cfg.timings.takeover_dwell
+        }) {
+            self.sound_held = true;
+        }
+        if level < SOUND_HOLD_LEVEL {
+            self.sound_held = false;
+        }
+        let sound = level >= SILENCE_LEVEL || self.sound_held;
+        self.sounding = sound;
+        if sound {
+            self.loud_at = Some(now);
+        }
         let bands = self.gain.step(dt, &raw, sound);
         self.audio = Some((now, bands));
     }
@@ -1023,16 +1094,18 @@ impl Engine {
         if matches!(self.settings.mode, Mode::Ambient | Mode::AmbientPulse) {
             self.read_frame(now);
         }
-        // In sustained silence ambient+pulse shows steady ambient instead of
-        // the pulse floor ([`PULSE_FLOOR`]): capture runs whenever an audio
-        // mode is selected, so silent frames arrive while nothing plays.
-        let pulse_target = match (self.settings.mode, self.fresh_bands(now)) {
-            (Mode::AmbientPulse, Some(b)) if self.sound_recent(now) => {
-                PULSE_FLOOR + (1.0 - PULSE_FLOOR) * bass_energy(b)
-            }
-            _ => 1.0,
+        // Without sound ambient+pulse eases to steady ambient instead of the
+        // pulse floor ([`PULSE_FLOOR`]): capture runs whenever an audio mode
+        // is selected, so silent frames arrive while nothing plays, and a
+        // pause inside music must not dip then snap back (R4).
+        let (pulse_target, taus) = match (self.settings.mode, self.fresh_bands(now)) {
+            (Mode::AmbientPulse, Some(b)) if self.sounding => (
+                PULSE_FLOOR + (1.0 - PULSE_FLOOR) * bass_energy(b),
+                PULSE_TAUS,
+            ),
+            _ => (1.0, PULSE_RESTING_TAUS),
         };
-        self.pulse = smooth_scalar(self.pulse, pulse_target, dt, PULSE_TAUS);
+        self.pulse = smooth_scalar(self.pulse, pulse_target, dt, taus);
 
         let placeholder = Conn::Down {
             next_probe: now,

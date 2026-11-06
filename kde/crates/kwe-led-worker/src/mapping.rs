@@ -218,8 +218,9 @@ impl AutoGain {
     /// Reference floor, `max(raw) × bands` units: 6.4e-3 is the loudest
     /// band of −37 dBFS noise. Quieter material is shown below full scale
     /// instead of being amplified (a frame just above the silence floor
-    /// peaks at ≈ 37 %, digital silence is black); −40 dBFS music still
-    /// reaches ≈ 90 % on its loudest band.
+    /// peaks at ≈ 37 %, digital silence is black). −40 dBFS noise: loudest
+    /// display band ≈ 93 % per frame (peak 99 %), brightest spectrum LED
+    /// ≈ 85 % (216/255; `LED_PROTOCOL_V1.md` §Audio levels).
     pub const FLOOR: f32 = 6.4e-3;
 
     /// The current reference (tests, diagnostics).

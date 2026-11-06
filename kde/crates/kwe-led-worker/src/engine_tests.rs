@@ -153,6 +153,9 @@ enum Signal {
     Noise(f32),
     /// 60 Hz + half-amplitude 120 Hz at this RMS level: bass-heavy music.
     Bass(f32),
+    /// 220 + 0.7·330 + 0.5·440 Hz at this RMS level (dBFS): quiet tonal
+    /// material (the review's swelling-classical reproducer).
+    Chord(f32),
     Silence,
 }
 
@@ -186,6 +189,16 @@ fn frame_of(signal: Signal, k: u64) -> Vec<f32> {
                     let t = (start + i as f32) / RATE;
                     let w = std::f32::consts::TAU * 60.0 * t;
                     (w.sin() + 0.5 * (2.0 * w).sin()) * scale
+                })
+                .collect()
+        }
+        Signal::Chord(db) => {
+            let scale = rms_of(db) / ((1.0f32 + 0.49 + 0.25) / 2.0).sqrt();
+            let start = (k as usize * WINDOW) as f32;
+            (0..WINDOW)
+                .map(|i| {
+                    let w = std::f32::consts::TAU * (start + i as f32) / RATE;
+                    ((220.0 * w).sin() + 0.7 * (330.0 * w).sin() + 0.5 * (440.0 * w).sin()) * scale
                 })
                 .collect()
         }
@@ -269,14 +282,15 @@ fn ambient_pulse_is_steady_ambient_in_silence() {
         c.iter().all(|c| c.r >= 240 && c.g < 10),
         "steady red in silence, got {c:?}"
     );
-    // Loud bass pulses to full, and a quiet moment inside music dims.
+    // A quiet moment inside music eases to steady ambient (review fixes E,
+    // R4: was a dip to the 50 % floor, then a snap back after 3 s).
     r.run_until(9.0, |e, now, _| loud(e, now));
     r.run_until(10.0, |e, now, _| quiet(e, now));
     thread::sleep(Duration::from_millis(100));
     let c = r.stub.controllers()[0].colors[0];
     assert!(
-        (120..200).contains(&c.r),
-        "a quiet moment in music pulses down to the 50 % floor, not dark: {c:?}"
+        c.r >= 235,
+        "a quiet moment in music eases to steady ambient: {c:?}"
     );
     fs::remove_dir_all(dir).ok();
 }
@@ -617,6 +631,7 @@ fn silence_and_hiss_are_silent_but_quiet_music_is_sound() {
         (Signal::Silence, false),
         (Signal::Noise(-80.0), false),
         (Signal::Noise(-60.0), false),
+        (Signal::Noise(-58.0), false),
         (Signal::Bass(-60.0), false),
         (Signal::Noise(-50.0), true),
         (Signal::Bass(-50.0), true),
@@ -735,6 +750,72 @@ fn ambient_pulse_modulates_around_a_lit_ambient_at_real_levels() {
         if !steady {
             assert!(hi - lo >= 40, "beats must visibly pulse: {lo}..{hi}");
         }
+    }
+    fs::remove_dir_all(dir).ok();
+}
+
+/// Review fixes E (R2): quiet tonal material at −48 dBFS RMS swelling
+/// ±10 dB (0.05 Hz; troughs −58 dBFS, under the −56 dBFS start level) is
+/// one takeover and no release over 3 simulated minutes. Before the level
+/// hysteresis: 9 take/release cycles, each showing the user's own lighting
+/// for ≥ 5 s.
+#[test]
+fn quiet_swelling_music_takes_over_once_and_never_releases() {
+    let mut r = Rig::new(Mode::Spectrum, None);
+    r.run_until(180.0, |e, now, s| {
+        let db = -48.0 + 10.0 * (std::f32::consts::TAU * 0.05 * s).sin();
+        play(e, now, Signal::Chord(db));
+    });
+    thread::sleep(Duration::from_millis(100));
+    for dev in 0..2 {
+        let takes = r.count(dev, packet_id::SET_CUSTOM_MODE);
+        let gives = r.count(dev, packet_id::UPDATE_MODE);
+        assert!(takes <= 1, "device {dev}: {takes} takeovers");
+        assert_eq!(gives, 0, "device {dev}: {gives} releases");
+    }
+    assert!(!r.e.status(r.now, 1).audio.silent);
+}
+
+/// Review fixes E (R4): in `ambient+pulse` a pause inside music (2 s of
+/// digital silence) and the end of a track never dip the brightness below
+/// the level it had when the pause began (tolerance [`PULSE_DIP_TOL`]),
+/// and every step from there into steady ambient stays within the resting
+/// smoothing bound ([`PULSE_STEP_MAX`]). Before: a dip to the 50 % floor,
+/// then a 30 ms-attack snap to 100 % after 3 s.
+const PULSE_DIP_TOL: f32 = 0.02;
+const PULSE_STEP_MAX: f32 = 0.1;
+
+#[test]
+fn ambient_pulse_pause_and_track_end_never_dip_or_snap() {
+    let dir = temp_dir("pulse-pause");
+    let frame = dir.join("f.bin");
+    let _w = solid_frame(&frame, [255, 0, 0]);
+    let music = Signal::Noise(-10.0);
+    let mut r = Rig::new(Mode::AmbientPulse, Some(frame));
+    r.run_until(5.0, |e, now, _| play(e, now, music));
+    assert!(r.wait_modes(&[0, 0]));
+    // Each silent stretch: (length s, then music again?).
+    for (len, label) in [(2.0, "2 s pause"), (8.0, "track end")] {
+        r.run_until(r.secs() + 2.0, |e, now, _| play(e, now, music));
+        let start = r.e.pulse;
+        let mut prev = start;
+        let (mut low, mut big) = (start, 0.0f32);
+        let end = r.secs() + len;
+        while r.secs() < end {
+            r.run_until(r.secs() + 0.01, |e, now, _| quiet(e, now));
+            low = low.min(r.e.pulse);
+            big = big.max((r.e.pulse - prev).abs());
+            prev = r.e.pulse;
+        }
+        eprintln!(
+            "{label}: pulse {start:.3} at start, low {low:.3}, largest step {big:.3}, end {prev:.3}"
+        );
+        assert!(
+            low >= start - PULSE_DIP_TOL,
+            "{label}: dipped {start} → {low}"
+        );
+        assert!(big <= PULSE_STEP_MAX, "{label}: step {big}");
+        assert!(prev > 0.99, "{label}: not steady ambient ({prev})");
     }
     fs::remove_dir_all(dir).ok();
 }

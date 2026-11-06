@@ -42,7 +42,9 @@
 # 6742), or a variable whose every assignment in the script is a literal
 # number other than 6742, or a variable the script explicitly refuses to
 # be 6742 (a line comparing it with ==/!=/-eq/-ne against 6742 or a
-# variable assigned 6742). Anything else — arithmetic, command
+# variable assigned 6742 whose comparison guards an abort — `exit`,
+# `return` or `fail` after `&&`/`||` on that line, or in the matching branch
+# of its `if` block; review fixes E, R3). Anything else — arithmetic, command
 # substitution, `${v:-...}`, an unassigned variable — is suspect. The
 # explicit `# led-guard: <why>` marker on the line opts in deliberately.
 set -euo pipefail
@@ -247,17 +249,120 @@ function real_port_var(name,    i) {
     return 1
 }
 
-# Some line of the script compares `name` with 6742 (a refusal check such
-# as `(( port != 6742 )) || exit` or `[[ $port == 6742 ]] && exit`).
-function refused(name,    i, t, other, words, nw, k) {
+# A logical line reduced to code for the refusal check (review fixes E,
+# R3): the trailing comment dropped, quote characters removed, and every
+# character inside quotes other than [A-Za-z0-9_$.{}:-] turned into "_" (so
+# `echo "x; exit"` holds no command `exit`); then `;`, `&&`, `||`, `((`,
+# `))`, `==` and `!=` are spaced out so they are tokens of their own.
+function refusal_code(t,    i, c, q, out, prev, len) {
+    q = ""; out = ""; prev = " "; len = length(t)
+    for (i = 1; i <= len; i++) {
+        c = substr(t, i, 1)
+        if (q != "") {
+            if (c == q) { q = ""; continue }
+            if (c == "\\" && q == "\"") { i++; out = out "_"; continue }
+            out = out (c ~ /[A-Za-z0-9_$.{}:-]/ ? c : "_")
+            continue
+        }
+        if (c == "\\") { i++; out = out "_"; prev = "_"; continue }
+        if (c == "\"" || c == "\047") { q = c; continue }
+        if (c == "#" && prev ~ /[[:space:];|&()]/) break
+        out = out c; prev = c
+    }
+    gsub(/&&/, " \\&\\& ", out); gsub(/\|\|/, " || ", out); gsub(/;/, " ; ", out)
+    gsub(/\(\(/, " (( ", out); gsub(/\)\)/, " )) ", out)
+    gsub(/==/, " == ", out); gsub(/!=/, " != ", out)
+    return out
+}
+
+# Tokens of refusal_code(lines[i]) appended to tk[] from index n + 1, then
+# a ";" (a newline ends a command); returns the new count.
+function refusal_tokens(i, tk, n,    w, m, k) {
+    m = split(refusal_code(lines[i]), w, /[[:space:]]+/)
+    for (k = 1; k <= m; k++) if (w[k] != "") tk[++n] = w[k]
+    tk[++n] = ";"
+    return n
+}
+
+function abort_word(x) { return x == "exit" || x == "return" || x == "fail" }
+function command_start(x) {
+    return x == "" || x == ";" || x == "&&" || x == "||" || x == "then" \
+        || x == "else" || x == "do" || x == "{"
+}
+function opens(x) { return x == "if" || x == "case" || x == "while" || x == "until" || x == "for" }
+function closes(x) { return x == "fi" || x == "esac" || x == "done" }
+
+# Does tk[from..to] run exit/return/fail as one of its own commands (at its
+# own nesting level, not inside a nested if/while/case or a subshell)?
+function aborts(tk, from, to,    k, depth) {
+    depth = 0
+    for (k = from; k <= to; k++) {
+        if (opens(tk[k]) && command_start(k > from ? tk[k - 1] : "")) depth++
+        else if (closes(tk[k])) depth--
+        else if (depth == 0 && abort_word(tk[k]) && command_start(k > from ? tk[k - 1] : "")) return 1
+    }
+    return 0
+}
+
+# Line `i` compares something with 6742 (token `c` is the operator): does
+# that comparison guard an abort taken exactly when the value is 6742?
+#   [[ $p == 6742 ]] && exit / && { ...; exit 1; }   (( p != REAL )) || fail
+#   if [[ $p == 6742 ]]; then ... exit ...; fi       (!= : in the else part)
+# A leading `!` on the test (`! [[`, `if !`) flips it.
+function guards_abort(i, tk, n, c,    eq, k, start, depth, then_at, else_at, fi_at, j, end) {
+    eq = (tk[c] == "==" || tk[c] == "-eq")
+    # Start of the simple-command list holding the comparison.
+    for (start = c; start > 1 && tk[start - 1] != ";" && tk[start - 1] != "then" \
+        && tk[start - 1] != "do" && tk[start - 1] != "else"; start--) ;
+    if (tk[start] == "if" || tk[start] == "elif") {
+        if (tk[start + 1] == "!") eq = !eq
+        # Pull in the following logical lines until the matching `fi`.
+        for (j = i + 1; j <= nlines && j <= i + 50; j++) n = refusal_tokens(j, tk, n)
+        depth = 0; then_at = 0; else_at = 0; fi_at = 0
+        for (k = start; k <= n; k++) {
+            if (opens(tk[k]) && command_start(tk[k - 1])) { depth++; continue }
+            if (tk[k] == "elif" && depth == 1) return 0
+            if (tk[k] == "then" && depth == 1 && !then_at) then_at = k
+            else if (tk[k] == "else" && depth == 1) else_at = k
+            else if (closes(tk[k])) { if (--depth == 0) { fi_at = k; break } }
+        }
+        if (!then_at || !fi_at) return 0
+        if (eq) return aborts(tk, then_at + 1, (else_at ? else_at : fi_at) - 1)
+        return else_at ? aborts(tk, else_at + 1, fi_at - 1) : 0
+    }
+    if (tk[start] == "!") eq = !eq
+    # The test, then its first && / ||, then exactly one abort or a { } group.
+    for (k = c + 1; k <= n && tk[k] != "&&" && tk[k] != "||"; k++)
+        if (tk[k] == ";") return 0
+    if (k > n || (tk[k] == "&&") != eq) return 0
+    k++
+    if (tk[k] == "{") {
+        for (end = k + 1; end <= n && tk[end] != "}"; end++) ;
+        return end <= n && aborts(tk, k + 1, end - 1)
+    }
+    return abort_word(tk[k])
+}
+
+# Some line of the script refuses `name` = 6742: it compares `name` with
+# ==/!=/-eq/-ne against 6742 (or a variable assigned 6742) AND the
+# comparison guards an abort (review fixes E, R3: a comparison that only
+# prints a note, e.g. `[ "$p" -eq 6742 ] && echo note`, used to pass), as
+# `(( port != REAL )) || exit` or `if [[ $port == 6742 ]]; then exit; fi`.
+function refused(name,    i, t, words, nw, k, tk, n, c, against) {
     for (i = 1; i <= nlines; i++) {
-        t = lines[i]
+        t = refusal_code(lines[i])
         if (t !~ ("(^|[^A-Za-z_0-9])" name "([^A-Za-z_0-9]|$)")) continue
         if (t !~ /(==|!=|-eq|-ne)/) continue
-        if (t ~ /(^|[^0-9])0*6742([^0-9]|$)/) return 1
+        against = (t ~ /(^|[^0-9#])0*6742([^0-9]|$)/)
         nw = split(t, words, /[^A-Za-z_0-9]+/)
-        for (k = 1; k <= nw; k++)
-            if (words[k] != name && words[k] != "" && real_port_var(words[k])) return 1
+        for (k = 1; k <= nw && !against; k++)
+            if (words[k] != name && words[k] != "" && real_port_var(words[k])) against = 1
+        if (!against) continue
+        split("", tk)
+        n = refusal_tokens(i, tk, 0)
+        for (c = 1; c <= n; c++)
+            if (tk[c] ~ /^(==|!=|-eq|-ne)$/) break
+        if (c <= n && guards_abort(i, tk, n, c)) return 1
     }
     return 0
 }
@@ -392,6 +497,16 @@ self_test() {
         $'target/debug/kwe-daemon --socket s --no-led-worker=false'
         $'echo "--no-led-worker"; target/debug/kwe-daemon --socket s'
         $'if true; then target/debug/kwe-daemon --socket s; fi'
+        # Review fixes E (R3): a comparison with 6742 that does not abort
+        # (the verifier's e1, e2, e14), the wrong polarity, a subshell exit.
+        $'PORT=${OPENRGB_PORT:-6742}\n[ "$PORT" -eq 6742 ] && echo "note: using the real server"\ntarget/debug/kwe-daemon --led-sdk-port "$PORT"'
+        $'PORT=${OPENRGB_PORT:-6742}\nif [ "$PORT" != 6742 ]; then echo stub; fi\ntarget/debug/kwe-daemon --led-sdk-port "$PORT" &'
+        $'read -r PORT < portfile\n[[ $PORT == 6742 ]] && echo hmm\ntarget/debug/kwe-daemon --led-sdk-port "$PORT"'
+        $'read -r P < f\n[[ $P != 6742 ]] && exit 1\ntarget/debug/kwe-daemon --led-sdk-port "$P"'
+        $'read -r P < f\n[[ $P == 6742 ]] && (exit 1)\ntarget/debug/kwe-daemon --led-sdk-port "$P"'
+        $'read -r P < f\n[[ $P == 6742 ]] && echo "x; exit 1"\ntarget/debug/kwe-daemon --led-sdk-port "$P"'
+        $'read -r P < f\nif [[ $P == 6742 ]]; then echo real; else exit 1; fi\ntarget/debug/kwe-daemon --led-sdk-port "$P"'
+        $'read -r P < f\nif [[ $P == 6742 ]]; then\n  if false; then exit 1; fi\nfi\ntarget/debug/kwe-daemon --led-sdk-port "$P"'
         $'"target/debug/kwe-daemon" --socket s'
         $'d=target/debug; "$d/kwe-daemon" --socket s'
     )
@@ -430,6 +545,11 @@ self_test() {
         $'for binary in kwe-daemon kwe kwe-led-worker; do [[ -x "target/debug/$binary" ]]; done'
         $'systemctl --user is-active kwe-daemon'
         $'fail "kwe-daemon did not start: target/debug/kwe-daemon"'
+        # Review fixes E (R3): refusals that do abort.
+        $'read -r P < f\n[[ $P == 6742 ]] && { echo "real port" >&2; exit 2; }\ntarget/debug/kwe-daemon --led-sdk-port "$P"'
+        $'read -r P < f\nif [ "$P" != 6742 ]; then\n  echo stub\nelse\n  exit 1\nfi\ntarget/debug/kwe-daemon --led-sdk-port "$P"'
+        $'readonly REAL_SDK_PORT=6742\nsdk_port="$(pick)"\n(( 10#$sdk_port != REAL_SDK_PORT )) || fail "refusing $REAL_SDK_PORT"\ntarget/debug/kwe-daemon --led-sdk-port "$sdk_port" &'
+        $'if [[ -n "${P:-}" ]]; then\n    if [[ ! "$P" =~ ^[0-9]{1,5}$ ]] || (( 10#$P == 6742 )); then\n        echo "real port" >&2\n        exit 2\n    fi\nfi\ntarget/debug/kwe-daemon --led-sdk-port "$P" &'
     )
     for snippet in "${bad[@]}"; do
         i=$((i + 1)); name="$dir/bad-$i.sh"

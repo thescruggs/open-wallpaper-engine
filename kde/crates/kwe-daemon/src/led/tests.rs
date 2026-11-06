@@ -416,6 +416,44 @@ fn the_default_stop_grace_meets_the_worker_contract() {
     assert!(Timings::default().stop_grace >= Duration::from_secs(4));
 }
 
+/// Review fixes E (R1): the shutdown restore pass is budgeted from
+/// `begin_shutdown` (where the worker's stop grace starts), not from
+/// `finish_shutdown` (which runs after the renderers stopped). A wedged
+/// worker SIGKILLed at its grace leaves the pass 0.5 s whatever the
+/// renderers took; the old code (budget from `finish_shutdown`'s start)
+/// gave `T + 0.5 s`, e.g. 3 s for T = 3 s → LED shutdown 7 s > 5 s.
+#[test]
+fn shutdown_restore_pass_is_budgeted_from_the_start_of_shutdown() {
+    let ms = Duration::from_millis;
+    let t0 = Instant::now();
+    let grace = STOP_GRACE;
+    for render_ms in [0, 1000, 3000, 3900] {
+        // The worker is reaped at its SIGKILL (grace), finish_shutdown having
+        // begun at `render_ms` after the renderers stopped.
+        let reaped = t0 + grace.max(ms(render_ms));
+        let budget = shutdown_restore_budget(t0, grace, reaped);
+        assert_eq!(budget, ms(500), "renderers took {render_ms} ms");
+        assert!(reaped + budget <= t0 + grace + ms(500));
+    }
+    // A worker that exited promptly leaves the rest, capped at the limit.
+    assert_eq!(
+        shutdown_restore_budget(t0, grace, t0 + ms(100)),
+        RESTORE_PASS_LIMIT
+    );
+    assert_eq!(shutdown_restore_budget(t0, grace, t0 + ms(2000)), ms(2500));
+    // Past the bound (renderers took longer than the grace): the floor.
+    assert_eq!(shutdown_restore_budget(t0, grace, t0 + ms(6000)), ms(500));
+
+    // `finish_shutdown` calls `begin_shutdown` again: the first stamp stays.
+    let mut m = LedManager::new(None, LedSettings::default());
+    m.begin_shutdown();
+    let first = m.shutdown_started.expect("stamped");
+    let earlier = first.checked_sub(ms(3000)).unwrap_or(first);
+    m.shutdown_started = Some(earlier);
+    m.begin_shutdown();
+    assert_eq!(m.shutdown_started, Some(earlier));
+}
+
 #[test]
 fn status_lines_are_read_latest_wins_bounded_and_staleness_is_reported_then_restarted() {
     let root = temporary_directory("status");
