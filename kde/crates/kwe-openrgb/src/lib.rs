@@ -32,7 +32,7 @@ pub mod stub;
 #[cfg(test)]
 mod tests;
 
-pub use client::{Client, ClientConfig, DEFAULT_PORT, PollOutcome, RestoreReport};
+pub use client::{Client, ClientConfig, DEFAULT_PORT, PollOutcome, RestoreReport, SavedMode};
 pub use error::Error;
 pub use model::{
     Controller, ControllerId, DeviceKey, Led, MatrixMap, Mode, Rgb, Segment, Zone, zone_type,
@@ -64,6 +64,11 @@ pub mod limits {
     /// Unrelated server packets skipped while waiting for one reply, and
     /// packets drained per `poll_events` call.
     pub const MAX_UNSOLICITED: usize = 64;
+    /// Unrelated packets skipped while waiting for one reply. Larger than
+    /// `MAX_UNSOLICITED` because a server that ACKs every update can still
+    /// be emitting a backlog of ACKs when a request is sent; the per-reply
+    /// deadline bounds the time either way.
+    pub const MAX_SKIPPED_PER_REPLY: usize = 4096;
     pub const MAX_CLIENT_NAME_BYTES: usize = 64;
     /// Upper bound for every configurable timeout.
     pub const MAX_TIMEOUT_MS: u64 = 30_000;

@@ -1,0 +1,13 @@
+[package]
+name = "kwe-led-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Wire types for kwe-led-worker: stdin control lines and stdout status lines (no I/O, no network code)"
+
+[dependencies]
+kwe-input-protocol = { path = "../../kwe-input-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

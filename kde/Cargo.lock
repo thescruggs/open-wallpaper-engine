@@ -320,6 +320,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "kwe-led-protocol"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "kwe-input-protocol",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "kwe-led-worker"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "clap",
+ "kwe-frame-protocol",
+ "kwe-input-protocol",
+ "kwe-led-protocol",
+ "kwe-openrgb",
+ "libc",
+ "serde_json",
+]
+
+[[package]]
 name = "kwe-mpv"
 version = "0.1.0-alpha.1"
 

@@ -60,11 +60,17 @@ the live probe**): little-endian integers; colour = R, G, B, pad;
   re-read the controller
 - `client.update_leds(id, &[Rgb])`, `client.update_zone_leds(id, zone, &[Rgb])`
   — count must match exactly
+- `client.saved_modes()`, `client.take_saved_modes()`,
+  `client.adopt_saved_modes(Vec<SavedMode>)` *(added in L2)* — export the
+  remembered pre-control modes from a lost connection and seed them into the
+  next one, so a reconnect to a server whose devices are still in per-LED
+  mode does not re-save that mode as the "previous" one. No I/O; adopt keeps
+  the first entry per `DeviceKey` and stays capped at 128.
 - `client.update_mode(id, index, &Mode)`, `client.restore(id) -> Result<bool>`,
   `client.restore_all() -> Vec<RestoreReport>` (best effort; matches devices
   by `DeviceKey {name, vendor, serial, location}`, re-enumerates first if
   the list changed)
-- Types: `Controller`, `ControllerId`, `DeviceKey`, `Zone`, `zone_type`,
+- Types: `Controller`, `ControllerId`, `DeviceKey`, `SavedMode`, `Zone`, `zone_type`,
   `MatrixMap`, `Segment`, `Led`, `Mode`, `Rgb` (`parse_hex`, `Display`)
 - Every device-targeting call first drains pending server packets, so a
   queued device-list update is seen before a stale index is used.
@@ -87,7 +93,8 @@ the live probe**): little-endian integers; colour = R, G, B, pad;
 | segments / zone | 64 |
 | matrix cells / zone | 16384 (`height*width` must equal the payload) |
 | string length | 4096 bytes (NUL incl.); invalid UTF-8 replaced |
-| unrelated packets skipped per reply / drained per poll | 64 |
+| unrelated packets skipped while waiting for one reply | 4096 (`MAX_SKIPPED_PER_REPLY`; the per-reply deadline bounds time) |
+| unrelated packets drained per poll | 64 |
 | remembered modes | 128 |
 
 Every count is also checked against the bytes left in the payload before
@@ -132,3 +139,16 @@ No path panics on server input (mutation and truncation tests).
 - `cargo run -p kwe-openrgb --features stub --example stub_server -- [--port N]`
   — prints `{"port":N}`, runs until stdin EOF, then prints the received
   packet ids, client names, and final active modes (for smoke scripts).
+
+## Changes in L2 (2026-11-05)
+
+- Additive: `SavedMode` is public; `saved_modes()`, `take_saved_modes()`,
+  `adopt_saved_modes()` (see above), with a unit test
+  (`saved_modes_carry_across_connections`).
+- Fix: waiting for a reply skipped at most 64 unrelated packets, so a server
+  that ACKs every update and was still behind when a request was sent (500
+  ACKed updates, then `take_control`) failed with `TooManyUnsolicited` —
+  observed as an intermittent failure of the existing
+  `acks_and_notifications_are_drained_not_fatal` test (1 of 3 runs on
+  unmodified HEAD `7129f14`). The skip cap is now `MAX_SKIPPED_PER_REPLY = 4096`;
+  the per-reply deadline still bounds the time. 15/15 runs green after.

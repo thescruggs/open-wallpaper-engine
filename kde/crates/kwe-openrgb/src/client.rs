@@ -81,11 +81,15 @@ pub struct RestoreReport {
     pub result: Result<()>,
 }
 
-#[derive(Debug, Clone)]
-struct SavedMode {
-    key: DeviceKey,
-    index: usize,
-    mode: Mode,
+/// A device's mode as it was before [`Client::take_control`] switched it
+/// to per-LED control. Exportable so a caller that loses its connection can
+/// carry the originals into the next one ([`Client::adopt_saved_modes`])
+/// instead of re-saving the per-LED mode it left behind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedMode {
+    pub key: DeviceKey,
+    pub index: usize,
+    pub mode: Mode,
 }
 
 pub struct Client {
@@ -410,6 +414,32 @@ impl Client {
         self.saved.len()
     }
 
+    /// The remembered pre-control modes, in the order they were saved.
+    pub fn saved_modes(&self) -> &[SavedMode] {
+        &self.saved
+    }
+
+    /// Removes and returns every remembered mode without restoring anything
+    /// (no I/O; works on a lost connection).
+    pub fn take_saved_modes(&mut self) -> Vec<SavedMode> {
+        std::mem::take(&mut self.saved)
+    }
+
+    /// Seeds remembered modes, typically taken from a previous connection.
+    /// An entry for a device that already has one is ignored (the first
+    /// saved mode wins, like [`Client::take_control`]); the set stays
+    /// capped at `MAX_CONTROLLERS`. No I/O.
+    pub fn adopt_saved_modes(&mut self, modes: Vec<SavedMode>) {
+        for m in modes {
+            if self.saved.len() >= limits::MAX_CONTROLLERS as usize {
+                break;
+            }
+            if !self.saved.iter().any(|s| s.key == m.key) {
+                self.saved.push(m);
+            }
+        }
+    }
+
     /// Restores this device's remembered mode. `Ok(false)` when nothing
     /// was saved for it.
     pub fn restore(&mut self, id: ControllerId) -> Result<bool> {
@@ -519,7 +549,7 @@ impl Client {
     }
 
     fn read_reply(&mut self, expect: u32, deadline: Instant) -> Result<Packet> {
-        for _ in 0..=limits::MAX_UNSOLICITED {
+        for _ in 0..=limits::MAX_SKIPPED_PER_REPLY {
             let packet = self.recv(deadline)?;
             if packet.id == expect {
                 return Ok(packet);
@@ -528,7 +558,7 @@ impl Client {
         }
         self.poisoned = true;
         Err(Error::TooManyUnsolicited {
-            max: limits::MAX_UNSOLICITED,
+            max: limits::MAX_SKIPPED_PER_REPLY,
         })
     }
 

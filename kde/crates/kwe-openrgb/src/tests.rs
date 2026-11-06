@@ -317,6 +317,30 @@ fn take_control_then_restore_previous_mode() {
 }
 
 #[test]
+fn saved_modes_carry_across_connections() {
+    let s = stub(StubConfig::default());
+    let mut first = connected(&s);
+    first.take_control(ControllerId::new(0)).unwrap();
+    let carried = first.take_saved_modes();
+    assert_eq!(carried.len(), 1);
+    assert_eq!(carried[0].mode.name, "Rainbow");
+    assert_eq!(first.saved_mode_count(), 0);
+    drop(first);
+    // The device is still in Direct; a fresh connection that adopts the
+    // carried originals must not re-save Direct as the "previous" mode.
+    let mut second = connected(&s);
+    second.adopt_saved_modes(carried.clone());
+    second.adopt_saved_modes(carried);
+    assert_eq!(second.saved_mode_count(), 1, "adopt deduplicates by key");
+    second.take_control(ControllerId::new(0)).unwrap();
+    assert_eq!(second.saved_modes()[0].mode.name, "Rainbow");
+    let reports = second.restore_all();
+    assert!(reports.iter().all(|r| r.result.is_ok()));
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(s.controllers()[0].active_mode, 2);
+}
+
+#[test]
 fn restore_all_matches_devices_by_key_after_reorder() {
     // Distinct original modes: a stale index would restore the wrong one.
     let mut strip = sample_controller("Stub Strip", &[("A", 4), ("B", 3)]);

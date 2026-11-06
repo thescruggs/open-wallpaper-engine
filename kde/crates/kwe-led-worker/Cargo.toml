@@ -1,0 +1,19 @@
+[package]
+name = "kwe-led-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Isolated OpenRGB LED sync worker: wallpaper frame and audio to LED colours (loopback SDK only)"
+
+[dependencies]
+clap.workspace = true
+kwe-frame-protocol = { path = "../kwe-frame-protocol" }
+kwe-input-protocol = { path = "../kwe-input-protocol" }
+kwe-led-protocol = { path = "protocol" }
+kwe-openrgb = { path = "../kwe-openrgb" }
+libc.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+kwe-openrgb = { path = "../kwe-openrgb", features = ["stub"] }

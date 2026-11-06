@@ -12,6 +12,8 @@ members = [
     "crates/kwe-daemon",
     "crates/kwe-frame-protocol",
     "crates/kwe-input-protocol",
+    "crates/kwe-led-worker",
+    "crates/kwe-led-worker/protocol",
     "crates/kwe-mpv",
     "crates/kwe-openrgb",
     "crates/kwe-report-protocol",

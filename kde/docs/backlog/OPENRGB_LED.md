@@ -39,7 +39,26 @@
     `-- --set-color FF0000 --hold-ms 1500`.
   - Maintainer gate still open: dependency/provenance approval (here: no
     new dependency; protocol-compatible ledger entry).
-- L2–L5: pending.
+- **L2 — done (uncommitted, 2026-11-05), live check pending.**
+  `crates/kwe-led-worker` (binary + lib) and nested wire crate
+  `crates/kwe-led-worker/protocol` (`kwe-led-protocol`, serde only — the
+  daemon depends on this, never on the client). Contract:
+  `docs/LED_PROTOCOL_V1.md` (CLI, stdin control lines, stdout `led_status`
+  lines, states, exit codes, bounds, restore). Unit + stub-server
+  integration tests. Measured ≈0.1 % of one core at 10 Hz on a 1080p frame.
+  - Plan corrections found: (1) the stop grace must be ≥ 4 s, not the audio
+    worker's 1 s (bounded OpenRGB op + 1.5 s restore); (2) the worker must
+    NOT get a private network namespace (loopback would not be the host's);
+    (3) the client's reply wait gave up after 64 queued ACKs — fixed in
+    `kwe-openrgb` (it was the intermittent failure of an existing test);
+    (4) remembered modes must survive a dropped connection, otherwise a
+    reconnect re-saves the per-LED mode — `adopt_saved_modes` added;
+    (5) "Worker runs only while … a renderer is live" (L3 below) is not
+    needed for correctness: the worker holds then fades on `led_frame null`
+    and idles cheaply; L3 may still choose it.
+  - Live check: SDK server not listening at 2026-11-05 (`ss -ltn` shows no
+    6742) → `kwe-led-worker --probe` and the ≤10 s ambient run are pending.
+- L3–L5: pending.
 
 Requested 2026-08-29: drive OpenRGB-controlled devices (keyboard, case
 LEDs, strips) from the running wallpaper and/or the captured system
