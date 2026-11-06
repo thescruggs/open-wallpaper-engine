@@ -33,6 +33,16 @@ qt_add_executable(kwe-settings-client-test
 target_link_libraries(kwe-settings-client-test PRIVATE Qt6::Core Qt6::Network Qt6::Test)
 add_test(NAME kwe-settings-client-test COMMAND kwe-settings-client-test)
 
+# OpenRGB L4: led.status / led.reprobe / settings.set {led} against a fake
+# daemon socket.
+qt_add_executable(kwe-led-sync-client-test
+    ledsyncclienttest.cpp
+    ../src/ledsyncclient.cpp
+    ../src/ledsyncclient.h
+)
+target_link_libraries(kwe-led-sync-client-test PRIVATE Qt6::Core Qt6::Network Qt6::Test)
+add_test(NAME kwe-led-sync-client-test COMMAND kwe-led-sync-client-test)
+
 qt_add_executable(kwe-renderer-defaults-test
     rendererdefaultstest.cpp
     ../src/rendererdefaults.cpp

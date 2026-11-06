@@ -95,6 +95,43 @@ the primary message. Repeated failures add a `Quarantined` badge and explain
 what will permit another automatic test (content, renderer, driver, or settings
 change).
 
+### LED sync (Settings, OpenRGB slice L4)
+
+OpenRGB is optional (maintainer, 2026-11-05): LED sync is on by default and
+used whenever OpenRGB's SDK server answers on loopback. Without it the
+section is calm information, never an error. The section has an enable
+switch, a mode picker (Ambient / Spectrum / Ambient + pulse, each with a
+one-line description; the switch covers "off", so Off is not a picker entry
+— a daemon whose stored mode is `off` shows "Off" until another mode is
+chosen), a brightness slider (0–100 %, steps of 5), an update-rate spin box
+(1–20 Hz) and one checkbox per detected device (name, vendor, LED count).
+`led.status` is polled every 3 s only while Settings is visible.
+
+Every state has an icon and text:
+
+| Daemon state | Icon | Text | Action |
+|---|---|---|---|
+| `disabled` | stop | LED sync is off — turn it on to light up OpenRGB devices | — |
+| `worker_unavailable` / `not_installed` | warning | The LED sync helper is missing; reinstalling restores it | Check again |
+| `worker_unavailable` / `restart_budget_exhausted` | warning | The helper kept stopping and was paused | Check again |
+| `worker_unavailable` / `not_configured` | information | Not available in this session (`--no-led-worker`) | — |
+| `starting`, `connecting` | spinner | Starting LED sync… / Restarting… / Restoring your lighting… / Looking for OpenRGB… | — |
+| `server_absent` (normal) | information | OpenRGB's SDK server is not running; LED sync is optional; OpenRGB → SDK Server → Start Server, or `openrgb --server`; connects by itself | Check again |
+| `active` | success | Syncing N devices with OpenRGB; M found; SDK protocol version | — |
+| `off` / `paused` | pause | Paused while a fullscreen app covers the desktop or the displays are off | — |
+| `off` / none | stop | Mode is Off; devices keep their own lighting | — |
+| `degraded` | warning | LED sync is having trouble: reason in plain words; keeps retrying | Check again |
+
+"Check again" calls `led.reprobe`; while the daemon's rate limit runs (and
+for 2 s after an accepted call) the button is disabled, never an error.
+With an audio mode selected and no fresh audio, an information message says
+no audio is reaching LED sync right now (audio capture may be off, or no
+wallpaper is running). An older daemon without `led.*` shows "LED sync needs
+a newer wallpaper service"; an unreachable daemon shows that the state is
+unknown and is re-checked while the page is open. A rejected write shows a
+warning with the daemon's reason and the controls return to the daemon's
+values.
+
 ## Compatibility language
 
 Use consistent states everywhere:

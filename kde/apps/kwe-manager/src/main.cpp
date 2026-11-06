@@ -14,6 +14,7 @@
 #include "playlistcontroller.h"
 #include "rendererdefaults.h"
 #include "settingsclient.h"
+#include "ledsyncclient.h"
 
 #include <QCommandLineParser>
 #include <QGuiApplication>
@@ -76,7 +77,13 @@ int main(int argc, char *argv[]) {
         QStringLiteral("Command that starts the daemon user service when its socket is absent (development only)"),
         QStringLiteral("path"));
     parser.addOption(daemonActivationOption);
+    QCommandLineOption startPageOption(
+        QStringLiteral("start-page"),
+        QStringLiteral("Page shown first: installed, workshop, settings, or led (Settings scrolled to LED sync; development and screenshots)"),
+        QStringLiteral("page"));
+    parser.addOption(startPageOption);
     parser.process(application);
+    const QString startPage = parser.value(startPageOption);
 
     QString socketPath = parser.value(socketOption);
     if (socketPath.isEmpty()) {
@@ -121,6 +128,9 @@ int main(int argc, char *argv[]) {
     RendererDefaults rendererDefaults;
     // Daemon-global settings (settings.get/set): the wallpaper-audio switch.
     SettingsClient settingsClient(socketPath);
+    // OpenRGB L4: LED sync state (led.status, polled only while the Settings
+    // page is visible), "Check again" (led.reprobe) and the led settings.
+    LedSyncClient ledSync(socketPath);
     // F4: "Report rendering issue" — a local diagnostic bundle the
     // maintainer records by hand, written under ~/.local/share/kwe/reports/.
     // Nothing here is uploaded anywhere.
@@ -178,6 +188,8 @@ int main(int argc, char *argv[]) {
     engine.rootContext()->setContextProperty(QStringLiteral("rendererDefaults"), &rendererDefaults);
     engine.rootContext()->setContextProperty(QStringLiteral("settingsClient"), &settingsClient);
     engine.rootContext()->setContextProperty(QStringLiteral("issueReporter"), &issueReporter);
+    engine.rootContext()->setContextProperty(QStringLiteral("ledSync"), &ledSync);
+    engine.rootContext()->setContextProperty(QStringLiteral("startPage"), startPage);
     engine.load(QUrl(QStringLiteral("qrc:/qt/qml/org/kde/kwe/qml/Main.qml")));
     if (engine.rootObjects().isEmpty()) return 1;
     client.refresh();

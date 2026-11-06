@@ -19,6 +19,25 @@ Kirigami.ApplicationWindow {
 
     pageStack.initialPage: installedPage
 
+    // --start-page: installed (default), workshop, settings, or led
+    // (Settings scrolled to LED sync). Used for screenshots and smokes.
+    Component.onCompleted: {
+        if (startPage === "workshop" || startPage === "settings" || startPage === "led") {
+            while (pageStack.depth > 0)
+                pageStack.pop()
+            pageStack.push(startPage === "workshop" ? workshopPage : settingsPage)
+            if (startPage === "led")
+                ledScrollTimer.start()
+        }
+    }
+
+    // The section's position is known once the page has been laid out.
+    Timer {
+        id: ledScrollTimer
+        interval: 1500
+        onTriggered: settingsPage.showLedSync()
+    }
+
     Kirigami.Page {
         id: installedPage
         visible: false

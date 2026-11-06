@@ -101,8 +101,35 @@
     whole cgroup at once, and the worker's worst case is ≈ 3.3 s.
   - Live check: 6742 not listening at 2026-11-06 (`ss -ltn`) → the real
     `--probe` and ≤ 10 s run are still pending (same as L1/L2).
-- L4–L5: pending. L4 consumes `led.status` / `led.reprobe` /
-  `settings.*.led` exactly as documented in `SUPERVISOR_API_V1.md`.
+- **L4 — done (uncommitted, 2026-11-06), live check pending.** Manager
+  Settings → "LED sync" (`apps/kwe-manager/qml/LedSyncSection.qml`,
+  `src/ledsyncclient.{h,cpp}`, context property `ledSync`; states and
+  wording in `docs/UX_DESIGN.md` §LED sync). Consumes `led.status` /
+  `led.reprobe` / `settings.set {led}` exactly as documented; C++ client
+  tests against a fake daemon (`tests/ledsyncclienttest.cpp`); offscreen
+  screenshots against a daemon from this tree with the stub SDK server.
+  - Design choices where the plan was open: (1) the switch covers "off", so
+    the mode picker lists only Ambient / Spectrum / Ambient + pulse; a
+    stored `off` shows "Off" in the picker; (2) brightness/rate edits are
+    merged and debounced 300 ms into one `settings.set`, discrete edits
+    (switch, mode, device) are sent at once, all with only the changed
+    `led` fields; (3) a device checkbox writes the whole
+    `disabled_devices` list from the effective list, so ids of devices
+    not connected right now stay disabled; (4) a write that fails to reach
+    the daemon is not retried (unlike the audio switch): the control
+    returns to the last confirmed value and the page shows the daemon as
+    unreachable; (5) "Check again" is disabled for 2 s after an accepted
+    call (the daemon's limit) and for `retry_after_ms` after
+    `rate_limited`; (6) the audio hint shows only in `active`/`degraded`
+    with an audio mode and `worker_status.audio.fresh == false`; (7) new
+    `kwe-manager --start-page installed|workshop|settings|led` for
+    screenshots and deep links.
+  - Contract notes for later slices: `led.reprobe` documents
+    `retry_after_ms` only for `rate_limited` (the UI uses a 1 s cooldown
+    for `worker_restarting`); the stock unit still runs without
+    `--audio-capture`, so on a stock install audio modes show the
+    no-audio hint (L3 correction 1).
+- L5: pending.
 
 Requested 2026-08-29: drive OpenRGB-controlled devices (keyboard, case
 LEDs, strips) from the running wallpaper and/or the captured system

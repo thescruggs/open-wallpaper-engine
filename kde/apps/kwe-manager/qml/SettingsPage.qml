@@ -19,6 +19,25 @@ Kirigami.ScrollablePage {
         { kind: "web", label: qsTr("Web renderer") }
     ]
 
+    // OpenRGB L4: poll led.status only while this page is shown (same
+    // visibility gating as the details pane's permission refresh).
+    Timer {
+        interval: 3000
+        repeat: true
+        triggeredOnStart: true
+        running: settingsPage.visible
+        onTriggered: ledSync.refresh()
+    }
+
+    // Leaving the page sends a debounced slider edit right away.
+    onVisibleChanged: if (!visible) ledSync.flush()
+
+    // Brings the LED sync section into view (--start-page led).
+    function showLedSync() {
+        settingsPage.flickable.contentY = Math.max(0, Math.min(ledSection.y,
+            settingsPage.flickable.contentHeight - settingsPage.flickable.height));
+    }
+
     ColumnLayout {
         spacing: Kirigami.Units.largeSpacing
 
@@ -88,6 +107,11 @@ Kirigami.ScrollablePage {
             type: Kirigami.MessageType.Error
             visible: settingsClient.errorMessage !== ""
             text: settingsClient.errorMessage
+        }
+
+        LedSyncSection {
+            id: ledSection
+            Layout.fillWidth: true
         }
 
         Kirigami.Heading {

@@ -24,6 +24,8 @@ qt_add_executable(kwe-manager
     src/rendererdefaults.h
     src/settingsclient.cpp
     src/settingsclient.h
+    src/ledsyncclient.cpp
+    src/ledsyncclient.h
 )
 
 # WallpaperSelection is a pragma Singleton; the generated qmldir must
@@ -72,6 +74,7 @@ qt_add_qml_module(kwe-manager
         qml/GalleryPage.qml
         qml/PlaylistPanel.qml
         qml/SettingsPage.qml
+        qml/LedSyncSection.qml
         qml/SteamSignInCard.qml
         qml/RemoteItemCard.qml
         qml/WorkshopBrowsePage.qml
