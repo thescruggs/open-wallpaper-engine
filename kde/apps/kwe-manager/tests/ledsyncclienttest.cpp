@@ -475,6 +475,35 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(client.canReprobe(), 1500);
     }
 
+    void reprobeWhileRestartingHonoursRetryAfter() {
+        LedSyncClient client(m_socketPath);
+        client.refresh();
+        QTRY_COMPARE(client.support(), QStringLiteral("ready"));
+        // The daemon names the wait (review fixes B): the button stays
+        // disabled for retry_after_ms, not the old fixed 1 s.
+        m_daemon.reprobeReply = QJsonObject{{QStringLiteral("accepted"), false},
+                                            {QStringLiteral("action"), QJsonValue::Null},
+                                            {QStringLiteral("reason"), QStringLiteral("worker_restarting")},
+                                            {QStringLiteral("retry_after_ms"), 2500}};
+        client.reprobe();
+        QTRY_COMPARE(m_daemon.reprobeCalls, 1);
+        QTest::qWait(1500);
+        QVERIFY2(!client.canReprobe(), "still inside retry_after_ms");
+        QVERIFY(client.errorMessage().isEmpty());
+        QTRY_VERIFY_WITH_TIMEOUT(client.canReprobe(), 2500);
+
+        // An older daemon without the field: the 1 s fallback.
+        m_daemon.reprobeReply = QJsonObject{{QStringLiteral("accepted"), false},
+                                            {QStringLiteral("action"), QJsonValue::Null},
+                                            {QStringLiteral("reason"), QStringLiteral("worker_restarting")},
+                                            {QStringLiteral("retry_after_ms"), QJsonValue::Null}};
+        client.reprobe();
+        QTRY_COMPARE(m_daemon.reprobeCalls, 2);
+        QTest::qWait(150);
+        QVERIFY(!client.canReprobe());
+        QTRY_VERIFY_WITH_TIMEOUT(client.canReprobe(), 1500);
+    }
+
     void olderDaemonWithoutLedSupport() {
         m_daemon.legacy = true;
         LedSyncClient client(m_socketPath);

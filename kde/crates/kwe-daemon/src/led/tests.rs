@@ -362,12 +362,21 @@ fn a_worker_that_never_reads_stdin_never_blocks_the_audio_tee() {
 fn a_worker_ignoring_sigterm_is_killed_after_the_grace_and_reaped() {
     let root = temporary_directory("grace");
     // Ignored dispositions survive exec, so `sleep` ignores SIGTERM too.
-    let worker = fake_worker(&root, "trap '' TERM\nexec /bin/sleep 60");
+    // Readiness handshake: the marker appears only after the trap is set.
+    let worker = fake_worker(&root, "trap '' TERM\n: > \"$0.ready\"\nexec /bin/sleep 60");
     let mut led = manager(&worker, LedSettings::default());
     led.set_timings_for_test(fast_timings());
     tick_until(&mut led, "spawn", |led| led.running_pid().is_some());
     let pid = led.running_pid().unwrap();
-    thread::sleep(Duration::from_millis(100)); // let the trap install
+    let ready = PathBuf::from(format!("{}.ready", worker.display()));
+    let deadline = Instant::now() + WAIT;
+    while !ready.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "fake worker never armed its trap"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
     let started = Instant::now();
     led.set_settings(LedSettings {
         enabled: false,
@@ -447,27 +456,52 @@ fn status_reports_paused_off_and_degraded_reasons() {
 // The real worker against the stub SDK server.
 // --------------------------------------------------------------------------
 
+/// Set by `scripts/check.sh` (after building the worker): a missing
+/// `kwe-led-worker` is then a test failure, never a silent skip.
+pub(crate) const REQUIRE_WORKER_ENV: &str = "KWE_REQUIRE_LED_WORKER";
+
 /// `target/<profile>/kwe-led-worker` beside this test binary's `deps/`
 /// directory. `cargo test --workspace` builds it; `cargo test -p
-/// kwe-daemon` alone may not, and then these tests skip loudly.
+/// kwe-daemon` alone may not: then these tests skip with a line written
+/// straight to stderr (not swallowed by the test harness's capture) —
+/// unless `KWE_REQUIRE_LED_WORKER=1`, which turns the skip into a failure.
 pub(crate) fn real_worker() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let path = exe.parent()?.parent()?.join("kwe-led-worker");
-    if path.is_file() {
-        Some(path)
-    } else {
-        eprintln!(
-            "SKIP: {} not built (run `cargo build -p kwe-led-worker` or `cargo test --workspace`)",
-            path.display()
-        );
-        None
+    let path = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.parent()?.join("kwe-led-worker")));
+    let required = std::env::var_os(REQUIRE_WORKER_ENV).is_some_and(|value| value == "1");
+    match path {
+        Some(path) if path.is_file() => Some(path),
+        path => {
+            let shown = path.map_or_else(|| "<unknown>".to_string(), |p| p.display().to_string());
+            assert!(
+                !required,
+                "{REQUIRE_WORKER_ENV}=1 but the LED worker is not built at {shown}"
+            );
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "skipped: worker not built ({shown}; run `cargo build -p kwe-led-worker`)"
+            );
+            None
+        }
     }
 }
 
-/// A loopback port nothing listens on (bound and released).
-pub(crate) fn quiet_port() -> u16 {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    listener.local_addr().unwrap().port()
+/// A loopback port nothing listens on, chosen BELOW the kernel's ephemeral
+/// range (32768..) so a parallel test's stub `bind(0)` can never be handed
+/// the same port between our probe and the worker's connect. Deterministic
+/// per (process, slot) like the worker crate's tests; probes are bounded.
+pub(crate) fn quiet_port(slot: u32) -> u16 {
+    let pid = std::process::id();
+    for k in 0..200_u32 {
+        let port = 20_000 + (pid.wrapping_mul(37) + slot * 1_013 + k * 7_919) % 12_000;
+        let port = u16::try_from(port).expect("below 32000");
+        if TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("no quiet loopback port found");
 }
 
 fn count(stub: &StubServer, id: u32) -> usize {
@@ -609,7 +643,7 @@ fn real_worker_reports_server_absent_quietly_and_accepts_reprobe() {
     let mut led = LedManager::new(
         Some(LedWorkerConfig {
             worker_path: binary,
-            port: Some(quiet_port()),
+            port: Some(quiet_port(1)),
         }),
         LedSettings::default(),
     );
@@ -640,7 +674,7 @@ fn real_worker_crash_is_restarted_within_the_budget() {
     let mut led = LedManager::new(
         Some(LedWorkerConfig {
             worker_path: binary,
-            port: Some(quiet_port()),
+            port: Some(quiet_port(2)),
         }),
         LedSettings::default(),
     );
@@ -747,5 +781,135 @@ fn real_worker_killed_mid_drive_is_cleaned_up_by_its_successor() {
             .collect::<Vec<_>>()
     );
     assert!(!root.join(SAVED_MODES_FILE).exists());
+    fs::remove_dir_all(root).ok();
+}
+
+// --------------------------------------------------------------------------
+// Review fixes B
+// --------------------------------------------------------------------------
+
+#[test]
+fn restart_budget_allows_three_restarts_and_the_fourth_exit_exhausts_it() {
+    let root = temporary_directory("budget-count");
+    // Count spawns through a side file ($0 survives the cleared env).
+    let worker = fake_worker(&root, "echo x >> \"$0.spawns\"\nexit 3");
+    let mut led = manager(&worker, LedSettings::default());
+    led.set_timings_for_test(fast_timings());
+    tick_until(&mut led, "budget", |led| {
+        led.status().worker.restart_budget_exhausted
+    });
+    let spawns = fs::read_to_string(format!("{}.spawns", worker.display()))
+        .unwrap()
+        .lines()
+        .count();
+    assert_eq!(
+        spawns,
+        MAX_RESTARTS + 1,
+        "first run + {MAX_RESTARTS} restarts"
+    );
+    assert_eq!(led.status().worker.restarts, MAX_RESTARTS as u64);
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn a_non_executable_binary_is_a_quiet_unavailable_state_without_a_strike() {
+    let root = temporary_directory("noexec");
+    let worker = fake_worker(&root, "exit 0");
+    fs::set_permissions(&worker, fs::Permissions::from_mode(0o644)).unwrap();
+    let mut led = manager(&worker, LedSettings::default());
+    led.set_timings_for_test(fast_timings());
+    for _ in 0..10 {
+        led.tick();
+        thread::sleep(Duration::from_millis(5));
+    }
+    let status = led.status();
+    assert_eq!(status.state, "worker_unavailable");
+    assert_eq!(status.reason.as_deref(), Some("not_executable"));
+    assert_eq!(status.worker.restarts, 0, "no restart strike");
+    assert!(!status.worker.restart_budget_exhausted);
+    assert!(!led.wants_audio());
+    // Fixing the mode bits + "Check again" respawns it.
+    fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).unwrap();
+    let outcome = led.reprobe();
+    assert_eq!(outcome.action, Some("respawn"));
+    tick_until(&mut led, "spawned", |led| {
+        led.status().reason.as_deref() != Some("not_executable")
+    });
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn reprobe_while_restarting_says_when_to_retry() {
+    let root = temporary_directory("retry-after");
+    let worker = fake_worker(&root, RECORDING_BODY);
+    let mut led = manager(&worker, LedSettings::default());
+    led.set_timings_for_test(Timings {
+        restart_delay: Duration::from_millis(1500),
+        ..fast_timings()
+    });
+    tick_until(&mut led, "spawn", |led| led.running_pid().is_some());
+    let pid = led.running_pid().unwrap();
+    // SAFETY: a crash stand-in for our own child.
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+    tick_until(&mut led, "exit noticed", |led| led.running_pid().is_none());
+    let outcome = led.reprobe();
+    assert!(!outcome.accepted);
+    assert_eq!(outcome.reason, Some("worker_restarting"));
+    let after = outcome
+        .retry_after_ms
+        .expect("retry_after_ms for worker_restarting");
+    assert!((1..=1500).contains(&after), "{after}");
+    drop(led);
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn audio_demand_follows_mode_enable_and_configuration() {
+    let root = temporary_directory("demand");
+    let worker = fake_worker(&root, RECORDING_BODY);
+    let mut led = manager(&worker, LedSettings::default());
+    assert!(!led.wants_audio(), "ambient never needs capture");
+    for (mode, wants) in [
+        (Mode::Spectrum, true),
+        (Mode::AmbientPulse, true),
+        (Mode::Ambient, false),
+        (Mode::Off, false),
+    ] {
+        led.set_settings(LedSettings {
+            mode,
+            ..LedSettings::default()
+        });
+        assert_eq!(led.wants_audio(), wants, "{mode:?}");
+    }
+    led.set_settings(LedSettings {
+        enabled: false,
+        mode: Mode::Spectrum,
+        ..LedSettings::default()
+    });
+    assert!(!led.wants_audio(), "disabled");
+    let unconfigured = LedManager::new(
+        None,
+        LedSettings {
+            mode: Mode::Spectrum,
+            ..LedSettings::default()
+        },
+    );
+    assert!(!unconfigured.wants_audio(), "--no-led-worker");
+    // consumes_audio additionally needs a live worker and no pause.
+    let mut led = manager(
+        &worker,
+        LedSettings {
+            mode: Mode::Spectrum,
+            ..LedSettings::default()
+        },
+    );
+    assert!(!led.consumes_audio(), "not spawned yet");
+    tick_until(&mut led, "spawn", |led| led.running_pid().is_some());
+    assert!(led.consumes_audio());
+    led.set_paused(true);
+    assert!(!led.consumes_audio(), "paused: mode off");
+    drop(led);
     fs::remove_dir_all(root).ok();
 }

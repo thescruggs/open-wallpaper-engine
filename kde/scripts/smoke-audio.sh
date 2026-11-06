@@ -86,6 +86,7 @@ call_daemon() {
 # The supervisor timings mirror smoke-video.sh (video renderer lane).
 start_daemon() {
     "$target_dir/debug/kwe-daemon" \
+        --no-led-worker \
         --socket "$socket" \
         --renderer-runtime-dir "$runtime_dir" \
         --state-dir "$state_dir" \

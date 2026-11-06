@@ -1764,6 +1764,7 @@ mod tests {
             occlusion_worker: None,
             display_power_worker: None,
             led_worker: None,
+            led_audio_demand: Default::default(),
         }
     }
 

@@ -25,10 +25,20 @@
 //! pause policies off, LED sync on in `ambient` at 100 % / 10 Hz with every
 //! device enabled (maintainer decision 2026-11-05: OpenRGB is optional but
 //! used when its SDK server runs). A file written before a field existed
-//! loads with that field's default; an out-of-bounds LED value fails
-//! validation and quarantines the file like any other schema violation. Persistence is atomic; a corrupt file is quarantined with the
+//! loads with that field's default.
+//!
+//! The `led` record is isolated from the rest (review fixes B, R2): an
+//! invalid `led` value (bounds, unknown mode, wrong type) resets ONLY `led`
+//! to its defaults — logged once as `event=settings.led_reset` — and
+//! unknown fields inside `led` (a newer daemon's) are ignored. Persistence
+//! is atomic; a file that is not valid JSON, is not the expected top-level
+//! shape (unknown top-level key, wrong type of a non-`led` field) or has an
+//! unsupported schema is still quarantined as a whole with the
 //! rename-to-invalid pattern and the store starts fresh, mirroring
-//! `grants::GrantStore`.
+//! `grants::GrantStore`. Downgrade note: a daemon older than LED sync
+//! (`deny_unknown_fields` at the top level) quarantines a file that
+//! contains the `led` key, resetting every knob — that cannot be fixed
+//! retroactively.
 
 use std::{
     fs::OpenOptions,
@@ -68,8 +78,9 @@ fn default_led_rate_hz() -> u8 {
 
 /// OpenRGB LED sync settings (slice L3). Every field defaults individually,
 /// so a partial record (or none at all) loads with the documented defaults.
+/// Unknown fields are ignored on load (forward compatibility, R2); RPC
+/// patches stay strict (`LedPatch`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct LedSettings {
     /// Use OpenRGB while its SDK server answers on loopback (default on).
     #[serde(default = "default_true")]
@@ -208,9 +219,53 @@ struct PersistedSettings {
     #[serde(default)]
     pause_when_display_off: bool,
     /// Additive (OpenRGB L3): files written before the record existed load
-    /// with `LedSettings::default()` (sync on).
+    /// with `LedSettings::default()` (sync on). Never fails the whole
+    /// record: see `LedField`.
     #[serde(default)]
-    led: LedSettings,
+    led: LedField,
+}
+
+/// The persisted `led` record, isolated so a bad value cannot quarantine the
+/// other knobs: anything that does not decode or validate becomes the
+/// defaults plus the reason (logged once at load).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LedField {
+    value: LedSettings,
+    /// Why the stored record was replaced by the defaults at load.
+    reset_reason: Option<String>,
+}
+
+impl LedField {
+    fn new(value: LedSettings) -> Self {
+        Self {
+            value,
+            reset_reason: None,
+        }
+    }
+}
+
+impl Serialize for LedField {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.value.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for LedField {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Any JSON value is accepted here; only the top-level shape can fail
+        // the whole file.
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        let parsed = serde_json::from_value::<LedSettings>(raw)
+            .map_err(anyhow::Error::from)
+            .and_then(|led| led.validate().map(|()| led));
+        Ok(match parsed {
+            Ok(value) => Self::new(value),
+            Err(error) => Self {
+                value: LedSettings::default(),
+                reset_reason: Some(error.to_string()),
+            },
+        })
+    }
 }
 
 impl Default for PersistedSettings {
@@ -220,7 +275,7 @@ impl Default for PersistedSettings {
             audio_output: true,
             pause_when_covered: false,
             pause_when_display_off: false,
-            led: LedSettings::default(),
+            led: LedField::default(),
         }
     }
 }
@@ -295,18 +350,26 @@ impl SettingsStore {
     }
 
     pub fn led(&self) -> &LedSettings {
-        &self.state.led
+        &self.state.led.value
+    }
+
+    /// Why the stored `led` record was replaced by the defaults when the
+    /// file was loaded (`None` = it loaded as stored). Cleared by the next
+    /// successful `set_led`. (No API surfaces it yet; the load logs it.)
+    #[cfg(test)]
+    pub fn led_reset_reason(&self) -> Option<&str> {
+        self.state.led.reset_reason.as_deref()
     }
 
     /// OpenRGB L3: persists a validated LED record atomically. Returns
     /// whether it changed.
     pub fn set_led(&mut self, led: LedSettings) -> Result<bool> {
         led.validate()?;
-        if self.state.led == led {
+        if self.state.led.value == led {
             return Ok(false);
         }
         let mut next = self.state.clone();
-        next.led = led;
+        next.led = LedField::new(led);
         self.save(&next)?;
         self.state = next;
         Ok(true)
@@ -352,13 +415,15 @@ impl SettingsStore {
             return PersistedSettings::default();
         }
         match serde_json::from_slice::<PersistedSettings>(&bytes) {
-            Ok(state) if state.schema_version == 1 => match state.led.validate() {
-                Ok(()) => state,
-                Err(error) => {
-                    Self::quarantine(path, &format!("invalid led record: {error}"));
-                    PersistedSettings::default()
+            Ok(state) if state.schema_version == 1 => {
+                if let Some(reason) = &state.led.reset_reason {
+                    // Only `led` falls back; the other knobs load as stored
+                    // and the file is rewritten at the next change.
+                    let reason: String = reason.chars().take(200).collect();
+                    eprintln!("event=settings.led_reset detail={reason:?}");
                 }
-            },
+                state
+            }
             Ok(_) => {
                 Self::quarantine(path, "unsupported schema");
                 PersistedSettings::default()
@@ -547,7 +612,7 @@ mod tests {
     }
 
     #[test]
-    fn led_bounds_are_enforced_on_patch_and_quarantined_on_load() {
+    fn led_bounds_are_enforced_on_patch_and_a_bad_led_record_resets_only_led() {
         let base = LedSettings::default();
         for patch in [
             LedPatch {
@@ -585,20 +650,64 @@ mod tests {
 
         let directory = temporary_directory("led-bounds");
         let path = directory.join(SETTINGS_FILE);
+        // R2: a bad `led` record resets only `led`; the other knobs load
+        // as stored and the file is not quarantined.
         for bad in [
-            &br#"{"schema_version":1,"led":{"rate_hz":50}}"#[..],
-            br#"{"schema_version":1,"led":{"brightness":300}}"#,
-            br#"{"schema_version":1,"led":{"mode":"disco"}}"#,
-            br#"{"schema_version":1,"led":{"enabled":true,"extra":1}}"#,
-            br#"{"schema_version":1,"led":{"disabled_devices":["nothex"]}}"#,
+            &br#"{"schema_version":1,"audio_output":false,"pause_when_covered":true,"pause_when_display_off":true,"led":{"rate_hz":50,"mode":"spectrum"}}"#[..],
+            br#"{"schema_version":1,"audio_output":false,"pause_when_covered":true,"pause_when_display_off":true,"led":{"brightness":300}}"#,
+            br#"{"schema_version":1,"audio_output":false,"pause_when_covered":true,"pause_when_display_off":true,"led":{"mode":"disco"}}"#,
+            br#"{"schema_version":1,"audio_output":false,"pause_when_covered":true,"pause_when_display_off":true,"led":{"disabled_devices":["nothex"]}}"#,
+            br#"{"schema_version":1,"audio_output":false,"pause_when_covered":true,"pause_when_display_off":true,"led":{"disabled_devices":["ffffffffffffffff","0123456789abcdef"]}}"#,
+            br#"{"schema_version":1,"audio_output":false,"pause_when_covered":true,"pause_when_display_off":true,"led":"on"}"#,
+            br#"{"schema_version":1,"audio_output":false,"pause_when_covered":true,"pause_when_display_off":true,"led":{"enabled":"yes"}}"#,
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            let mut store = SettingsStore::open(&directory).unwrap();
+            assert_eq!(store.led(), &LedSettings::default(), "{}", String::from_utf8_lossy(bad));
+            assert!(store.led_reset_reason().is_some());
+            assert!(!store.audio_output(), "audio_output survives");
+            assert!(store.pause_when_covered(), "pause policy survives");
+            assert!(store.pause_when_display_off(), "pause policy survives");
+            assert!(path.exists(), "a bad led record must not quarantine the file");
+            // The next LED change rewrites a valid record and clears the reason.
+            let next = store
+                .led()
+                .patched(&LedPatch {
+                    brightness: Some(40),
+                    ..LedPatch::default()
+                })
+                .unwrap();
+            assert!(store.set_led(next).unwrap());
+            assert!(store.led_reset_reason().is_none());
+            let reloaded = SettingsStore::open(&directory).unwrap();
+            assert_eq!(reloaded.led().brightness, 40);
+            assert!(reloaded.led_reset_reason().is_none());
+            assert!(!reloaded.audio_output());
+        }
+
+        // Unknown fields inside `led` (a newer daemon's) are tolerated.
+        std::fs::write(
+            &path,
+            br#"{"schema_version":1,"audio_output":false,"led":{"mode":"spectrum","future_knob":{"x":1}}}"#,
+        )
+        .unwrap();
+        let store = SettingsStore::open(&directory).unwrap();
+        assert_eq!(store.led().mode, Mode::Spectrum);
+        assert!(store.led_reset_reason().is_none());
+        assert!(!store.audio_output());
+        assert!(path.exists());
+
+        // Not the expected top-level shape: still a whole-file quarantine.
+        for bad in [
+            &br#"{"schema_version":1,"audio_output":"loud","led":{}}"#[..],
+            br#"{"schema_version":1,"led":{},"bogus":1}"#,
+            br#"[1,2,3]"#,
+            br#"{"schema_version":2,"led":{}}"#,
         ] {
             std::fs::write(&path, bad).unwrap();
             let store = SettingsStore::open(&directory).unwrap();
-            assert_eq!(store.led(), &LedSettings::default());
-            assert!(
-                !path.exists(),
-                "invalid led record must quarantine the file"
-            );
+            assert!(store.audio_output(), "defaults after quarantine");
+            assert!(!path.exists(), "{}", String::from_utf8_lossy(bad));
         }
     }
 }

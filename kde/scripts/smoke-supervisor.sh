@@ -31,6 +31,7 @@ call_daemon() {
 
 start_daemon() {
     "$target_dir/debug/kwe-daemon" \
+        --no-led-worker \
         --socket "$socket" \
         --renderer "$target_dir/debug/kwe-test-renderer" \
         --renderer-runtime-dir "$runtime_dir" \

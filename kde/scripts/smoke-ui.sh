@@ -66,7 +66,7 @@ set -euo pipefail
 # smoke pipeline) open past the manager's exit. The smoke script exports
 # KWE_DAEMON_SOCKET (the manager's contract), KWE_DAEMON_LOG and
 # KWE_DAEMON_PIDFILE.
-"${KWE_DAEMON_BIN:?}" --socket "${KWE_DAEMON_SOCKET:?}" \
+"${KWE_DAEMON_BIN:?}" --socket "${KWE_DAEMON_SOCKET:?}" --no-led-worker \
     </dev/null >>"${KWE_DAEMON_LOG:?}" 2>&1 &
 echo $! > "${KWE_DAEMON_PIDFILE:?}"
 STUB
@@ -104,7 +104,7 @@ kill -0 "${daemon_pids[-1]}" 2>/dev/null || {
 # the script and must not hold the script's stdout/stderr open.
 socket_path="$smoke_root/case2/daemon.sock"
 mkdir -p "$(dirname "$socket_path")"
-"$daemon_bin" --socket "$socket_path" </dev/null >>"$smoke_root/case2/daemon.log" 2>&1 &
+"$daemon_bin" --socket "$socket_path" --no-led-worker </dev/null >>"$smoke_root/case2/daemon.log" 2>&1 &
 daemon_pids+=("$!")
 for _attempt in {1..50}; do
     [[ -S "$socket_path" ]] && break

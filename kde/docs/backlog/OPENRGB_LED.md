@@ -181,7 +181,104 @@
   - Not in this slice (second agent): smoke scripts, `check.sh`, settings
     quarantine, audio-capture policy, restart-budget docs, daemon test
     skipping.
-- L5: pending.
+- **Review fixes B — done (uncommitted, 2026-11-06), live check pending.**
+  Second review slice: scripts, settings isolation, audio for the audio
+  modes, daemon NITs.
+  - MUST-FIX 4 — CLOSED. Every daemon launch under `scripts/` passes
+    `--no-led-worker` (smoke-supervisor/-audio/-apply ×2/-input-preview/
+    -plasma-display/-workshop-cache/-playlist-restart/-video/-web/
+    -live-apply/-ui ×2); `smoke-led.sh` uses a stub `--led-sdk-port`;
+    `dev-run.sh` defaults to `--no-led-worker`, opt-in `KWE_DEV_LED=1`
+    (real devices, marked `# led-guard:`) or `KWE_DEV_LED_SDK_PORT=<port>`
+    (6742 refused). `check.sh` guard (awk over backslash-joined lines) fails
+    on any launch without `--no-led-worker` / `--led-sdk-port` / a
+    `# led-guard:` marker; verified it flags 8 launches in mutated copies
+    and passes the tree.
+  - R2 — CLOSED. An invalid `led` record resets only `led` (one
+    `event=settings.led_reset` line); `audio_output` and both pause
+    policies survive; unknown fields inside `led` are ignored; bad JSON /
+    top-level shape / schema still quarantines the whole file. Not
+    surfaced as a separate API field (no existing way; `settings.get` /
+    `led.status` show the defaults actually in effect). Downgrade below
+    L3 quarantines a file with `led` (documented in SUPERVISOR_API_V1.md;
+    a package install script cannot warn on downgrade — the old package's
+    script runs — so no `.install` line). Test
+    `settings::tests::led_bounds_are_enforced_on_patch_and_a_bad_led_record_resets_only_led`.
+  - R5 — CLOSED. `check.sh` and PKGBUILD `check()` build `kwe-led-worker`
+    first and set `KWE_REQUIRE_LED_WORKER=1` (missing binary = test
+    failure); a bare `cargo test -p kwe-daemon` without the worker prints
+    `skipped: worker not built (...)` straight to stderr (visible, not
+    captured). Verified both by moving the binary aside.
+  - Audio for the audio modes — CLOSED (with one out-of-scope file, see
+    below). Capture runs while `--audio-capture` OR LED sync wants audio
+    (enabled, usable worker, mode spectrum / ambient+pulse), following
+    `settings.set` live (`audio.rs`: shared demand flag published by the
+    supervisor every tick; start/stop on the 100 ms runtime tick); default
+    `ambient` never captures. `audio.status` gains additive `active` +
+    `reasons` (`audio_capture_flag`, `led_sync`). Renderer-less LED audio:
+    the capture worker now pushes `generation: 0` frames while nothing was
+    ever promoted; the daemon gives them to the LED worker only (running,
+    audio mode, not paused), else rejects them and the worker backs off to
+    one push / 500 ms. Renderer gates unchanged. **Scope note:** this needed
+    a ~20-line change in `crates/kwe-audio-worker` (it never pushed at
+    generation 0), outside the listed file scope. Tests
+    `audio::tests::led_demand_starts_and_stops_capture_without_the_flag`,
+    `audio::tests::the_flag_keeps_capture_running_whatever_led_wants`,
+    `supervisor::tests::led_only_audio_never_reaches_an_ungranted_wallpaper`,
+    `led::tests::audio_demand_follows_mode_enable_and_configuration`,
+    kwe-audio-worker `unpromoted_frames_are_pushed_with_generation_zero_when_accepted`,
+    `rejected_unpromoted_frames_back_off_to_the_poll_interval`. Manager hint
+    reworded (no "audio capture may be off / no wallpaper running").
+  - NIT restart budget — CLOSED. Doc and code comment now say "at most 3
+    restarts per 10 min; the 4th unexpected exit exhausts it"; test
+    `restart_budget_allows_three_restarts_and_the_fourth_exit_exhausts_it`
+    counts 4 spawns.
+  - NIT non-executable binary — CLOSED. `not_executable` reason (mode bits,
+    or EACCES at exec), no strike, `led.reprobe` respawns; manager shows
+    its own text (one QML branch — outside the "hint + retry" scope, needed
+    so the fallback "started with --no-led-worker" is not shown). Test
+    `a_non_executable_binary_is_a_quiet_unavailable_state_without_a_strike`.
+  - NIT shutdown bounds — CLOSED by reasoning (an unreapable child cannot
+    be made in a unit test): a SIGKILLed worker not reaped 2 s later is
+    dropped with one `event=led.worker.unreaped` line, in ticks and in
+    `finish_shutdown` (plus a hard backstop); a `try_wait` error is logged
+    once per worker and no longer blocks the SIGKILL escalation.
+  - NIT timing-fragile tests — CLOSED. Trap test waits for a `.ready`
+    marker written after `trap`; `quiet_port(slot)` picks deterministic
+    ports in 20000..31999 (below the ephemeral range, so no parallel
+    `bind(0)` can take them), like the worker crate's tests.
+  - NIT `led.reprobe` `retry_after_ms` for `worker_restarting` — CLOSED
+    (time to next spawn or remaining stop grace); manager uses it, 1 s
+    fallback for older daemons. Tests `reprobe_while_restarting_says_when_to_retry`,
+    `LedSyncClientTest::reprobeWhileRestartingHonoursRetryAfter`.
+  - NIT credits — CLOSED in `kde/README.md` (OpenRGB SDK protocol line,
+    pointing at THIRD_PARTY.yml `openrgb-sdk-protocol`). OPEN:
+    `docs/PROVENANCE.md`'s ledger table has no OpenRGB row (file outside
+    this slice's scope).
+- **L5 — done (uncommitted, 2026-11-06), live check pending.**
+  `scripts/smoke-led.sh` (opt-in `KWE_RUN_LED_SMOKE=1` in `check.sh`), with
+  test-only helpers `crates/kwe-daemon/examples/led_smoke_stub.rs` (the
+  recording stub driven over FIFOs: late `listen`, `snapshot`) and
+  `led_smoke_renderer.rs` (solid RGB 0,160,255 at even fps, fast colour
+  cycle at odd fps — `kwe-test-renderer` has no solid mode, and the worker
+  does not re-send unchanged colours, so the rate case needs motion).
+  Private state/socket/runtime dirs, ports in 20000..31999 (6742 refused),
+  `--audio-worker` pointed at a missing path, trap cleanup of daemon /
+  stub / every process carrying the smoke's paths or port. Cases, all
+  CLOSED: server absent (`server_absent`, reason null, 0 strikes, no
+  error-level lines, worker alive); server appears without a wallpaper
+  (`active`/`waiting_for_source`, no 1050/1051/1100/1101 packets, modes
+  untouched, `driven_count` 0); solid wallpaper (every LED within ±12 of
+  the colour, `driven_count` 2, Direct); rate (8 Hz → 24 UpdateLEDs per
+  device in 3 s, bound 26); disable one device (restored to Rainbow, no
+  further updates, other device continues, `driven_count` 1);
+  `enabled:false` (worker reaped, every device restored, restore summary);
+  opt-in gating across a daemon restart (no worker, no new connection, no
+  process); worker SIGKILLed mid-drive (1 restart, `signal_9`, successor
+  restores Rainbow, saved-modes file removed); daemon SIGTERM (restored, no
+  strays). Wall time 15.7–15.9 s; passed 3/3 consecutive runs.
+  - Not covered: audio modes end to end (would need a null-sink capture in
+    the LED smoke); live devices (6742 still not listening).
 
 Requested 2026-08-29: drive OpenRGB-controlled devices (keyboard, case
 LEDs, strips) from the running wallpaper and/or the captured system

@@ -51,7 +51,9 @@ use crate::supervisor::{PipeWrite, set_nonblocking, try_write_input};
 /// between connect phases and between devices — + restore 1.5 s + flush
 /// 0.3 s); `LED_PROTOCOL_V1.md` requires ≥ 4 s.
 pub const STOP_GRACE: Duration = Duration::from_secs(4);
-/// Restart budget, same shape as the audio/occlusion workers.
+/// Restart budget, same shape as the audio/occlusion workers: at most
+/// `MAX_RESTARTS` restarts within `RESTART_WINDOW`, so the
+/// `MAX_RESTARTS + 1`-th unexpected exit inside the window exhausts it.
 const MAX_RESTARTS: usize = 3;
 const RESTART_WINDOW: Duration = Duration::from_secs(600);
 const RESTART_DELAY: Duration = Duration::from_secs(1);
@@ -63,6 +65,10 @@ const STATUS_STALE: Duration = Duration::from_secs(15);
 const WORKER_WEDGED: Duration = Duration::from_secs(30);
 /// `led.reprobe` ("Check again") rate limit.
 const REPROBE_MIN_INTERVAL: Duration = Duration::from_secs(2);
+/// After SIGKILL, how long a stopping worker may stay unreaped (e.g. stuck
+/// in uninterruptible sleep) before the handle is dropped with one log line
+/// — so neither a supervisor tick nor daemon shutdown can wait forever.
+const KILL_REAP_LIMIT: Duration = Duration::from_secs(2);
 /// stdout bytes read per tick (the pipe's capacity).
 const STDOUT_READ_BUDGET: usize = 64 * 1024;
 
@@ -216,6 +222,8 @@ struct Stopping {
     reader: StatusReader,
     deadline: Instant,
     killed: bool,
+    /// A `try_wait` error was already logged for this worker.
+    wait_error_logged: bool,
 }
 
 /// Audio tee counters, surfaced in `led.status` for diagnostics.
@@ -256,8 +264,8 @@ pub struct LedStatusReport {
     /// `disabled | worker_unavailable | starting | connecting |
     /// server_absent | active | off | degraded`.
     pub state: &'static str,
-    /// Why: `not_configured`/`not_installed`/`restart_budget_exhausted`
-    /// for `worker_unavailable`; `restarting`/`worker_stopping` for
+    /// Why: `not_configured`/`not_installed`/`not_executable`/
+    /// `restart_budget_exhausted` for `worker_unavailable`; `restarting`/`worker_stopping` for
     /// `starting`; the worker's own reason or `worker_unresponsive` for
     /// `degraded`; `paused` for `off` while the pause policy holds the LEDs
     /// off. `null` otherwise.
@@ -297,7 +305,9 @@ pub struct LedManager {
     restarts: u64,
     next_spawn_at: Option<Instant>,
     budget_exhausted: bool,
-    /// `not_configured` (no worker path) or `not_installed` (path missing).
+    /// `not_configured` (no worker path), `not_installed` (path missing) or
+    /// `not_executable` (present but cannot be executed). None of them is a
+    /// restart strike.
     unavailable: Option<&'static str>,
     last_exit: Option<String>,
     last_restore: Option<RestoreSummary>,
@@ -354,6 +364,30 @@ impl LedManager {
         } else {
             self.settings.mode
         }
+    }
+
+    /// LED sync wants system audio: enabled, a worker is configured and
+    /// usable, and the configured mode reads audio (`spectrum`,
+    /// `ambient+pulse`). The supervisor publishes this to the audio
+    /// capture service, which runs capture while it holds (follows the
+    /// settings, not the pause verdict).
+    pub fn wants_audio(&self) -> bool {
+        self.settings.enabled
+            && self.config.is_some()
+            && self.unavailable.is_none()
+            && !self.budget_exhausted
+            && mode_reads_audio(self.settings.mode)
+    }
+
+    /// A running worker would use an audio frame right now (wants audio,
+    /// not paused). Gates the renderer-less audio path (generation 0).
+    pub fn consumes_audio(&self) -> bool {
+        self.wants_audio()
+            && !self.paused
+            && self
+                .running
+                .as_ref()
+                .is_some_and(|running| !running.stdin_broken)
     }
 
     /// Applies a new (validated) settings record live: enabling spawns the
@@ -498,7 +532,25 @@ impl LedManager {
             };
         }
         let Some(running) = self.running.as_mut() else {
-            return refuse("worker_restarting");
+            // Between a stop and the next spawn: say when to ask again.
+            let wait = self
+                .next_spawn_at
+                .map(|at| at.saturating_duration_since(now))
+                .or_else(|| {
+                    self.stopping
+                        .as_ref()
+                        .map(|stopping| stopping.deadline.saturating_duration_since(now))
+                })
+                .unwrap_or(self.timings.restart_delay);
+            return ReprobeOutcome {
+                retry_after_ms: Some(
+                    wait.as_millis()
+                        .clamp(1, u128::from(u64::MAX))
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                ),
+                ..refuse("worker_restarting")
+            };
         };
         running.pending_reprobe = true;
         running.pending_status_request = true;
@@ -680,12 +732,24 @@ impl LedManager {
     }
 
     /// Daemon shutdown, second half: wait out the stop grace (bounded), then
-    /// SIGKILL and reap. The only place that waits.
+    /// SIGKILL and reap. The only place that waits: at most `stop_grace +
+    /// KILL_REAP_LIMIT` (`tick_stopping` drops a killed worker that never
+    /// reaps), plus a hard backstop in case the clock misbehaves.
     pub fn finish_shutdown(&mut self) {
         self.begin_shutdown();
+        let backstop = Instant::now() + self.timings.stop_grace + KILL_REAP_LIMIT * 2;
         while self.stopping.is_some() {
             self.tick_stopping();
             if self.stopping.is_some() {
+                if Instant::now() >= backstop {
+                    if let Some(stopping) = self.stopping.take() {
+                        eprintln!(
+                            "event=led.worker.unreaped pid={} detail=shutdown gave up waiting",
+                            stopping.child.id()
+                        );
+                    }
+                    break;
+                }
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
@@ -719,17 +783,31 @@ impl LedManager {
                 );
                 self.absorb_reader(&stopping.reader);
             }
-            Ok(None) if !stopping.killed && Instant::now() >= stopping.deadline => {
-                signal_process_group(pid, libc::SIGKILL);
-                let _ = stopping.child.kill();
-                stopping.killed = true;
-                eprintln!("event=led.worker.forced_kill pid={pid}");
-            }
-            Ok(None) => {}
-            Err(error) => {
-                eprintln!("event=led.worker.wait_error pid={pid} detail={error}");
-                if stopping.killed {
-                    // Nothing more can be done; drop the handle.
+            result => {
+                if let Err(error) = result {
+                    if !stopping.wait_error_logged {
+                        stopping.wait_error_logged = true;
+                        eprintln!("event=led.worker.wait_error pid={pid} detail={error}");
+                    }
+                    if stopping.killed {
+                        // Nothing more can be done; drop the handle.
+                        self.stopping = None;
+                        return;
+                    }
+                }
+                let now = Instant::now();
+                if !stopping.killed && now >= stopping.deadline {
+                    signal_process_group(pid, libc::SIGKILL);
+                    let _ = stopping.child.kill();
+                    stopping.killed = true;
+                    eprintln!("event=led.worker.forced_kill pid={pid}");
+                } else if stopping.killed && now >= stopping.deadline + KILL_REAP_LIMIT {
+                    // SIGKILLed yet still not reapable (uninterruptible
+                    // sleep): stop waiting so the manager is never stuck.
+                    eprintln!(
+                        "event=led.worker.unreaped pid={pid} detail=not reaped {} ms after SIGKILL",
+                        KILL_REAP_LIMIT.as_millis()
+                    );
                     self.stopping = None;
                 }
             }
@@ -767,6 +845,7 @@ impl LedManager {
             reader,
             deadline: Instant::now() + self.timings.stop_grace,
             killed: false,
+            wait_error_logged: false,
         });
     }
 
@@ -797,7 +876,7 @@ impl LedManager {
         if self.restart_history.len() >= MAX_RESTARTS {
             if !self.budget_exhausted {
                 eprintln!(
-                    "event=led.worker.disabled detail=restart budget exhausted ({MAX_RESTARTS} within {}s)",
+                    "event=led.worker.disabled detail=restart budget exhausted ({MAX_RESTARTS} restarts within {}s already used)",
                     RESTART_WINDOW.as_secs()
                 );
             }
@@ -822,6 +901,16 @@ impl LedManager {
                 config.worker_path.display()
             );
             self.unavailable = Some("not_installed");
+            return Ok(());
+        }
+        if !is_executable(&config.worker_path) {
+            // Present but not runnable (mode bits): a packaging/permission
+            // problem, not a crash — same quiet treatment as a missing file.
+            eprintln!(
+                "event=led.worker.unavailable detail=not executable path={}",
+                config.worker_path.display()
+            );
+            self.unavailable = Some("not_executable");
             return Ok(());
         }
         let mut command = Command::new(&config.worker_path);
@@ -871,9 +960,23 @@ impl LedManager {
                 Ok(())
             });
         }
-        let mut child = command
-            .spawn()
-            .with_context(|| format!("launch {}", config.worker_path.display()))?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            // EACCES at exec (e.g. a noexec mount) despite the mode bits:
+            // still not a crash of the worker, so no restart strike.
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!(
+                    "event=led.worker.unavailable detail=not executable path={} error={error}",
+                    config.worker_path.display()
+                );
+                self.unavailable = Some("not_executable");
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("launch {}", config.worker_path.display()));
+            }
+        };
         let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             signal_process_group(child.id(), libc::SIGKILL);
             let _ = child.kill();
@@ -932,6 +1035,17 @@ impl Drop for LedManager {
     fn drop(&mut self) {
         self.finish_shutdown();
     }
+}
+
+/// The modes whose output depends on captured system audio.
+pub fn mode_reads_audio(mode: Mode) -> bool {
+    matches!(mode, Mode::Spectrum | Mode::AmbientPulse)
+}
+
+/// Any execute bit set (the spawn still handles EACCES at exec).
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
 }
 
 /// `led_frame` for a path the frame protocol produced; a path the wire

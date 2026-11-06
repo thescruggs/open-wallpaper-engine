@@ -461,6 +461,10 @@ fn main() -> Result<()> {
         wall_timeout: Duration::from_millis(arguments.inspector_wall_timeout_ms),
         resource_limits: scene_limits,
     };
+    // Review fixes B: the supervisor publishes "LED sync wants audio" here
+    // every tick; the audio capture service runs capture while it OR
+    // --audio-capture holds.
+    let led_audio_demand = Arc::new(AtomicBool::new(false));
     let supervisor_service = SupervisorService::start(SupervisorConfig {
         renderer_paths,
         runtime_dir: renderer_runtime_dir,
@@ -516,6 +520,7 @@ fn main() -> Result<()> {
                     port: arguments.led_sdk_port,
                 })
         },
+        led_audio_demand: led_audio_demand.clone(),
     })?;
     let supervisor = supervisor_service.handle();
     let workshop_cache = Arc::new(std::sync::Mutex::new(WorkshopCache::open(
@@ -585,8 +590,8 @@ fn main() -> Result<()> {
     });
     let playlist = playlist_service.handle();
     // The audio capture service always runs so `audio.status` stays
-    // answerable; without --audio-capture it stays idle and reports
-    // enabled: false.
+    // answerable; it captures while --audio-capture was passed OR LED sync
+    // is in an audio mode (`reasons`), and is idle otherwise.
     let audio_worker_path = match arguments.audio_worker {
         Some(path) => path,
         None => default_audio_worker_path()?,
@@ -596,6 +601,7 @@ fn main() -> Result<()> {
         worker_path: audio_worker_path,
         socket: socket.clone(),
         capture_node: arguments.audio_capture_node,
+        led_demand: led_audio_demand,
     })?;
     let audio = audio_service.handle();
     let worker_pid = audio_service.worker_pid();
@@ -1133,8 +1139,12 @@ fn process_request(
                     Ok(params) => {
                         // The protocol constructor enforces 16/32/64 matching
                         // bands with finite values in 0..=1.
+                        // Generation 0 = "no renderer was ever promoted":
+                        // the supervisor routes such a frame to LED sync
+                        // only (or rejects it); the wire frame still needs
+                        // a non-zero sequence.
                         match AudioFrame::new(
-                            params.generation,
+                            params.generation.max(1),
                             params.frame.left,
                             params.frame.right,
                         ) {
@@ -2183,6 +2193,7 @@ mod tests {
             occlusion_worker: None,
             display_power_worker: None,
             led_worker,
+            led_audio_demand: Default::default(),
         })
         .unwrap()
     }
@@ -3384,6 +3395,7 @@ mod tests {
             worker_path: PathBuf::from("/bin/sleep"),
             socket: PathBuf::from("/nonexistent/kwe.sock"),
             capture_node: None,
+            led_demand: Default::default(),
         })
         .unwrap();
         let handle = service.handle();
@@ -3589,6 +3601,7 @@ with open(args.output, "wb") as frame:
             occlusion_worker: None,
             display_power_worker: None,
             led_worker: None,
+            led_audio_demand: Default::default(),
         }
     }
 
@@ -5079,6 +5092,7 @@ args = parser.parse_args()
             occlusion_worker: None,
             display_power_worker: None,
             led_worker: None,
+            led_audio_demand: Default::default(),
         })
         .unwrap();
         let supervisor = supervisor_service.handle();

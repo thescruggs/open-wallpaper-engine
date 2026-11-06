@@ -70,6 +70,7 @@ LD_LIBRARY_PATH="$stage_dir/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
 kpackagetool6 --hash "$package" >/dev/null
 
 target/debug/kwe-daemon \
+    --no-led-worker \
     --socket "$socket" \
     --renderer "$project_root/target/debug/kwe-test-renderer" \
     --renderer-runtime-dir "$runtime_dir" \

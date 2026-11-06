@@ -71,6 +71,7 @@ call_daemon() {
 
 start_daemon() {
     STEAM_ROOT="$steam_root" "$target_dir/debug/kwe-daemon" \
+        --no-led-worker \
         --socket "$socket" \
         --renderer "$target_dir/debug/kwe-test-renderer" \
         --renderer-runtime-dir "$runtime_dir" \
@@ -113,6 +114,7 @@ start_stripped_daemon() {
         DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/bus}" \
         STEAM_ROOT="$steam_root" \
         "$target_dir/debug/kwe-daemon" \
+        --no-led-worker \
         --socket "$socket_path" \
         --renderer "$target_dir/debug/kwe-test-renderer" \
         --renderer-runtime-dir "$smoke_root/stripped-runtime" \

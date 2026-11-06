@@ -72,6 +72,10 @@ ColumnLayout {
                 return { icon: "dialog-warning", busy: false, checkAgain: true,
                          title: qsTr("The LED sync helper is missing"),
                          detail: qsTr("kwe-led-worker was not found next to the wallpaper service. Reinstalling KDE Wallpaper Engine restores it.") };
+            if (reason === "not_executable")
+                return { icon: "dialog-warning", busy: false, checkAgain: true,
+                         title: qsTr("The LED sync helper cannot be started"),
+                         detail: qsTr("kwe-led-worker next to the wallpaper service is not executable. Reinstalling KDE Wallpaper Engine restores it.") };
             if (reason === "restart_budget_exhausted")
                 return { icon: "dialog-warning", busy: false, checkAgain: true,
                          title: qsTr("The LED sync helper kept stopping"),
@@ -255,7 +259,7 @@ ColumnLayout {
         type: Kirigami.MessageType.Information
         visible: section.ready && ledSync.enabled && section.audioMode && ledSync.hasWorkerStatus
                  && !ledSync.audioFresh && (ledSync.state === "active" || ledSync.state === "degraded")
-        text: qsTr("No audio is reaching LED sync right now. Audio capture may be off, or no wallpaper is running. Until audio arrives, Spectrum stays dark and Ambient + pulse shows steady wallpaper colours.")
+        text: qsTr("No audio is reaching LED sync right now. System audio capture starts automatically for this mode; it may still be starting, or it could not capture your audio output. Until audio arrives, Spectrum stays dark and Ambient + pulse shows steady wallpaper colours.")
     }
 
     Kirigami.InlineMessage {

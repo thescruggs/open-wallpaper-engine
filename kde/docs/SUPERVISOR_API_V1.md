@@ -254,6 +254,21 @@ it pauses while every display is powered down (F4).
   rejects the **whole** request before anything in it is applied. A record
   written before a knob existed loads with its default.
 
+On load, a file that is not valid JSON, not the expected top-level shape
+(unknown top-level key, wrong type for a non-`led` knob) or an unsupported
+`schema_version` is quarantined as a whole (renamed `settings-v1.json.invalid-<unix>`,
+every knob back to its default). The `led` record is isolated (review fixes
+B, R2): an invalid `led` value — out of bounds, unknown mode, unsorted ids,
+wrong type — resets **only** `led` to its defaults (one
+`event=settings.led_reset` journal line; `settings.get` / `led.status`
+then show the defaults, which is what the daemon runs; there is no separate
+"was reset" field) and the file is rewritten at the next settings change;
+unknown fields inside `led` (a newer daemon's) are ignored.
+**Downgrade:** a daemon older than LED sync rejects the `led` key and
+quarantines the whole file, so `audio_output` and both pause policies
+return to their defaults after a downgrade. Older binaries cannot be fixed
+retroactively.
+
 ### Enforcement
 
 The supervisor re-reads the store at every spawn (like grants) and appends
@@ -352,8 +367,8 @@ load and in `settings.set`):
 | `rate_hz` | 10 | 1..=20 |
 | `disabled_devices` | `[]` | ≤ 128 device ids (16 lowercase hex, `led.status` `worker_status.devices[].id`); `settings.set` **replaces** the list; stored sorted and unique |
 
-An invalid `led` record in the file (bad bounds, unknown mode or field)
-quarantines the file like any other schema violation. `settings.set
+An invalid `led` record in the file resets only `led` to these defaults
+(see Global settings above); unknown fields inside it are ignored. `settings.set
 {"led": {"enabled": false}}` stops the worker (SIGTERM / stdin EOF → the
 worker restores every device it controlled; 4 s grace, then SIGKILL);
 `enabled: true` spawns it with a fresh restart budget. Every spawn passes
@@ -366,15 +381,25 @@ reaches the running worker as one merged `led_config` line — no respawn.
 Daemon flags: `--led-worker <path>` (default `kwe-led-worker` beside the
 daemon), `--no-led-worker` (state stays `worker_unavailable` /
 `not_configured`), hidden `--led-sdk-port N` (tests/smokes: point the worker
-at a stub server; default the worker's 6742). The worker runs while
+at a stub server; default the worker's 6742). Every script under `scripts/`
+that starts a daemon passes `--no-led-worker` or a stub `--led-sdk-port`
+(`scripts/check.sh` enforces it); `scripts/dev-run.sh` starts without the
+worker unless `KWE_DEV_LED=1` (real devices) or `KWE_DEV_LED_SDK_PORT=<port>`. The worker runs while
 `enabled` is on, whether or not a renderer is live (device inventory and the
 server state stay available to the UI). Spawn: cleared environment, own
 process group, parent-death SIGTERM, `no_new_privs`, stdin/stdout pipes
 nonblocking, stderr to the daemon journal, **no** network namespace. Restart
-budget: 3 unexpected exits per 10 min (1 s apart), then
-`worker_unavailable` / `restart_budget_exhausted` until the setting is
-toggled or `led.reprobe` is called. A missing binary is no strike. A worker
-silent for 30 s (heartbeat is 5 s) is stopped and restarted (one strike).
+budget: at most 3 restarts per rolling 10 min (1 s apart) — the 4th
+unexpected exit inside the window exhausts it — then `worker_unavailable` /
+`restart_budget_exhausted` until the setting is toggled or `led.reprobe` is
+called. A missing binary (`not_installed`) or one that cannot be executed
+(`not_executable`: no execute bit, or EACCES at exec) is a quiet
+`worker_unavailable` state, never a strike; `led.reprobe` re-checks it. A
+worker silent for 30 s (heartbeat is 5 s) is stopped and restarted (one
+strike). Stopping is bounded: SIGTERM, 4 s grace, SIGKILL, and a worker that
+is still not reaped 2 s after SIGKILL (uninterruptible sleep) is given up on
+with one `event=led.worker.unreaped` line, so neither a supervisor tick nor
+daemon shutdown waits forever.
 
 Feeding, all latest-wins and nonblocking (one pending line per stream, a
 full pipe never blocks the supervisor thread, audio to the renderer, or
@@ -387,8 +412,16 @@ RPCs):
   worker as the renderer's exact `audio_bands` line — independent of the
   wallpaper's `audio` grant (the grant protects captured audio from
   untrusted wallpaper content; the LED worker is daemon code the user
-  enabled). Audio only exists while the daemon runs with `--audio-capture`
-  and a renderer has been promoted.
+  enabled). Review fixes B: audio capture runs while `--audio-capture` was
+  passed **or** LED sync wants audio (enabled, worker usable, mode
+  `spectrum` / `ambient+pulse`; see BETA_M1d below), and before any
+  renderer was ever promoted the capture worker's `generation: 0` frames
+  reach the LED worker only (while it runs, in an audio mode, not paused) —
+  so Spectrum works without a wallpaper. What renderers receive is
+  unchanged: the generation gate and the per-wallpaper `audio` grant apply
+  exactly as before, whatever started capture (a wallpaper without the grant
+  receives nothing — test
+  `supervisor::tests::led_only_audio_never_reaches_an_ungranted_wallpaper`).
 - **Pause (orchestrator design choice, flagged for maintainer review):**
   while the effective F3/F4 pause verdict holds — `(pause_when_covered AND
   covered) OR (pause_when_display_off AND asleep)`, whether or not a
@@ -424,7 +457,7 @@ RPCs):
 | `state` | `reason` | Meaning / UI |
 |---|---|---|
 | `disabled` | `null` | setting off |
-| `worker_unavailable` | `not_configured` \| `not_installed` \| `restart_budget_exhausted` | no worker; "Check again" = `led.reprobe` |
+| `worker_unavailable` | `not_configured` \| `not_installed` \| `not_executable` \| `restart_budget_exhausted` | no worker; "Check again" = `led.reprobe` |
 | `starting` | `null` \| `restarting` \| `worker_stopping` | spawned but no status line yet / between restarts / previous worker still restoring |
 | `connecting` | `null` | worker's first probe in flight |
 | `server_absent` | `null` | **normal**: no SDK server on loopback — "enable OpenRGB's SDK server (SDK Server tab) or run `openrgb --server`" |
@@ -445,13 +478,17 @@ Errors: `led_unavailable` (no supervisor), `led_failed` (supervisor timeout).
 ```json
 {"accepted": true, "action": "reprobe", "reason": null, "retry_after_ms": null, "status": {...led.status...}}
 {"accepted": false, "action": null, "reason": "rate_limited", "retry_after_ms": 1400, "status": {...}}
+{"accepted": false, "action": null, "reason": "worker_restarting", "retry_after_ms": 650, "status": {...}}
 ```
 
 `action`: `reprobe` (the running worker probes the SDK server now and emits
 a fresh status line; a no-op while connected) or `respawn` (the worker was
-`not_installed` or out of restarts: the binary is re-checked and the budget
-reset). `reason` when not accepted: `disabled`, `not_configured`,
-`rate_limited`, `worker_restarting`. The new state arrives in a later
+`not_installed` / `not_executable` or out of restarts: the binary is
+re-checked and the budget reset). `reason` when not accepted: `disabled`,
+`not_configured`, `rate_limited`, `worker_restarting`. `retry_after_ms` is
+set for `rate_limited` and (review fixes B, additive) for
+`worker_restarting` — the time until the next spawn is due (or the previous
+worker's remaining stop grace); `null` otherwise. The new state arrives in a later
 `led.status` (poll; ≤ 250 ms worker-side).
 
 ## Audio and media control
@@ -510,17 +547,39 @@ restarts within a rolling 10-minute window; beyond that it is disabled for the
 daemon's lifetime with a one-time log), and it inherits the daemon environment
 because PipeWire capture needs the session's `XDG_RUNTIME_DIR`.
 
+**When capture runs (review fixes B).** The worker runs while `--audio-capture`
+was passed OR LED sync wants audio — `led.enabled` on, a usable LED worker
+(not `--no-led-worker`, not `not_installed`/`not_executable`/out of
+restarts) and mode `spectrum` or `ambient+pulse`. The supervisor publishes
+the LED demand every tick and the capture service follows it within
+~100 ms: it starts capture when the demand rises and stops it (SIGTERM,
+1 s grace, SIGKILL; no restart strike) when it falls and the flag was not
+passed. The default mode `ambient` never captures, so nothing changes for a
+user who never picks an audio mode; choosing one in Settings is the opt-in.
+The LED pause verdict (mode `off`) does not stop capture. The restart budget
+applies whatever the reason; once exhausted, capture stays off for the
+daemon's lifetime.
+
+| `--audio-capture` | LED enabled + usable | LED mode | capture | `reasons` |
+|---|---|---|---|---|
+| no | — | `ambient` / `off` | off | `[]` |
+| no | no | any | off | `[]` |
+| no | yes | `spectrum` / `ambient+pulse` | **on** | `["led_sync"]` |
+| yes | no | any | on | `["audio_capture_flag"]` |
+| yes | yes | `ambient` / `off` | on | `["audio_capture_flag"]` |
+| yes | yes | `spectrum` / `ambient+pulse` | on | `["audio_capture_flag", "led_sync"]` |
+
 `audio.status` (no params) reports:
 
 ```json
-{"enabled": true, "pid": 1234, "restarts": 0, "disabled_reason": null}
+{"enabled": false, "active": true, "reasons": ["led_sync"], "pid": 1234, "restarts": 0, "disabled_reason": null}
 ```
 
-`enabled` mirrors the `--audio-capture` flag; `pid` is the live worker (or
-`null`); `restarts` counts bounded respawns; `disabled_reason` is
-`"too_many_restarts"` once the budget is exhausted. Without
-`--audio-capture`, `enabled` is `false` and the daemon never spawns the
-worker.
+`enabled` mirrors the `--audio-capture` flag (unchanged meaning); `active`
+(additive) is "capture is wanted now" and `reasons` (additive) says why —
+`audio_capture_flag`, `led_sync`, or empty when capture is off; `pid` is the
+live worker (or `null`); `restarts` counts bounded respawns;
+`disabled_reason` is `"too_many_restarts"` once the budget is exhausted.
 
 Producer contract (`kwe-audio-worker`):
 
@@ -529,9 +588,16 @@ Producer contract (`kwe-audio-worker`):
   "params":{"generation":G,"frame":{"left":[...],"right":[...]}}}`.
 - The `generation` is learned from `renderer.status` and refreshed whenever a
   push is rejected with `supervisor_failed` (stale generation). While no
-  renderer has ever been promoted (`display_generation` 0) the worker holds a
-  single latest frame and re-polls `renderer.status` on a bounded interval;
-  it does not spam rejections at the daemon.
+  renderer has ever been promoted (`display_generation` 0) the worker re-polls
+  `renderer.status` on a bounded interval (500 ms) and, in between, pushes
+  its latest frame with `generation: 0` (review fixes B). The daemon accepts
+  a generation-0 frame only while `display_generation` is 0 and LED sync
+  would use it (worker running, audio mode, not paused): it goes to the LED
+  worker alone and the call answers `renderer.status`. Otherwise it is
+  rejected as `audio frame display generation is stale or invalid`, and the
+  worker backs off to one push per poll interval — it does not spam
+  rejections at the daemon (an older daemon's `invalid_params` for
+  generation 0 backs off the same way).
 - While the daemon runs with `--audio-capture` and no renderer is promoted,
   the daemon converts its own worker's
   `{"error": "supervisor_failed", "detail": "no promoted renderer is

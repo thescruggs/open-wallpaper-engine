@@ -52,7 +52,29 @@ if [[ -x "$occlusion_worker" ]]; then
     renderer_flags+=(--occlusion-worker "$occlusion_worker")
 fi
 
-target/debug/kwe-daemon --socket "$socket_path" "${renderer_flags[@]}" &
+# OpenRGB LED sync defaults ON in the daemon and would drive this machine's
+# real devices through OpenRGB's SDK server (127.0.0.1:6742) whenever it is
+# running. A dev daemon therefore starts WITHOUT the LED worker unless the
+# developer opts in: KWE_DEV_LED=1 runs the worker built in this tree
+# against the real port; KWE_DEV_LED_SDK_PORT=<port> (e.g. the stub server,
+# `cargo run -p kwe-openrgb --features stub --example stub_server`) points
+# it elsewhere instead.
+# (check.sh's LED guard accepts the opt-in launch only through its explicit
+# `led-guard:` marker.)
+if [[ "${KWE_DEV_LED_SDK_PORT:-}" == "6742" ]]; then
+    echo "dev-run: KWE_DEV_LED_SDK_PORT=6742 is the real OpenRGB port; use KWE_DEV_LED=1 to drive real devices" >&2
+    exit 2
+fi
+if [[ -n "${KWE_DEV_LED_SDK_PORT:-}" ]]; then
+    target/debug/kwe-daemon --socket "$socket_path" --led-worker target/debug/kwe-led-worker \
+        --led-sdk-port "$KWE_DEV_LED_SDK_PORT" "${renderer_flags[@]}" &
+elif [[ "${KWE_DEV_LED:-0}" == "1" ]]; then
+    echo "dev-run: KWE_DEV_LED=1 — LED sync will drive real OpenRGB devices" >&2
+    target/debug/kwe-daemon --socket "$socket_path" --led-worker target/debug/kwe-led-worker \
+        "${renderer_flags[@]}" & # led-guard: explicit KWE_DEV_LED=1 developer opt-in
+else
+    target/debug/kwe-daemon --socket "$socket_path" --no-led-worker "${renderer_flags[@]}" &
+fi
 daemon_pid=$!
 cleanup() {
     kill "$daemon_pid" 2>/dev/null || true

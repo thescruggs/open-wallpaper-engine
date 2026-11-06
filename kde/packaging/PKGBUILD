@@ -151,7 +151,11 @@ check() {
     export LDFLAGS="${LDFLAGS//-flto=auto/}"
     # kwe-vulkan exercises real Vulkan instances and is excluded so the test
     # run also works in GPU-less build environments.
-    cargo test --release --workspace --exclude kwe-vulkan
+    # The daemon's LED tests drive the real kwe-led-worker (against an
+    # in-process stub SDK server, never port 6742): build it first and make
+    # a missing binary a failure instead of a skip (same as scripts/check.sh).
+    cargo build --release -p kwe-led-worker
+    KWE_REQUIRE_LED_WORKER=1 cargo test --release --workspace --exclude kwe-vulkan
 }
 
 package() {

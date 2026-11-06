@@ -113,6 +113,7 @@ Every state has an icon and text:
 |---|---|---|---|
 | `disabled` | stop | LED sync is off — turn it on to light up OpenRGB devices | — |
 | `worker_unavailable` / `not_installed` | warning | The LED sync helper is missing; reinstalling restores it | Check again |
+| `worker_unavailable` / `not_executable` | warning | The LED sync helper cannot be started (not executable); reinstalling restores it | Check again |
 | `worker_unavailable` / `restart_budget_exhausted` | warning | The helper kept stopping and was paused | Check again |
 | `worker_unavailable` / `not_configured` | information | Not available in this session (`--no-led-worker`) | — |
 | `starting`, `connecting` | spinner | Starting LED sync… / Restarting… / Restoring your lighting… / Looking for OpenRGB… | — |
@@ -124,10 +125,13 @@ Every state has an icon and text:
 | `degraded` | warning | LED sync is having trouble: reason in plain words; keeps retrying | Check again |
 
 "Check again" calls `led.reprobe`; while the daemon's rate limit runs (and
-for 2 s after an accepted call) the button is disabled, never an error.
+for 2 s after an accepted call) the button is disabled, never an error; while
+the helper restarts it is disabled for the daemon's `retry_after_ms` (1 s
+when an older daemon sends none).
 With an audio mode selected and no fresh audio, an information message says
-no audio is reaching LED sync right now (audio capture may be off, or no
-wallpaper is running). An older daemon without `led.*` shows "LED sync needs
+no audio is reaching LED sync right now: system audio capture starts by
+itself for these modes (review fixes B), so it may still be starting or could
+not capture the audio output; no wallpaper is needed. An older daemon without `led.*` shows "LED sync needs
 a newer wallpaper service"; an unreachable daemon shows that the state is
 unknown and is re-checked while the page is open. A rejected write shows a
 warning with the daemon's reason and the controls return to the daemon's

@@ -206,4 +206,6 @@ This project also references the wallpaper behaviour and format design from:
 
 Steam Workshop support — subscription detection from Steam's own `appworkshop` record, QR-code sign-in, browsing and subscribing — follows the approach and Steam Web API protocol of the waywallen plugin in [waywallen/open-wallpaper-engine](https://github.com/waywallen/open-wallpaper-engine) (GPL-2.0). It is independently implemented here; the relevant files are marked with `Borrowed-From:` comments.
 
+Optional OpenRGB LED sync speaks the OpenRGB SDK network protocol as published in the [OpenRGB SDK documentation](https://gitlab.com/CalcProgrammer1/OpenRGB/-/blob/master/Documentation/OpenRGBSDK.md) (OpenRGB project, GPL-2.0-or-later). The client in `crates/kwe-openrgb` is an independent implementation of the documented packet layouts; no OpenRGB code is copied (THIRD_PARTY.yml entry `openrgb-sdk-protocol`).
+
 See [docs/PROVENANCE.md](docs/PROVENANCE.md) for the full provenance ledger.

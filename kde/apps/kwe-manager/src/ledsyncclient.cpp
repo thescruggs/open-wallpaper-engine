@@ -452,7 +452,8 @@ void LedSyncClient::applyReprobe(const QJsonObject &result) {
     } else if (reason == QStringLiteral("rate_limited")) {
         cooldown = result.value(QStringLiteral("retry_after_ms")).toInt(ReprobeCooldownMilliseconds);
     } else if (reason == QStringLiteral("worker_restarting")) {
-        cooldown = 1000;
+        // Newer daemons say when the helper will be back; older ones do not.
+        cooldown = result.value(QStringLiteral("retry_after_ms")).toInt(1000);
         m_followUp.start();
     }
     if (cooldown > 0) {

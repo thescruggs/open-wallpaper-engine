@@ -64,6 +64,7 @@ call_daemon() {
 # running without any override IS the proof (docs/BETA_M2.md M2b).
 start_daemon() {
     "$target_dir/debug/kwe-daemon" \
+        --no-led-worker \
         --socket "$socket" \
         --renderer-runtime-dir "$runtime_dir" \
         --state-dir "$state_dir" \

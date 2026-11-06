@@ -17,10 +17,14 @@
 //
 // Wire sequence: audio/media `sequence` IS the daemon's display generation
 // (docs/INPUT_PROTOCOL_V1.md). The worker learns the current generation from
-// `renderer.status` at startup, holds frames while no renderer has ever been
-// promoted (generation 0, polled on a bounded interval), and refreshes the
-// generation after every `supervisor_failed` response. No monotonicity logic
-// is implemented.
+// `renderer.status` at startup and refreshes it after every
+// `supervisor_failed` response. While no renderer has ever been promoted
+// (generation 0) it polls `renderer.status` on a bounded interval and ALSO
+// pushes its latest frame with generation 0 (review fixes B): the daemon
+// hands such frames to LED sync only, when an audio LED mode wants them, and
+// otherwise rejects them — a rejected generation-0 push backs off for the
+// poll interval, so a daemon with no taker (or an older daemon) sees at most
+// one push per interval. No monotonicity logic is implemented.
 //
 // Exit codes (documented in docs/BETA_M1.md):
 //   0  graceful SIGTERM stop (pw-record child stopped first)
@@ -831,9 +835,18 @@ impl WorkerState {
             frame,
         ) {
             Ok(response) => {
+                let unpromoted = self.generation == 0;
                 if refresh_needed(&response) {
                     self.refresh_generation();
+                    if unpromoted && self.generation == 0 {
+                        // Nobody takes generation-0 frames right now.
+                        self.next_emit = Instant::now() + GENERATION_POLL;
+                    }
                 } else if !response.ok {
+                    if unpromoted {
+                        // e.g. an older daemon's invalid_params for 0.
+                        self.next_emit = Instant::now() + GENERATION_POLL;
+                    }
                     let detail = response
                         .result
                         .get("error")
@@ -891,6 +904,22 @@ impl WorkerState {
                 // reschedule as the no-renderer arm.
                 self.next_generation_poll = Instant::now() + GENERATION_POLL;
             }
+        }
+    }
+
+    /// One loop step of the daemon side: with a promoted renderer push at
+    /// the emission cadence; before any (generation 0) poll the generation
+    /// on its interval and push generation-0 frames for LED sync in between
+    /// (bounded by `push_pending`'s back-off when the daemon rejects them).
+    fn emit_step(&mut self, now: Instant) {
+        if self.generation == 0 {
+            if now >= self.next_generation_poll {
+                self.refresh_generation();
+            } else if self.pending.is_some() && now >= self.next_emit {
+                self.push_pending();
+            }
+        } else if now >= self.next_emit {
+            self.push_pending();
         }
     }
 
@@ -1015,14 +1044,7 @@ fn main() -> Result<()> {
                 &format!("dropped={non_finite}"),
             );
         }
-        let now = Instant::now();
-        if state.generation == 0 {
-            if now >= state.next_generation_poll {
-                state.refresh_generation();
-            }
-        } else if now >= state.next_emit {
-            state.push_pending();
-        }
+        state.emit_step(Instant::now());
         std::thread::sleep(LOOP_SLEEP);
     }
 }
@@ -1167,6 +1189,153 @@ mod tests {
         assert!(!rejected.ok);
         assert!(!refresh_needed(&rejected));
         assert!(parse_response(b"junk").is_err());
+    }
+
+    fn test_state(socket: &Path, generation: u64) -> WorkerState {
+        let mut command = Command::new("true");
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        let _ = child.wait();
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        WorkerState {
+            arguments: Arguments::parse_from([
+                "kwe-audio-worker",
+                "--socket",
+                socket.to_str().unwrap(),
+            ]),
+            capture: Capture {
+                child,
+                stdout,
+                samples: vec![],
+                byte_tail: vec![],
+                window_samples: 2048,
+                stderr,
+                stderr_ring: StderrRing::default(),
+                drop_next_sample: false,
+                non_finite_dropped: 0,
+            },
+            pending: None,
+            generation,
+            request_serial: 0,
+            frames_dropped: 0,
+            next_emit: Instant::now(),
+            next_generation_poll: Instant::now(),
+            backoff: RECONNECT_BASE,
+            diag: DiagLog::default(),
+        }
+    }
+
+    /// A one-thread fake daemon: `renderer.status` answers generation 0,
+    /// `audio.forward` answers `forward_reply`; returns the generations of
+    /// every `audio.forward` it saw.
+    fn fake_daemon(
+        socket: &Path,
+        forward_reply: &'static str,
+        run_for: Duration,
+    ) -> std::thread::JoinHandle<Vec<u64>> {
+        let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || {
+            let mut forwards = Vec::new();
+            let end = Instant::now() + run_for;
+            while Instant::now() < end {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(2));
+                    continue;
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(500)))
+                    .unwrap();
+                let mut line = Vec::new();
+                let mut byte = [0_u8; 1];
+                while stream.read(&mut byte).unwrap_or(0) == 1 && byte[0] != b'\n' {
+                    line.push(byte[0]);
+                }
+                let request: Value = serde_json::from_slice(&line).unwrap();
+                let reply = match request["method"].as_str() {
+                    Some("renderer.status") => {
+                        r#"{"version":1,"id":1,"ok":true,"result":{"display_generation":0}}"#
+                    }
+                    Some("audio.forward") => {
+                        forwards.push(request["params"]["generation"].as_u64().unwrap());
+                        forward_reply
+                    }
+                    _ => r#"{"version":1,"id":1,"ok":false,"result":{"error":"unknown_method"}}"#,
+                };
+                let _ = stream.write_all(reply.as_bytes());
+                let _ = stream.write_all(b"\n");
+            }
+            forwards
+        })
+    }
+
+    fn drive(state: &mut WorkerState, for_time: Duration) {
+        let end = Instant::now() + for_time;
+        let window = vec![0.25_f32; 2048];
+        while Instant::now() < end {
+            state.analyze(&window, &window);
+            state.emit_step(Instant::now());
+            std::thread::sleep(LOOP_SLEEP);
+        }
+    }
+
+    fn socket_path(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kwe-audio-worker-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("daemon.sock")
+    }
+
+    /// Review fixes B: before any renderer was promoted, frames are pushed
+    /// with generation 0 at the emission cadence while the daemon takes
+    /// them (LED sync in an audio mode).
+    #[test]
+    fn unpromoted_frames_are_pushed_with_generation_zero_when_accepted() {
+        let socket = socket_path("accept");
+        let daemon = fake_daemon(
+            &socket,
+            r#"{"version":1,"id":1,"ok":true,"result":{}}"#,
+            Duration::from_millis(1300),
+        );
+        let mut state = test_state(&socket, 0);
+        drive(&mut state, Duration::from_millis(1000));
+        let forwards = daemon.join().unwrap();
+        assert!(forwards.iter().all(|generation| *generation == 0));
+        // 1 s at the ~23 Hz window cadence; generous lower bound.
+        assert!(forwards.len() >= 8, "{} pushes", forwards.len());
+        let _ = std::fs::remove_dir_all(socket.parent().unwrap());
+    }
+
+    /// ... and a daemon that rejects them (no LED taker, or an older daemon)
+    /// sees at most about one push per poll interval, never a storm.
+    #[test]
+    fn rejected_unpromoted_frames_back_off_to_the_poll_interval() {
+        for reply in [
+            r#"{"version":1,"id":1,"ok":false,"result":{"error":"supervisor_failed","detail":"audio frame display generation is stale or invalid"}}"#,
+            r#"{"version":1,"id":1,"ok":false,"result":{"error":"invalid_params","detail":"invalid audio bands"}}"#,
+        ] {
+            let socket = socket_path("reject");
+            let daemon = fake_daemon(&socket, reply, Duration::from_millis(1800));
+            let mut state = test_state(&socket, 0);
+            drive(&mut state, Duration::from_millis(1500));
+            let forwards = daemon.join().unwrap();
+            // 1.5 s / 500 ms poll ≈ 3-4; anything near the 23 Hz cadence
+            // (≈ 35) or the 50 Hz loop would be a storm.
+            assert!(
+                (1..=5).contains(&forwards.len()),
+                "{} pushes for {reply}",
+                forwards.len()
+            );
+            let _ = std::fs::remove_dir_all(socket.parent().unwrap());
+        }
     }
 
     #[test]

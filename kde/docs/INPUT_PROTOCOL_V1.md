@@ -90,16 +90,24 @@ staleness is enforced daemon-side before writing, exactly like pointer input.
 
 ### BETA_M1d producer: `kwe-audio-worker`
 
-With `kwe-daemon --audio-capture`, the daemon's `kwe-audio-worker` captures
+The daemon runs `kwe-audio-worker` while `kwe-daemon --audio-capture` was
+passed OR LED sync is enabled in an audio mode (`spectrum`,
+`ambient+pulse`; review fixes B — see `SUPERVISOR_API_V1.md` §BETA_M1d).
+It captures
 the PipeWire default sink (`pw-record --raw --format f32 --rate <rate>
 --channels 2 --target <node> -`; `<node>` from `--capture-node` or resolved
 once from `pw-dump`) and analyzes each bounded window with
 `kwe_core::audio::analyze_stereo`, producing the 16/32/64-band frames above at
 most `--max-fps` times per second. Defaults: 48000 Hz, 64 bands, 2048-sample
 windows, 30 fps. The worker holds only the latest window (a bounded queue of
-1), pushes over one fresh RPC connection per frame (`audio.forward`), and
-pauses pushing while the daemon has no promoted display generation (polling
-`renderer.status` on a bounded interval instead). The bands are normalized
+1) and pushes over one fresh RPC connection per frame (`audio.forward`).
+While the daemon has no promoted display generation it polls
+`renderer.status` on a bounded interval and pushes its latest frame with
+`generation: 0` in between: the daemon delivers such a frame **only** to the
+LED sync worker (never to a renderer — none exists), and only while LED
+sync would use it; otherwise it rejects it and the worker backs off to one
+push per poll interval (500 ms). The `audio_bands` line sent to the LED
+worker then carries `sequence: 1`. The bands are normalized
 energies in `0..=1` per band per channel; the worker is bounded end to end —
 capture reads, window buffers, pw-dump output (4 MiB), response lines
 (16 KiB), reconnect backoff (max 1 s), and stderr diagnostics — and stops

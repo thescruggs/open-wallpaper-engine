@@ -6,6 +6,15 @@
 //! exposes `audio.status` state plus the worker's pid so the daemon can
 //! identify its own worker's `audio.forward` connections by peer credentials.
 //!
+//! Capture runs while EITHER the `--audio-capture` flag was passed OR LED
+//! sync currently wants audio (enabled, worker usable, mode `spectrum` or
+//! `ambient+pulse`) — review fixes B. The supervisor publishes the LED
+//! demand into a shared flag every tick; this runtime follows it on its own
+//! 100 ms tick, starting capture when it rises and stopping it (SIGTERM,
+//! grace, SIGKILL) when it falls and the flag was not passed. What
+//! renderers receive is decided elsewhere and does not change: the
+//! per-wallpaper audio grant and the generation gate in the supervisor.
+//!
 //! The worker's stderr is inherited (its bounded diagnostics land in the
 //! daemon's own log); its stdout is unused. The worker is spawned with the
 //! daemon's socket path, so it can refresh its display generation via
@@ -18,7 +27,7 @@ use std::{
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
@@ -53,12 +62,25 @@ pub struct AudioCaptureConfig {
     pub socket: PathBuf,
     /// Optional PipeWire capture node passthrough (`--capture-node`).
     pub capture_node: Option<String>,
+    /// LED sync wants audio right now (written by the supervisor every
+    /// tick, read here every `WORKER_TICK`).
+    pub led_demand: Arc<AtomicBool>,
 }
+
+/// `audio.status` `reasons` entries.
+pub const REASON_FLAG: &str = "audio_capture_flag";
+pub const REASON_LED: &str = "led_sync";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AudioCaptureStatus {
     /// The `--audio-capture` configuration flag, not the live state.
     pub enabled: bool,
+    /// Capture is wanted right now (`reasons` non-empty). The worker runs
+    /// while this holds unless the restart budget is exhausted.
+    pub active: bool,
+    /// Why capture is wanted: `audio_capture_flag` (`--audio-capture`),
+    /// `led_sync` (LED sync in an audio mode). Empty = capture off.
+    pub reasons: Vec<&'static str>,
     pub pid: Option<u32>,
     pub restarts: u64,
     /// Present only after the restart budget is exhausted.
@@ -154,13 +176,44 @@ impl Runtime {
         }
     }
 
-    fn run(mut self, receiver: Receiver<AudioCommand>) {
-        if self.config.enabled
-            && let Err(error) = self.spawn_worker()
-        {
-            eprintln!("event=audio.worker.spawn_failed detail={error}");
-            self.worker_down();
+    /// Capture is wanted: the flag, or LED sync's live demand.
+    fn wanted(&self) -> bool {
+        self.config.enabled || self.config.led_demand.load(Ordering::Acquire)
+    }
+
+    fn reasons(&self) -> Vec<&'static str> {
+        let mut reasons = Vec::new();
+        if self.config.enabled {
+            reasons.push(REASON_FLAG);
         }
+        if self.config.led_demand.load(Ordering::Acquire) {
+            reasons.push(REASON_LED);
+        }
+        reasons
+    }
+
+    /// Level-triggered: start capture when it became wanted, stop it when
+    /// it no longer is. An exhausted budget stays exhausted.
+    fn follow_demand(&mut self) {
+        let wanted = self.wanted();
+        if wanted && self.child.is_none() && self.disabled_reason.is_none() {
+            eprintln!(
+                "event=audio.capture.start reasons={}",
+                self.reasons().join(",")
+            );
+            if let Err(error) = self.spawn_worker() {
+                eprintln!("event=audio.worker.spawn_failed detail={error}");
+                self.worker_down();
+            }
+        } else if !wanted && self.child.is_some() {
+            eprintln!("event=audio.capture.stop detail=no longer wanted");
+            self.shutdown_worker();
+            self.worker_pid.store(0, Ordering::Release);
+        }
+    }
+
+    fn run(mut self, receiver: Receiver<AudioCommand>) {
+        self.follow_demand();
         loop {
             match receiver.recv_timeout(WORKER_TICK) {
                 Ok(AudioCommand::Status(reply)) => {
@@ -172,9 +225,7 @@ impl Runtime {
                 }
                 Err(RecvTimeoutError::Timeout) => {}
             }
-            if self.config.enabled
-                && let Some(child) = self.child.as_mut()
-            {
+            if let Some(child) = self.child.as_mut() {
                 match child.try_wait() {
                     Ok(Some(status)) => {
                         // Unexpected exit: the daemon did not request this.
@@ -194,13 +245,17 @@ impl Runtime {
                     }
                 }
             }
+            self.follow_demand();
         }
     }
 
     fn status(&self) -> AudioCaptureStatus {
         let pid = self.worker_pid.load(Ordering::Acquire);
+        let reasons = self.reasons();
         AudioCaptureStatus {
             enabled: self.config.enabled,
+            active: !reasons.is_empty(),
+            reasons,
             pid: (pid != 0).then_some(pid),
             restarts: self.restarts,
             disabled_reason: self.disabled_reason.clone(),
@@ -211,7 +266,8 @@ impl Runtime {
     /// within `RESTART_WINDOW` the worker is disabled for the daemon's
     /// lifetime, with exactly one log line.
     fn worker_down(&mut self) {
-        if self.disabled_reason.is_some() {
+        if self.disabled_reason.is_some() || !self.wanted() {
+            // No longer wanted (LED demand fell): an exit is not restarted.
             return;
         }
         let now = Instant::now();
@@ -379,6 +435,7 @@ mod tests {
             worker_path: PathBuf::from("/bin/false"),
             socket: PathBuf::from("/nonexistent/kwe.sock"),
             capture_node: None,
+            led_demand: Arc::new(AtomicBool::new(false)),
         };
         let service = AudioCaptureService::start(config).unwrap();
         let handle = service.handle();
@@ -409,6 +466,7 @@ mod tests {
             worker_path: PathBuf::from("/bin/sleep"),
             socket: PathBuf::from("/nonexistent/kwe.sock"),
             capture_node: None,
+            led_demand: Arc::new(AtomicBool::new(false)),
         };
         let service = AudioCaptureService::start(config).unwrap();
         let worker_pid = service.worker_pid();
@@ -436,6 +494,7 @@ mod tests {
             worker_path: PathBuf::from("/bin/sleep"),
             socket: PathBuf::from("/nonexistent/kwe.sock"),
             capture_node: None,
+            led_demand: Arc::new(AtomicBool::new(false)),
         };
         let service = AudioCaptureService::start(config).unwrap();
         let status = service.handle().status().unwrap();
@@ -450,12 +509,16 @@ mod tests {
     fn status_serializes_with_the_documented_shape() {
         let status = AudioCaptureStatus {
             enabled: true,
+            active: true,
+            reasons: vec![REASON_FLAG],
             pid: Some(1234),
             restarts: 2,
             disabled_reason: None,
         };
         let value = serde_json::to_value(&status).unwrap();
         assert_eq!(value["enabled"], true);
+        assert_eq!(value["active"], true);
+        assert_eq!(value["reasons"], serde_json::json!(["audio_capture_flag"]));
         assert_eq!(value["pid"], 1234);
         assert_eq!(value["restarts"], 2);
         // None fields serialize as null, matching the daemon's convention for
@@ -463,6 +526,8 @@ mod tests {
         assert!(value["disabled_reason"].is_null());
         let disabled = AudioCaptureStatus {
             enabled: true,
+            active: true,
+            reasons: vec![REASON_FLAG],
             pid: None,
             restarts: 3,
             disabled_reason: Some("too_many_restarts".into()),
@@ -470,6 +535,101 @@ mod tests {
         let value = serde_json::to_value(&disabled).unwrap();
         assert_eq!(value["disabled_reason"], "too_many_restarts");
         assert!(value["pid"].is_null());
+    }
+
+    /// A worker stand-in that ignores its arguments and lives until
+    /// signalled (`/bin/sleep --socket ...` would exit at once).
+    fn idle_worker(label: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "kwe-audio-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("audio-worker");
+        std::fs::write(&script, "#!/bin/sh\nexec /bin/sleep 60\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + StdDuration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Review fixes B: without `--audio-capture`, capture follows LED sync's
+    /// demand live — off by default, started when an audio LED mode is
+    /// selected, stopped (worker reaped) when it is not any more.
+    #[test]
+    fn led_demand_starts_and_stops_capture_without_the_flag() {
+        let demand = Arc::new(AtomicBool::new(false));
+        let service = AudioCaptureService::start(AudioCaptureConfig {
+            enabled: false,
+            worker_path: idle_worker("led-demand"),
+            socket: PathBuf::from("/nonexistent/kwe.sock"),
+            capture_node: None,
+            led_demand: demand.clone(),
+        })
+        .unwrap();
+        let handle = service.handle();
+        let pid_cell = service.worker_pid();
+        thread::sleep(Duration::from_millis(250));
+        let status = handle.status().unwrap();
+        assert!(!status.enabled && !status.active);
+        assert!(status.reasons.is_empty());
+        assert_eq!(status.pid, None, "ambient / LED off: no capture");
+
+        demand.store(true, Ordering::Release);
+        wait_for("capture for LED", || pid_cell.load(Ordering::Acquire) != 0);
+        let status = handle.status().unwrap();
+        assert!(!status.enabled, "the flag is still off");
+        assert!(status.active);
+        assert_eq!(status.reasons, vec![REASON_LED]);
+        let pid = status.pid.expect("worker pid");
+
+        demand.store(false, Ordering::Release);
+        wait_for("capture stopped", || pid_cell.load(Ordering::Acquire) == 0);
+        let gone = || unsafe { libc::kill(i32::try_from(pid).unwrap(), 0) } != 0;
+        wait_for("worker reaped", gone);
+        let status = handle.status().unwrap();
+        assert!(!status.active);
+        assert_eq!(status.pid, None);
+        assert_eq!(status.restarts, 0, "a requested stop is no restart");
+    }
+
+    /// With the flag, LED demand only adds a reason; losing it never stops
+    /// capture.
+    #[test]
+    fn the_flag_keeps_capture_running_whatever_led_wants() {
+        let demand = Arc::new(AtomicBool::new(true));
+        let service = AudioCaptureService::start(AudioCaptureConfig {
+            enabled: true,
+            worker_path: idle_worker("flag"),
+            socket: PathBuf::from("/nonexistent/kwe.sock"),
+            capture_node: None,
+            led_demand: demand.clone(),
+        })
+        .unwrap();
+        let handle = service.handle();
+        let pid_cell = service.worker_pid();
+        wait_for("capture", || pid_cell.load(Ordering::Acquire) != 0);
+        assert_eq!(
+            handle.status().unwrap().reasons,
+            vec![REASON_FLAG, REASON_LED]
+        );
+        let pid = pid_cell.load(Ordering::Acquire);
+        demand.store(false, Ordering::Release);
+        thread::sleep(Duration::from_millis(400));
+        let status = handle.status().unwrap();
+        assert_eq!(status.pid, Some(pid), "same worker keeps running");
+        assert_eq!(status.reasons, vec![REASON_FLAG]);
     }
 
     #[test]

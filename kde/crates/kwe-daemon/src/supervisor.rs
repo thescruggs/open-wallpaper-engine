@@ -17,7 +17,8 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command as ProcessCommand, Stdio},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
@@ -157,6 +158,10 @@ pub struct SupervisorConfig {
     /// (`--no-led-worker`) leaves LED sync permanently `worker_unavailable`
     /// (`not_configured`); the settings still persist.
     pub led_worker: Option<LedWorkerConfig>,
+    /// Review fixes B: "LED sync wants system audio" (`LedManager::
+    /// wants_audio`), published every tick for the audio capture service,
+    /// which runs capture while this OR `--audio-capture` holds.
+    pub led_audio_demand: Arc<AtomicBool>,
 }
 
 /// F3 detector launch parameters (see `occlusion.rs`).
@@ -1350,6 +1355,9 @@ impl SupervisorRuntime {
         let paused = self.effective_render_pause();
         self.led.set_paused(paused);
         self.led.tick();
+        self.config
+            .led_audio_demand
+            .store(self.led.wants_audio(), Ordering::Release);
     }
 
     /// F3 policy switch: persists, starts/stops the detector, and applies
@@ -1797,6 +1805,17 @@ impl SupervisorRuntime {
     }
 
     fn forward_audio_frame(&mut self, generation: u64, frame: AudioFrame) -> Result<WorkerStatus> {
+        // Review fixes B: the renderer-less LED path. Before any renderer
+        // was ever promoted (display generation 0) the capture worker sends
+        // generation 0; such a frame reaches ONLY the LED worker, and only
+        // while it would use it (audio mode, running, not paused). No
+        // renderer exists to receive it, so the renderer gates below are
+        // untouched; everything else about generation 0 stays rejected.
+        if generation == 0 && self.display_generation == 0 && self.led.consumes_audio() {
+            let bytes = encode_audio_frame(&frame)?;
+            self.led.offer_audio(&bytes);
+            return Ok(self.status());
+        }
         if generation == 0 || generation != self.display_generation {
             bail!("audio frame display generation is stale or invalid");
         }
@@ -3247,6 +3266,7 @@ mod tests {
             occlusion_worker: None,
             display_power_worker: None,
             led_worker: None,
+            led_audio_demand: Default::default(),
         }
         .validate()
         .unwrap()
@@ -4753,6 +4773,103 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(delivered >= 100, "renderer got {delivered} audio lines");
+        runtime.stop_all(false);
+        runtime.led.finish_shutdown();
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Review fixes B (item 5): LED sync in an audio mode publishes its
+    /// capture demand; before any renderer was promoted a generation-0
+    /// frame reaches the LED worker ONLY; once a wallpaper WITHOUT the audio
+    /// grant is live it still receives nothing — the renderer gates are the
+    /// same whatever started capture.
+    #[test]
+    fn led_only_audio_never_reaches_an_ungranted_wallpaper() {
+        use kwe_led_protocol::Control;
+        let root = temporary_directory("led-audio-only");
+        let (mut runtime, led_worker) = led_runtime(
+            &root,
+            "exec cat > \"$HOME/stdin.txt\"",
+            crate::led::tests::RECORDING_BODY,
+        );
+        let demand = runtime.config.led_audio_demand.clone();
+        for _ in 0..50 {
+            runtime.sync_led();
+            if runtime.led.running_pid().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(runtime.led.running_pid().is_some());
+        assert!(
+            !demand.load(Ordering::Acquire),
+            "ambient: no capture demand"
+        );
+        let frame = AudioFrame::new(1, vec![0.5; 32], vec![0.5; 32]).unwrap();
+        // Ambient + nothing promoted: generation 0 is rejected as before.
+        assert!(runtime.forward_audio_frame(0, frame.clone()).is_err());
+
+        runtime
+            .set_led_settings(&LedPatch {
+                mode: Some(kwe_led_protocol::Mode::Spectrum),
+                ..LedPatch::default()
+            })
+            .unwrap();
+        runtime.sync_led();
+        assert!(demand.load(Ordering::Acquire), "spectrum wants capture");
+        // Nothing promoted: the LED worker gets the frame, nobody else.
+        assert_eq!(runtime.display_generation, 0);
+        let status = runtime.forward_audio_frame(0, frame.clone()).unwrap();
+        assert_eq!(status.audio_grant_dropped, 0);
+        let lines = led_stdin(&led_worker, 3);
+        assert!(
+            matches!(&lines[2], Control::Audio(audio) if audio.left.len() == 32),
+            "{lines:?}"
+        );
+        // Paused (mode off): the renderer-less path closes again.
+        runtime.set_pause_when_covered(true).unwrap();
+        let _ = runtime.occlusion_report_for_test(true);
+        runtime.sync_led();
+        assert!(runtime.forward_audio_frame(0, frame.clone()).is_err());
+        let _ = runtime.occlusion_report_for_test(false);
+        runtime.set_pause_when_covered(false).unwrap();
+        runtime.sync_led();
+
+        // A wallpaper without the audio grant goes live.
+        let home = promote_test_renderer(&mut runtime);
+        runtime.sync_led();
+        let generation = runtime.display_generation;
+        assert_ne!(generation, 0);
+        assert!(
+            runtime.forward_audio_frame(0, frame.clone()).is_err(),
+            "generation 0 is stale once a renderer was promoted"
+        );
+        let before = led_stdin(&led_worker, 1).len();
+        for _ in 0..5 {
+            let status = runtime
+                .forward_audio_frame(generation, frame.clone())
+                .unwrap();
+            assert!(status.audio_grant_dropped > 0);
+            runtime.service_active_input();
+        }
+        assert_eq!(runtime.audio_grant_dropped, 5);
+        assert!(runtime.active.as_ref().unwrap().pending_audio.is_none());
+        // The LED worker got them all; the renderer's stdin has no audio.
+        let lines = led_stdin(&led_worker, before + 5);
+        assert!(
+            lines[before..]
+                .iter()
+                .filter(|line| matches!(line, Control::Audio(_)))
+                .count()
+                >= 5,
+            "{lines:?}"
+        );
+        thread::sleep(Duration::from_millis(100));
+        let renderer_stdin = fs::read_to_string(home.join("stdin.txt")).unwrap_or_default();
+        assert!(
+            !renderer_stdin.contains("audio_bands"),
+            "an ungranted wallpaper received audio: {renderer_stdin}"
+        );
         runtime.stop_all(false);
         runtime.led.finish_shutdown();
         fs::remove_dir_all(root).ok();

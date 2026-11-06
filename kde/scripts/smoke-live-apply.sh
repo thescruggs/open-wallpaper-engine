@@ -418,6 +418,7 @@ rm -f -- "$live_socket"
 
 start_daemon() {
     "$target_dir/debug/kwe-daemon" \
+        --no-led-worker \
         --socket "$live_socket" \
         --steam-root "$steam_root" \
         --renderer-runtime-dir "$runtime_dir" \
