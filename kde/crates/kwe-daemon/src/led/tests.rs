@@ -581,11 +581,26 @@ fn real_worker_drives_the_stub_pauses_off_and_restores_on_disable() {
         thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(led.status().reason.as_deref(), Some("paused"));
+    // Review fixes C1 (R4): the pause path (mode off → back) does not
+    // retake the devices sooner than the worker's minimum retake interval
+    // (5 s) after the release — a fullscreen app toggling cannot cycle
+    // the devices' modes. They are taken again after it (below).
+    let takes = count(&stub, packet_id::SET_CUSTOM_MODE);
+    let resumed = Instant::now();
     led.set_paused(false);
     tick_until(&mut led, "active again", |led| {
         led.status().state == "active"
     });
     assert_eq!(led.running_pid(), Some(pid));
+    while resumed.elapsed() < Duration::from_millis(2500) {
+        led.tick();
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        count(&stub, packet_id::SET_CUSTOM_MODE),
+        takes,
+        "retaken too soon"
+    );
 
     // Config change live: brightness 0 → black LEDs, same process.
     led.set_settings(LedSettings {

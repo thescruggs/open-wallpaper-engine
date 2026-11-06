@@ -110,8 +110,12 @@ pub struct SavedMode {
     pub mode: Mode,
     /// The LED colours at save time, kept only when the saved mode is
     /// [`Mode::is_direct`] (that mode shows the last colours sent, so they
-    /// are part of the user's lighting); empty otherwise. Restore re-sends
-    /// them when the LED count still matches.
+    /// are part of the user's lighting); empty otherwise, and empty when
+    /// every colour is black (review fixes C1: a freshly started OpenRGB
+    /// with no profile reports Direct with an all-zero buffer while the
+    /// hardware shows its own effect — re-sending zeros would blank the
+    /// device). Restore re-sends non-empty colours when the LED count still
+    /// matches.
     pub colors: Vec<Rgb>,
     /// Filled in once the switch to per-LED control was observed.
     pub control: Option<ControlMode>,
@@ -132,6 +136,8 @@ pub struct Client {
     list_dirty: bool,
     poisoned: bool,
     saved: Vec<SavedMode>,
+    /// +1 on every change of `saved` ([`Client::saved_revision`]).
+    saved_revision: u64,
 }
 
 impl std::fmt::Debug for Client {
@@ -171,6 +177,7 @@ impl Client {
             list_dirty: true,
             poisoned: false,
             saved: Vec::new(),
+            saved_revision: 0,
         };
         client.negotiate()?;
         let mut name = client.config.client_name.clone().into_bytes();
@@ -405,7 +412,7 @@ impl Client {
             occurrence,
             index,
             mode: mode.clone(),
-            colors: if mode.is_direct() {
+            colors: if mode.is_direct() && !all_black(&controller.colors) {
                 controller.colors.clone()
             } else {
                 Vec::new()
@@ -422,6 +429,7 @@ impl Client {
     pub fn take_control(&mut self, id: ControllerId) -> Result<()> {
         if let Some(entry) = self.mode_to_save(id)? {
             self.saved.push(entry);
+            self.saved_revision += 1;
         }
         let (key, occurrence) = self.slot(id).ok_or(Error::UnknownController(id.index()))?;
         self.send(id.index(), packet_id::SET_CUSTOM_MODE, &[])?;
@@ -442,6 +450,7 @@ impl Client {
             && entry.control.is_none()
         {
             entry.control = control;
+            self.saved_revision += 1;
         }
         self.controllers[id.index() as usize] = updated;
         Ok(())
@@ -527,9 +536,28 @@ impl Client {
         &self.saved
     }
 
+    /// Changes whenever the remembered set changes (adds, removals, a
+    /// recorded control mode), so a caller persisting it can skip the
+    /// encoding when nothing changed. Starts at 0 per connection.
+    pub fn saved_revision(&self) -> u64 {
+        self.saved_revision
+    }
+
+    /// Remembered modes whose device is in the current device list (the
+    /// ones a restore could apply right now).
+    pub fn saved_present_count(&self) -> usize {
+        self.saved
+            .iter()
+            .filter(|s| self.find_slot(&s.key, s.occurrence).is_some())
+            .count()
+    }
+
     /// Removes and returns every remembered mode without restoring anything
     /// (no I/O; works on a lost connection).
     pub fn take_saved_modes(&mut self) -> Vec<SavedMode> {
+        if !self.saved.is_empty() {
+            self.saved_revision += 1;
+        }
         std::mem::take(&mut self.saved)
     }
 
@@ -544,6 +572,7 @@ impl Client {
             }
             if !self.saved.iter().any(|s| s.same_slot(&m.key, m.occurrence)) {
                 self.saved.push(m);
+                self.saved_revision += 1;
             }
         }
     }
@@ -554,6 +583,13 @@ impl Client {
     /// those would overwrite lighting chosen after the switch. Entries for
     /// absent devices or without a recorded control mode are kept. Uses the
     /// current device list; no I/O. Returns the forgotten entries.
+    ///
+    /// Limit: a device still in the recorded control mode is kept, but
+    /// OpenRGB profiles and effects also run in that mode (`Direct`), so
+    /// "still frozen on our colours" cannot be told from "the user applied
+    /// their own Direct lighting since". Callers adopting entries from an
+    /// earlier process must decide first whether they are trustworthy
+    /// (the LED worker checks boot id and liveness, `LED_PROTOCOL_V1.md`).
     pub fn drop_stale_saved_modes(&mut self) -> Vec<SavedMode> {
         if self.list_dirty {
             return Vec::new();
@@ -577,6 +613,9 @@ impl Client {
                 kept.push(entry);
             }
         }
+        if !stale.is_empty() {
+            self.saved_revision += 1;
+        }
         self.saved = kept;
         stale
     }
@@ -584,7 +623,8 @@ impl Client {
     /// Restores this device's remembered mode. `Ok(false)` when nothing
     /// was saved for it. The entry is forgotten only after a successful
     /// restore or when it can never apply again
-    /// ([`Error::drops_saved_mode`]); any other error keeps it.
+    /// ([`Error::drops_saved_mode`]: the mode is gone); any other error —
+    /// including [`Error::DeviceGone`] — keeps it.
     pub fn restore(&mut self, id: ControllerId) -> Result<bool> {
         self.sync()?;
         let (key, occurrence) = self.slot(id).ok_or(Error::UnknownController(id.index()))?;
@@ -599,6 +639,7 @@ impl Client {
         let result = self.restore_with_retry(&saved);
         if result.is_ok() || result.as_ref().is_err_and(Error::drops_saved_mode) {
             self.saved.retain(|s| !s.same_slot(&key, occurrence));
+            self.saved_revision += 1;
         }
         result.map(|()| true)
     }
@@ -606,8 +647,9 @@ impl Client {
     /// Best-effort restore of every remembered mode (re-enumerating first
     /// when the device list changed). Devices are matched by
     /// [`DeviceKey`] + occurrence, not index. Restored entries and entries
-    /// that can never apply again are forgotten; every other failure keeps
-    /// its entry ([`RestoreReport::retained`]) for a later attempt.
+    /// whose mode no longer exists are forgotten; every other failure —
+    /// including a device missing from the list ([`Error::DeviceGone`]) —
+    /// keeps its entry ([`RestoreReport::retained`]) for a later attempt.
     pub fn restore_all(&mut self) -> Vec<RestoreReport> {
         self.restore_all_until(&|| false)
     }
@@ -639,6 +681,7 @@ impl Client {
             if forget {
                 self.saved
                     .retain(|s| !s.same_slot(&entry.key, entry.occurrence));
+                self.saved_revision += 1;
             }
             reports.push(RestoreReport {
                 device: entry.key,
@@ -674,7 +717,11 @@ impl Client {
             Some(m) if m.name == saved.mode.name => {}
             _ => return Err(Error::ModeGone),
         }
-        let colors_fit = !saved.colors.is_empty() && saved.colors.len() == controller.leds.len();
+        // An all-black Direct buffer is never re-sent (entries from older
+        // files may still carry one): it would blank the device.
+        let colors_fit = !saved.colors.is_empty()
+            && !all_black(&saved.colors)
+            && saved.colors.len() == controller.leds.len();
         self.update_mode(id, saved.index, &saved.mode)?;
         if colors_fit {
             self.update_leds(id, &saved.colors)?;
@@ -755,4 +802,9 @@ impl Client {
         self.send(dev_id, id, payload)?;
         self.read_reply(id, deadline)
     }
+}
+
+/// True when every colour is black (also for an empty slice).
+fn all_black(colors: &[Rgb]) -> bool {
+    colors.iter().all(|c| c.r == 0 && c.g == 0 && c.b == 0)
 }

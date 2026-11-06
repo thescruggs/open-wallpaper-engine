@@ -66,6 +66,9 @@ the live probe**): little-endian integers; colour = R, G, B, pad;
   next one, so a reconnect to a server whose devices are still in per-LED
   mode does not re-save that mode as the "previous" one. No I/O; adopt keeps
   the first entry per `DeviceKey` and stays capped at 128.
+- `client.saved_revision()`, `client.saved_present_count()` *(review fixes
+  C1)* — change counter of the remembered set; remembered entries whose
+  device is listed now.
 - `client.update_mode(id, index, &Mode)`, `client.restore(id) -> Result<bool>`,
   `client.restore_all() -> Vec<RestoreReport>` (best effort; matches devices
   by `DeviceKey {name, vendor, serial, location}`, re-enumerates first if
@@ -116,7 +119,7 @@ anything is allocated.
 | `LimitExceeded {what, value, max}` | a count/length over its cap | usable |
 | `UnsupportedVersion {server, min, max}` | negotiation refused | n/a (connect fails) |
 | `DeviceListChanged` | ids stale; call `refresh()` | usable |
-| `UnknownController(i)` / `DeviceGone` / `ModeGone` / `InvalidArgument(..)` | caller-side (`DeviceGone`/`ModeGone`: restore only; the remembered mode is forgotten) | usable |
+| `UnknownController(i)` / `DeviceGone` / `ModeGone` / `InvalidArgument(..)` | caller-side (`DeviceGone`/`ModeGone`: restore only; `ModeGone` forgets the remembered mode, `DeviceGone` keeps it — review fixes C1) | usable |
 
 `Error::is_server_absent()` and `Error::is_connection_lost()` classify.
 No path panics on server input (mutation and truncation tests).
@@ -140,6 +143,32 @@ No path panics on server input (mutation and truncation tests).
 - `cargo run -p kwe-openrgb --features stub --example stub_server -- [--port N]`
   — prints `{"port":N}`, runs until stdin EOF, then prints the received
   packet ids, client names, and final active modes (for smoke scripts).
+
+## Changes in review fixes C1 (2026-11-06)
+
+- **`DeviceGone` keeps the remembered mode.** `Error::drops_saved_mode()`
+  is now true for `ModeGone` only. A device missing from the list at
+  restore time (OpenRGB rescan, USB replug, OpenRGB still detecting after a
+  restart) is usually back seconds later; forgetting it left the device
+  frozen on the per-LED colours. `restore` / `restore_all` report it
+  (`retained: true`) and keep it; once the device is listed again, still in
+  the recorded control mode, a restore applies it (`drop_stale_saved_modes`
+  forgets it if it came back in another mode). Test
+  `device_missing_at_restore_is_kept_and_restored_when_back`.
+- **All-black Direct is never re-sent.** `mode_to_save` / `take_control`
+  remember no colours when the device is in `Direct` with every colour
+  black (a fresh OpenRGB without a profile reports exactly that while the
+  hardware shows its own effect), and `restore` skips an all-black colour
+  list from older entries: the restore re-selects `Direct` only, leaving
+  the last colours sent. Test `all_black_direct_origin_is_not_repainted_black`.
+- `saved_revision()` (changes exactly when the remembered set changes, so
+  a caller persisting it can skip re-encoding) and `saved_present_count()`
+  (entries whose device is listed now). Test `saved_revision_tracks_changes_only`.
+- `drop_stale_saved_modes` documents its limit: a device still in the
+  recorded control mode cannot be told from one the user put into their own
+  `Direct` lighting since; callers adopting entries from another process
+  must judge their provenance first (the LED worker: boot id + liveness,
+  `LED_PROTOCOL_V1.md`).
 
 ## Changes in review fixes A (2026-11-06)
 

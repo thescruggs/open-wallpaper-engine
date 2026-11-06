@@ -47,8 +47,11 @@ pub enum Error {
     DeviceListChanged,
     #[error("controller {0} is not in the current device list")]
     UnknownController(u32),
-    /// A device whose mode was saved is no longer present (restore only).
-    #[error("device is no longer present")]
+    /// A device whose mode was saved is not in the current device list
+    /// (restore only). Usually transient (an OpenRGB rescan, a USB replug,
+    /// OpenRGB still detecting after a restart), so the remembered mode is
+    /// **kept** and applied when the device is listed again.
+    #[error("device is not in the current device list")]
     DeviceGone,
     /// The remembered mode no longer exists on the device (restore only):
     /// its index is out of range or names a different mode now.
@@ -64,11 +67,13 @@ impl Error {
         matches!(self, Error::ServerAbsent { .. })
     }
 
-    /// True for the restore outcomes after which a remembered mode can never
-    /// be applied again ([`Error::DeviceGone`], [`Error::ModeGone`]), so it
-    /// is dropped. Every other restore error keeps it for a later attempt.
+    /// True for the restore outcome after which a remembered mode can never
+    /// be applied again ([`Error::ModeGone`]: the device is listed but the
+    /// mode no longer exists), so it is dropped. Every other restore error,
+    /// including [`Error::DeviceGone`] (review fixes C1: a device missing
+    /// from the list is usually back seconds later), keeps it.
     pub fn drops_saved_mode(&self) -> bool {
-        matches!(self, Error::DeviceGone | Error::ModeGone)
+        matches!(self, Error::ModeGone)
     }
 
     /// True when the connection must be dropped and re-established.

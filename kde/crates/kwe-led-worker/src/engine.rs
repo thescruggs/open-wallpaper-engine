@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use kwe_led_protocol::{
     AudioInfo, ConfigPatch, Counters, DeviceInfo, FrameInfo, FrameState, Mode, ServerInfo, State,
@@ -20,13 +20,42 @@ use crate::color::{Rgbf, Smoother, Taus, apply_brightness, smooth_scalar};
 use crate::frame::{FrameSampler, Sample};
 use crate::log::LogLimiter;
 use crate::mapping::{ambient_zone, bass_energy, controller_colors, mono_bands, spectrum_zone};
-use crate::saved::Store;
+use crate::saved::{Store, judge};
 
 /// After the source disappears (no valid frame for the ambient modes, no
 /// fresh audio for `spectrum`), the last colours are held this long; then
 /// every device is released (its remembered mode restored) until a source
 /// returns. Nothing is ever driven to black for lack of a source.
 pub const FRAME_HOLD: Duration = Duration::from_secs(2);
+/// A frame read within this long counts as "a frame is showing now" for
+/// takeover (tolerates one busy read at the 4 Hz waiting tick).
+pub const FRAME_NOW: Duration = Duration::from_millis(500);
+/// An audio frame whose loudest (perceptual) band is below this is silence.
+/// Bands are `sqrt(mean(left, right))`, so 0.05 is a raw level of 0.0025 —
+/// far below anything audible, and a spectrum LED at 0.05 is near black
+/// anyway.
+pub const SILENCE_LEVEL: f32 = 0.05;
+/// `spectrum` releases the devices after this long without sound even
+/// while (silent) audio frames keep arriving; `ambient+pulse` stops pulsing
+/// (steady ambient). Gaps between songs or sentences are shorter, so they
+/// neither release nor stop the pulse.
+pub const SILENCE_RELEASE: Duration = Duration::from_secs(3);
+/// A source must be present continuously this long before devices are
+/// taken over (filters blips: a single audio burst, a frame published for
+/// an instant).
+pub const TAKEOVER_DWELL: Duration = Duration::from_secs(1);
+/// Devices are not taken over again sooner than this after a release (a
+/// flapping source, or the daemon's pause toggling mode `off` on every
+/// fullscreen switch, costs at most one mode-switch cycle per this long).
+/// A mode change between two non-`off` modes, or enabling a device, skips
+/// it once.
+pub const MIN_RETAKE: Duration = Duration::from_secs(5);
+/// Entries adopted from the saved-modes file are trusted only when the
+/// file is from this boot and its writer was alive (mtime) within this
+/// long. Covers a crash respawn (1 s), a daemon restart by systemd (2 s +
+/// start), and a wedged worker killed by the daemon (no touch for up to
+/// 30 s stale + 4 s grace + 1 s respawn), plus the 5 s touch interval.
+pub const SAVED_FRESH: Duration = Duration::from_secs(60);
 /// Tick period while connected but not driving (waiting for a source):
 /// bounds how fast a returning source is picked up.
 pub const IDLE_TICK: Duration = Duration::from_millis(250);
@@ -59,11 +88,32 @@ pub const PULSE_FLOOR: f32 = 0.2;
 pub const BACKOFF_MIN: Duration = Duration::from_secs(1);
 pub const BACKOFF_MAX: Duration = Duration::from_secs(60);
 
+/// Hysteresis and silence timings (hidden CLI flags scale them in tests).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timings {
+    pub takeover_dwell: Duration,
+    pub min_retake: Duration,
+    pub silence_release: Duration,
+    pub saved_fresh: Duration,
+}
+
+impl Default for Timings {
+    fn default() -> Self {
+        Self {
+            takeover_dwell: TAKEOVER_DWELL,
+            min_retake: MIN_RETAKE,
+            silence_release: SILENCE_RELEASE,
+            saved_fresh: SAVED_FRESH,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     pub client: ClientConfig,
     pub backoff_min: Duration,
     pub backoff_max: Duration,
+    pub timings: Timings,
 }
 
 impl EngineConfig {
@@ -80,6 +130,7 @@ impl EngineConfig {
             },
             backoff_min: BACKOFF_MIN,
             backoff_max: BACKOFF_MAX,
+            timings: Timings::default(),
         }
     }
 }
@@ -278,6 +329,15 @@ impl RestoreParts {
         }
     }
 
+    /// Nothing to restore: makes sure no saved-modes file is left (a
+    /// release in the tick the stop interrupted may not have been
+    /// persisted). Bounded: at most one unlink.
+    pub fn settle_empty(mut self) {
+        if let Some(store) = &mut self.store {
+            let _ = store.write(&[]);
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.carried.is_empty()
             && self
@@ -308,6 +368,23 @@ pub struct Engine {
     frame_state: FrameState,
     frame_ok_at: Option<Instant>,
     audio: Option<(Instant, Vec<f32>)>,
+    /// When the last audio frame with sound (≥ [`SILENCE_LEVEL`]) arrived.
+    loud_at: Option<Instant>,
+    /// Start of the current unbroken stretch with a source present now.
+    live_since: Option<Instant>,
+    /// When devices were last given back (a release that restored any).
+    released_at: Option<Instant>,
+    /// A user action (mode change between non-`off` modes, device enabled)
+    /// lets the next takeover skip [`Timings::min_retake`] once.
+    retake_bypass: bool,
+    /// Bumped whenever the remembered set moves between the client and
+    /// `carried` (connect, connection lost, file adoption); with the
+    /// client's revision it tells [`Engine::persist`] whether anything
+    /// changed since the last write.
+    saved_epoch: u64,
+    persisted: Option<(u64, u64)>,
+    /// Slots whose remembered device was reported missing (logged once).
+    gone_noted: HashSet<String>,
     pulse: f32,
     smoothers: HashMap<String, Smoother>,
     last_sent: HashMap<String, (Instant, Vec<Rgb>)>,
@@ -348,6 +425,13 @@ impl Engine {
             sampler: FrameSampler::default(),
             frame_ok_at: None,
             audio: None,
+            loud_at: None,
+            live_since: None,
+            released_at: None,
+            retake_bypass: false,
+            saved_epoch: 0,
+            persisted: None,
+            gone_noted: HashSet::new(),
             pulse: 1.0,
             smoothers: HashMap::new(),
             last_sent: HashMap::new(),
@@ -362,8 +446,27 @@ impl Engine {
     /// Persists remembered modes at `path` (`--saved-modes`): adopts what
     /// the file holds (a previous worker that died without restoring) and
     /// keeps the file a superset of the devices this worker switched.
-    pub fn with_saved_modes(mut self, path: PathBuf, now: Instant) -> Self {
+    ///
+    /// Adoption is conservative (review fixes C1): the entries are trusted
+    /// only when the file is from the current boot and its writer was alive
+    /// within [`Timings::saved_fresh`] (see [`judge`]). Otherwise every
+    /// entry is forgotten (one log line) and the devices are left alone: a
+    /// device still in the recorded per-LED mode may be showing lighting
+    /// the user applied since (OpenRGB profiles and effects use `Direct`).
+    pub fn with_saved_modes(self, path: PathBuf, now: Instant) -> Self {
         let (store, loaded) = Store::open(path);
+        self.adopt_store(store, loaded, now, SystemTime::now())
+    }
+
+    /// [`Engine::with_saved_modes`] with an opened store and an explicit
+    /// wall-clock time (tests).
+    pub fn adopt_store(
+        mut self,
+        mut store: Store,
+        loaded: crate::saved::Loaded,
+        now: Instant,
+        wall: SystemTime,
+    ) -> Self {
         if let Some(why) = &loaded.ignored {
             self.log.log(
                 now,
@@ -371,15 +474,57 @@ impl Engine {
                 &format!("detail=ignored reason={why} path={:?}", store.path()),
             );
         } else if !loaded.entries.is_empty() {
-            self.log.log(
-                now,
-                "saved_modes",
-                &format!("detail=adopted entries={}", loaded.entries.len()),
-            );
+            match judge(
+                &loaded.provenance,
+                store.boot_id(),
+                wall,
+                self.cfg.timings.saved_fresh,
+            ) {
+                Ok(()) => {
+                    self.log.log(
+                        now,
+                        "saved_modes",
+                        &format!("detail=adopted entries={}", loaded.entries.len()),
+                    );
+                    merge_saved(&mut self.carried, loaded.entries);
+                }
+                Err(why) => {
+                    // Remove it now: liveness touches must never make an
+                    // untrusted file look fresh to a later worker.
+                    let _ = store.write(&[]);
+                    self.log.log(
+                        now,
+                        "saved_modes",
+                        &format!(
+                            "detail=forgotten reason={why} entries={}",
+                            loaded.entries.len()
+                        ),
+                    );
+                }
+            }
         }
-        merge_saved(&mut self.carried, loaded.entries);
+        self.saved_epoch += 1;
         self.store = Some(store);
         self
+    }
+
+    /// The saved-modes store, if any (tests, diagnostics).
+    pub fn store(&self) -> Option<&Store> {
+        self.store.as_ref()
+    }
+
+    /// Liveness of the saved-modes file: refreshes its mtime at most every
+    /// [`crate::saved::TOUCH_INTERVAL`] while it exists. Cheap; call every
+    /// loop iteration.
+    pub fn housekeeping(&mut self, now: Instant) {
+        if let Some(store) = self.store.as_mut() {
+            store.touch(now);
+        }
+    }
+
+    /// When [`Engine::housekeeping`] next has work.
+    pub fn next_housekeeping(&self) -> Option<Instant> {
+        self.store.as_ref().and_then(Store::next_touch)
     }
 
     pub fn settings(&self) -> &Settings {
@@ -404,7 +549,19 @@ impl Engine {
     }
 
     pub fn apply_config(&mut self, patch: ConfigPatch) {
+        let (old_mode, old_disabled) = (self.settings.mode, self.settings.disabled.clone());
         self.settings.apply(patch);
+        let mode = self.settings.mode;
+        let switched = old_mode != mode && old_mode != Mode::Off && mode != Mode::Off;
+        let enabled_one = old_disabled
+            .difference(&self.settings.disabled)
+            .next()
+            .is_some();
+        // Mode off → on is not a bypass: the daemon's pause uses exactly
+        // that, and it must stay bounded.
+        if switched || enabled_one {
+            self.retake_bypass = true;
+        }
     }
 
     pub fn set_frame_path(&mut self, path: Option<PathBuf>) {
@@ -428,7 +585,11 @@ impl Engine {
 
     pub fn set_audio(&mut self, now: Instant, left: &[f32], right: &[f32]) {
         self.counters.audio_frames = self.counters.audio_frames.saturating_add(1);
-        self.audio = Some((now, mono_bands(left, right)));
+        let bands = mono_bands(left, right);
+        if bands.iter().any(|b| *b >= SILENCE_LEVEL) {
+            self.loud_at = Some(now);
+        }
+        self.audio = Some((now, bands));
     }
 
     /// Probe now (resets the backoff) when not connected.
@@ -463,20 +624,63 @@ impl Engine {
         }
     }
 
+    fn within(at: Option<Instant>, now: Instant, d: Duration) -> bool {
+        at.is_some_and(|t| now.saturating_duration_since(t) <= d)
+    }
+
+    /// Fresh audio frames are arriving but carry no sound.
+    fn silent(&self, now: Instant) -> bool {
+        self.fresh_bands(now).is_some() && !Self::within(self.loud_at, now, AUDIO_FRESH)
+    }
+
+    /// Sound was heard recently enough to keep reacting to it: within
+    /// [`Timings::silence_release`] and with frames still (nearly) fresh.
+    fn sound_recent(&self, now: Instant) -> bool {
+        Self::within(self.loud_at, now, self.cfg.timings.silence_release)
+            && Self::within(
+                self.audio.as_ref().map(|(t, _)| *t),
+                now,
+                AUDIO_FRESH + FRAME_HOLD,
+            )
+    }
+
+    /// The selected mode has something real to show right now (takeover
+    /// needs this continuously for [`Timings::takeover_dwell`]).
+    fn source_now(&self, now: Instant) -> bool {
+        match self.settings.mode {
+            Mode::Off => false,
+            Mode::Ambient | Mode::AmbientPulse => {
+                Self::within(self.frame_ok_at, now, FRAME_NOW) && self.sampler.grid().is_some()
+            }
+            Mode::Spectrum => {
+                self.fresh_bands(now).is_some() && Self::within(self.loud_at, now, AUDIO_FRESH)
+            }
+        }
+    }
+
     /// The selected mode has something real to show (or is inside the
-    /// hold after its source went away).
+    /// hold after its source went away). Sustained silence is no source:
+    /// `spectrum` would otherwise paint every device black for as long as
+    /// nothing plays.
     fn source_live(&self, now: Instant) -> bool {
         match self.settings.mode {
             Mode::Off => false,
             Mode::Ambient | Mode::AmbientPulse => {
-                self.frame_ok_at
-                    .is_some_and(|t| now.saturating_duration_since(t) <= FRAME_HOLD)
-                    && self.sampler.grid().is_some()
+                Self::within(self.frame_ok_at, now, FRAME_HOLD) && self.sampler.grid().is_some()
             }
-            Mode::Spectrum => self.audio.as_ref().is_some_and(|(t, _)| {
-                now.saturating_duration_since(*t) <= AUDIO_FRESH + FRAME_HOLD
-            }),
+            Mode::Spectrum => self.sound_recent(now),
         }
+    }
+
+    /// Hysteresis for taking devices over (they are not driven now).
+    fn may_take(&self, now: Instant) -> bool {
+        let t = self.cfg.timings;
+        self.live_since
+            .is_some_and(|since| now.saturating_duration_since(since) >= t.takeover_dwell)
+            && (self.retake_bypass
+                || self
+                    .released_at
+                    .is_none_or(|r| now.saturating_duration_since(r) >= t.min_retake))
     }
 
     fn set_state(&mut self, now: Instant, state: State, reason: Option<&str>) {
@@ -573,13 +777,8 @@ impl Engine {
         match connected {
             Ok(mut client) => {
                 client.adopt_saved_modes(std::mem::take(&mut self.carried));
-                for stale in client.drop_stale_saved_modes() {
-                    let detail = format!(
-                        "detail=forgotten reason=device_left_control_mode device={:?}",
-                        stale.key.name
-                    );
-                    self.log.log(now, "saved_modes", &detail);
-                }
+                self.saved_epoch += 1;
+                self.forget_stale(now, &mut client);
                 self.counters.connects = self.counters.connects.saturating_add(1);
                 self.conn = Conn::Up(Box::new(client));
                 self.driving = false;
@@ -600,8 +799,34 @@ impl Engine {
         }
     }
 
+    /// Forgets remembered modes whose device is listed in another mode than
+    /// the recorded per-LED one (the user changed it), with a log line each.
+    fn forget_stale(&mut self, now: Instant, client: &mut Client) {
+        for stale in client.drop_stale_saved_modes() {
+            let detail = format!(
+                "detail=forgotten reason=device_left_control_mode device={:?}",
+                stale.key.name
+            );
+            self.log.log(now, "saved_modes", &detail);
+        }
+    }
+
+    /// After a re-enumeration: devices no longer listed are no longer
+    /// controlled (a returning one is switched again, its original still
+    /// remembered), and remembered devices that came back in another mode
+    /// are forgotten.
+    fn after_refresh(&mut self, now: Instant, client: &mut Client) {
+        let present: HashSet<String> = device_slots(client)
+            .into_iter()
+            .map(|(_, _, slot, _)| slot)
+            .collect();
+        self.controlled.retain(|slot| present.contains(slot));
+        self.forget_stale(now, client);
+    }
+
     fn connection_lost(&mut self, now: Instant, client: &mut Client, e: &Error) {
         merge_saved(&mut self.carried, client.take_saved_modes());
+        self.saved_epoch += 1;
         self.controlled.clear();
         self.last_sent.clear();
         self.smoothers.clear();
@@ -616,19 +841,28 @@ impl Engine {
         self.set_state(now, State::Degraded, Some(error_reason(e)));
     }
 
-    /// Keeps the saved-modes file equal to what is remembered right now
-    /// (no write when unchanged). A failed write is retried next tick.
+    /// Keeps the saved-modes file equal to what is remembered right now.
+    /// Encodes and writes only when the remembered set changed since the
+    /// last successful write (epoch + client revision; review fixes C1 R5 —
+    /// it used to re-encode the whole set every tick). A failed write is
+    /// retried next tick.
     fn persist(&mut self, now: Instant) {
         let Some(store) = self.store.as_mut() else {
             return;
         };
-        let current: &[SavedMode] = match &self.conn {
-            Conn::Up(c) => c.saved_modes(),
-            Conn::Down { .. } => &self.carried,
+        let (key, current): ((u64, u64), &[SavedMode]) = match &self.conn {
+            Conn::Up(c) => ((self.saved_epoch, c.saved_revision()), c.saved_modes()),
+            Conn::Down { .. } => ((self.saved_epoch, u64::MAX), &self.carried),
         };
-        if let Err(e) = store.write(current) {
-            let detail = format!("detail=write_failed kind={:?}", e.kind());
-            self.log.log(now, "saved_modes", &detail);
+        if self.persisted == Some(key) {
+            return;
+        }
+        match store.write(current) {
+            Ok(()) => self.persisted = Some(key),
+            Err(e) => {
+                let detail = format!("detail=write_failed kind={:?}", e.kind());
+                self.log.log(now, "saved_modes", &detail);
+            }
         }
     }
 
@@ -649,15 +883,22 @@ impl Engine {
         if !matches!(self.conn, Conn::Up(_)) {
             // Disconnected: no frame reads, no LED work; just the probe.
             self.try_connect(now, stop);
-            self.persist(now);
+            if !stop() {
+                self.persist(now);
+            }
             return;
         }
 
         if matches!(self.settings.mode, Mode::Ambient | Mode::AmbientPulse) {
             self.read_frame(now);
         }
+        // In sustained silence ambient+pulse shows steady ambient instead of
+        // the 20 % floor (it would otherwise sit near-dark while nothing
+        // plays, now that capture runs whenever an audio mode is selected).
         let pulse_target = match (self.settings.mode, self.fresh_bands(now)) {
-            (Mode::AmbientPulse, Some(b)) => PULSE_FLOOR + (1.0 - PULSE_FLOOR) * bass_energy(b),
+            (Mode::AmbientPulse, Some(b)) if self.sound_recent(now) => {
+                PULSE_FLOOR + (1.0 - PULSE_FLOOR) * bass_energy(b)
+            }
             _ => 1.0,
         };
         self.pulse = smooth_scalar(self.pulse, pulse_target, dt, PULSE_TAUS);
@@ -676,32 +917,51 @@ impl Engine {
             }
             Err(e) => self.connection_lost(now, &mut client, &e),
         }
-        self.persist(now);
+        // On a stop the restore path writes the file (bounded by its own
+        // deadline); the file is already a superset of the devices in the
+        // per-LED mode (written before each switch), so skipping this keeps
+        // a large encode out of the in-flight tick.
+        if !stop() {
+            self.persist(now);
+        }
     }
 
-    /// Restores every remembered mode (mode `off`, no source). Failures
-    /// other than "device/mode gone" stay remembered and are retried.
+    /// Restores every remembered mode whose device is listed (mode `off`,
+    /// no source). Failures other than "that mode no longer exists" stay
+    /// remembered and are retried; a device missing from the list is
+    /// restored when it is listed again (still in the recorded per-LED
+    /// mode, see [`Engine::after_refresh`]).
     fn release(
         &mut self,
         client: &mut Client,
         now: Instant,
         stop: &dyn Fn() -> bool,
     ) -> Result<(), Error> {
-        self.driving = false;
+        let was_driving = std::mem::replace(&mut self.driving, false);
         self.last_sent.clear();
         self.smoothers.clear();
-        if client.saved_mode_count() > 0 {
+        let mut gave_back = false;
+        if client.saved_present_count() > 0 {
             let reports = client.restore_all_until(stop);
             for r in reports.iter() {
-                if let Err(e) = &r.result {
-                    let detail = format!(
-                        "device={:?} op=restore reason={} kept={}",
-                        cut(&r.device.name),
-                        error_reason(e),
-                        r.retained
-                    );
-                    self.log.log(now, "update_error", &detail);
-                    self.counters.update_errors = self.counters.update_errors.saturating_add(1);
+                let slot = slot_key(&r.device, r.occurrence);
+                match &r.result {
+                    Ok(()) => {
+                        gave_back = true;
+                        self.gone_noted.remove(&slot);
+                    }
+                    // Missing from the list: kept; logged once, not per tick.
+                    Err(Error::DeviceGone) if !self.gone_noted.insert(slot) => {}
+                    Err(e) => {
+                        let detail = format!(
+                            "device={:?} op=restore reason={} kept={}",
+                            cut(&r.device.name),
+                            error_reason(e),
+                            r.retained
+                        );
+                        self.log.log(now, "update_error", &detail);
+                        self.counters.update_errors = self.counters.update_errors.saturating_add(1);
+                    }
                 }
             }
             if let Some(e) = reports
@@ -711,6 +971,9 @@ impl Engine {
             {
                 return Err(e);
             }
+        }
+        if was_driving || gave_back {
+            self.released_at = Some(now);
         }
         // Still controlled = still remembered (a restore that will be
         // retried); everything else is back on the user's lighting.
@@ -735,9 +998,27 @@ impl Engine {
             client.refresh()?;
             // Indexes changed: drop per-device caches keyed by stale data.
             self.last_sent.clear();
+            self.after_refresh(now, client);
         }
-        if !self.source_live(now) {
+        let present = self.source_now(now);
+        if !present {
+            self.live_since = None;
+        } else if self.live_since.is_none() {
+            self.live_since = Some(now);
+        }
+        if self.driving {
+            if !self.source_live(now) {
+                return self.release(client, now, stop);
+            }
+        } else if !present {
+            // Nothing to show: give back anything still remembered.
             return self.release(client, now, stop);
+        } else if !self.may_take(now) {
+            // A source, but inside the takeover dwell or the minimum
+            // retake interval: leave every device exactly as it is.
+            return Ok(());
+        } else {
+            self.retake_bypass = false;
         }
         self.driving = true;
 
@@ -792,6 +1073,9 @@ impl Engine {
                         Ok(Some(entry)) => {
                             let mut all = client.saved_modes().to_vec();
                             all.push(entry);
+                            // The file now differs from the last persisted
+                            // set whatever happens next.
+                            self.persisted = None;
                             if let Err(e) = store.write(&all) {
                                 let detail = format!(
                                     "device={id} op=persist kind={:?} detail=not_taken",
@@ -939,10 +1223,13 @@ impl Engine {
             Some((w, h)) => (Some(w), Some(h)),
             None => (None, None),
         };
-        let driven_count = if reachable && self.driving && self.settings.mode != Mode::Off {
-            self.controlled.len() as u32
-        } else {
-            0
+        let driven_count = match &self.conn {
+            Conn::Up(c) if self.driving && self.settings.mode != Mode::Off => device_slots(c)
+                .iter()
+                .filter(|(_, _, slot, _)| self.controlled.contains(slot))
+                .count()
+                as u32,
+            _ => 0,
         };
         StatusLine {
             version: VERSION,
@@ -969,6 +1256,7 @@ impl Engine {
             audio: AudioInfo {
                 fresh: self.fresh_bands(now).is_some(),
                 bands: self.fresh_bands(now).map(|b| b.len() as u32),
+                silent: self.silent(now),
             },
             device_count: devices.len() as u32,
             driven_count,
@@ -1012,3 +1300,7 @@ pub fn device_info(c: &Controller, enabled: bool, controlled: bool) -> DeviceInf
         zones,
     }
 }
+
+#[cfg(test)]
+#[path = "engine_tests.rs"]
+mod tests;

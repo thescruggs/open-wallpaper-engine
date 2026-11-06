@@ -389,6 +389,9 @@ fn restore_all_reports_vanished_device() {
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].result, Err(Error::DeviceGone));
     assert_eq!(reports[0].device.name, "Stub Strip");
+    // Review fixes C1 (N3): a device missing from the list is kept.
+    assert!(reports[0].retained);
+    assert_eq!(c.saved_mode_count(), 1);
 }
 
 // ---- notifications -----------------------------------------------------
@@ -976,4 +979,106 @@ fn enumeration_total_bytes_are_budgeted() {
         "{err:?}"
     );
     assert!(c.controllers().is_empty());
+}
+
+// ---- review fixes C1 ---------------------------------------------------
+
+/// N3: a device missing from the list at restore time (OpenRGB rescan,
+/// USB replug) keeps its remembered mode, which is applied once the device
+/// is listed again — it is not left frozen on the per-LED colours.
+#[test]
+fn device_missing_at_restore_is_kept_and_restored_when_back() {
+    let s = stub(StubConfig::default());
+    let mut c = connected(&s);
+    c.take_control(ControllerId::new(0)).unwrap();
+    c.take_control(ControllerId::new(1)).unwrap();
+    let full = s.controllers();
+    s.set_controllers(vec![full[0].clone()]);
+    s.notify_device_list_updated();
+    std::thread::sleep(Duration::from_millis(100));
+    let rev = c.saved_revision();
+    let reports = c.restore_all();
+    assert_eq!(reports.len(), 2);
+    assert!(reports[0].result.is_ok(), "{reports:?}");
+    assert_eq!(reports[1].result, Err(Error::DeviceGone));
+    assert!(reports[1].retained);
+    assert_ne!(
+        c.saved_revision(),
+        rev,
+        "the restored entry changed the set"
+    );
+    assert_eq!(c.saved_mode_count(), 1);
+    assert_eq!(c.saved_present_count(), 0);
+    // Back (still in Direct, as the server left it).
+    let mut back = s.controllers();
+    back.push(full[1].clone());
+    s.set_controllers(back);
+    s.notify_device_list_updated();
+    std::thread::sleep(Duration::from_millis(100));
+    c.poll_events().unwrap();
+    c.refresh().unwrap();
+    assert_eq!(c.saved_present_count(), 1);
+    assert!(
+        c.drop_stale_saved_modes().is_empty(),
+        "still in Direct: kept"
+    );
+    let reports = c.restore_all();
+    assert!(reports.iter().all(|r| r.result.is_ok()), "{reports:?}");
+    assert!(wait_modes(&s, &[2, 2]), "{:?}", active_modes(&s));
+    assert_eq!(c.saved_mode_count(), 0);
+}
+
+/// R6: a device already in Direct with an all-zero buffer (fresh OpenRGB,
+/// no profile) is remembered without colours, and the restore does not
+/// paint it black: it re-selects Direct and leaves the last colours.
+#[test]
+fn all_black_direct_origin_is_not_repainted_black() {
+    let mut d = sample_controller("Strip", &[("A", 3)]);
+    d.active_mode = 0;
+    d.colors = vec![Rgb::new(0, 0, 0); 3];
+    let s = stub(StubConfig {
+        controllers: vec![d],
+        ..StubConfig::default()
+    });
+    let mut c = connected(&s);
+    c.take_control(ControllerId::new(0)).unwrap();
+    assert!(c.saved_modes()[0].colors.is_empty());
+    let ours = [Rgb::new(0, 160, 255); 3];
+    c.update_leds(ControllerId::new(0), &ours).unwrap();
+    // An entry adopted from an older file may still carry the zeros.
+    let mut carried = c.take_saved_modes();
+    carried[0].colors = vec![Rgb::new(0, 0, 0); 3];
+    c.adopt_saved_modes(carried);
+    let reports = c.restore_all();
+    assert!(reports.iter().all(|r| r.result.is_ok()), "{reports:?}");
+    let end = Instant::now() + Duration::from_secs(5);
+    while !s.received_ids().contains(&packet_id::UPDATE_MODE) && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    let updates = s
+        .received_ids()
+        .iter()
+        .filter(|id| **id == packet_id::UPDATE_LEDS)
+        .count();
+    assert_eq!(updates, 1, "only our own update, no black re-send");
+    assert_eq!(s.controllers()[0].colors, ours.to_vec());
+}
+
+/// R5 support: the revision moves on every change of the remembered set
+/// and only then.
+#[test]
+fn saved_revision_tracks_changes_only() {
+    let s = stub(StubConfig::default());
+    let mut c = connected(&s);
+    let r0 = c.saved_revision();
+    c.take_control(ControllerId::new(0)).unwrap();
+    let r1 = c.saved_revision();
+    assert!(r1 > r0);
+    c.take_control(ControllerId::new(0)).unwrap();
+    assert_eq!(c.saved_revision(), r1, "already remembered");
+    assert!(c.drop_stale_saved_modes().is_empty());
+    assert_eq!(c.saved_revision(), r1);
+    c.restore_all();
+    assert!(c.saved_revision() > r1);
 }

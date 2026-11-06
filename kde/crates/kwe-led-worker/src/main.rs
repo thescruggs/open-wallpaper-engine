@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use kwe_led_protocol::{Mode, is_device_id, validate_frame_path};
-use kwe_led_worker::engine::{Engine, EngineConfig, Settings, device_info};
+use kwe_led_worker::engine::{
+    Engine, EngineConfig, MIN_RETAKE, SILENCE_RELEASE, Settings, TAKEOVER_DWELL, device_info,
+};
 use kwe_led_worker::log::LogLimiter;
 use kwe_led_worker::runtime::{Outbox, RunOptions, Shared, read_lines, run};
 use kwe_openrgb::{Client, ClientConfig, Error, PROTOCOL_MAX, PROTOCOL_MIN};
@@ -70,6 +72,15 @@ struct Args {
     /// Re-probe delay cap.
     #[arg(long, default_value_t = 60_000, hide = true, value_parser = clap::value_parser!(u64).range(50..=60_000))]
     backoff_max_ms: u64,
+    /// Tests: a source must be present this long before takeover.
+    #[arg(long, default_value_t = TAKEOVER_DWELL.as_millis() as u64, hide = true, value_parser = clap::value_parser!(u64).range(0..=60_000))]
+    takeover_dwell_ms: u64,
+    /// Tests: minimum time between a release and the next takeover.
+    #[arg(long, default_value_t = MIN_RETAKE.as_millis() as u64, hide = true, value_parser = clap::value_parser!(u64).range(0..=60_000))]
+    min_retake_ms: u64,
+    /// Tests: sustained silence after which spectrum releases.
+    #[arg(long, default_value_t = SILENCE_RELEASE.as_millis() as u64, hide = true, value_parser = clap::value_parser!(u64).range(100..=60_000))]
+    silence_release_ms: u64,
     /// `--probe` I/O timeout (the whole probe is additionally bounded by a
     /// 2 s enumeration budget).
     #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u64).range(1..=30_000))]
@@ -199,6 +210,9 @@ fn main() {
     let mut cfg = EngineConfig::with_port(args.port);
     cfg.backoff_min = Duration::from_millis(args.backoff_min_ms);
     cfg.backoff_max = Duration::from_millis(args.backoff_max_ms);
+    cfg.timings.takeover_dwell = Duration::from_millis(args.takeover_dwell_ms);
+    cfg.timings.min_retake = Duration::from_millis(args.min_retake_ms);
+    cfg.timings.silence_release = Duration::from_millis(args.silence_release_ms);
     let settings = Settings {
         mode: args.mode,
         brightness: args.brightness,

@@ -419,6 +419,7 @@ pub fn run(
         }
         force_emit |= status_request;
 
+        engine.housekeeping(now);
         if now >= next_tick {
             engine.tick(now, &stopping);
             // Measured from the actual tick start, so a late tick never
@@ -458,6 +459,9 @@ pub fn run(
         if let Some(e) = end {
             wake_at = wake_at.min(e);
         }
+        if let Some(t) = engine.next_housekeeping() {
+            wake_at = wake_at.min(t);
+        }
         if opts.synthetic_audio && engine.is_connected() {
             wake_at = wake_at.min(next_synth);
         }
@@ -486,6 +490,7 @@ fn shutdown(engine: Engine, outbox: &Outbox, seq: u64, reason: &str) {
     final_status.reason = Some(reason.to_string());
     let parts = engine.into_restore_parts();
     let summary = if parts.is_empty() {
+        parts.settle_empty();
         RestoreSummary {
             attempted: 0,
             restored: 0,

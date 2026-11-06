@@ -27,6 +27,18 @@ use kwe_openrgb::wire::packet_id;
 use kwe_openrgb::{Controller, Rgb, zone_type};
 
 const WAIT: Duration = Duration::from_secs(15);
+/// The worker's hysteresis/silence timings scaled down (defaults: dwell 1 s,
+/// minimum retake 5 s, silence 3 s) so the suite does not sleep through
+/// them; a flag also given in `extra` is taken from there instead. The
+/// defaults themselves run in the daemon tests and `scripts/smoke-led.sh`.
+const SCALED_TIMINGS: &[&str] = &[
+    "--takeover-dwell-ms",
+    "150",
+    "--min-retake-ms",
+    "400",
+    "--silence-release-ms",
+    "600",
+];
 const POLL: Duration = Duration::from_millis(20);
 
 fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
@@ -115,6 +127,15 @@ fn start_on_retry(port: u16, cfg: StubConfig) -> StubServer {
     }
 }
 
+fn scaled_timings(extra: &[&str]) -> Vec<&'static str> {
+    SCALED_TIMINGS
+        .chunks(2)
+        .filter(|pair| !extra.contains(&pair[0]))
+        .flatten()
+        .copied()
+        .collect()
+}
+
 struct Worker {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -129,6 +150,7 @@ impl Worker {
             .arg("--port")
             .arg(port.to_string())
             .args(["--backoff-min-ms", "100", "--backoff-max-ms", "400"])
+            .args(scaled_timings(extra))
             .args(extra)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1210,4 +1232,198 @@ fn server_strings_cannot_inject_log_lines() {
         !log.iter().any(|l| l.starts_with("event=led.fatal")),
         "{log:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Review fixes C1
+// ---------------------------------------------------------------------------
+
+/// Worker A drives both stub devices, then is SIGKILLed (leaving them in
+/// Direct and the saved-modes file behind).
+fn killed_while_driving(stub: &StubServer, saved: &Path) {
+    let mut a = Worker::spawn(
+        stub.port(),
+        &[
+            "--mode",
+            "spectrum",
+            "--synthetic-audio",
+            "--saved-modes",
+            saved.to_str().unwrap(),
+        ],
+    );
+    a.wait_status("controlled", |s| {
+        s.devices.len() == 2 && s.devices.iter().all(|d| d.controlled)
+    });
+    a.child.kill().unwrap();
+    a.child.wait().unwrap();
+    assert!(stub.controllers().iter().all(|c| c.active_mode == 0));
+    assert!(saved.exists());
+}
+
+fn device_packets_since(stub: &StubServer, from: usize) -> Vec<u32> {
+    stub.received()[from..]
+        .iter()
+        .map(|p| p.id)
+        .filter(|id| {
+            [
+                packet_id::SET_CUSTOM_MODE,
+                packet_id::UPDATE_LEDS,
+                packet_id::UPDATE_ZONE_LEDS,
+                packet_id::UPDATE_MODE,
+            ]
+            .contains(id)
+        })
+        .collect()
+}
+
+/// N2: leftovers from a worker that has not been alive for longer than the
+/// freshness window (or from an earlier boot) never overwrite the user's
+/// new lighting, even when that lighting uses Direct like ours.
+#[test]
+fn stale_or_foreign_boot_leftovers_leave_new_direct_lighting_alone() {
+    for case in ["stale", "earlier_boot"] {
+        let stub = StubServer::start(StubConfig::default()).unwrap();
+        let dir = temp_dir(case);
+        let saved = dir.join("led-saved-modes.json");
+        killed_while_driving(&stub, &saved);
+        // The user applies their own Direct lighting (an OpenRGB profile).
+        let magenta = Rgb::new(255, 0, 255);
+        let mut list = stub.controllers();
+        for c in &mut list {
+            c.active_mode = 0;
+            c.colors.fill(magenta);
+        }
+        stub.set_controllers(list);
+        match case {
+            "stale" => {
+                let old = SystemTime::now() - Duration::from_secs(120);
+                std::fs::File::options()
+                    .write(true)
+                    .open(&saved)
+                    .unwrap()
+                    .set_modified(old)
+                    .unwrap();
+            }
+            _ => {
+                let text = std::fs::read_to_string(&saved).unwrap();
+                let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let ours = v["boot_id"].as_str().expect("boot id recorded").to_string();
+                std::fs::write(
+                    &saved,
+                    text.replace(&ours, "00000000-0000-0000-0000-000000000000"),
+                )
+                .unwrap();
+            }
+        }
+        let from = stub.received().len();
+        let mut b = Worker::spawn(
+            stub.port(),
+            &[
+                "--mode",
+                "spectrum",
+                "--saved-modes",
+                saved.to_str().unwrap(),
+            ],
+        );
+        b.wait_status("connected", |s| {
+            s.state == State::Active && s.devices.len() == 2
+        });
+        thread::sleep(Duration::from_millis(1000));
+        assert_eq!(
+            device_packets_since(&stub, from),
+            Vec::<u32>::new(),
+            "{case}"
+        );
+        assert!(
+            stub.controllers()
+                .iter()
+                .all(|c| c.active_mode == 0 && c.colors.iter().all(|k| *k == magenta)),
+            "{case}: the user's lighting is untouched"
+        );
+        assert!(!saved.exists(), "{case}: forgotten file removed");
+        let log = b.stderr.lock().unwrap().clone();
+        assert!(
+            log.iter()
+                .any(|l| l.contains("detail=forgotten") && l.contains(&format!("reason={case}"))),
+            "{case}: {log:?}"
+        );
+        b.close_stdin();
+        assert!(b.wait_exit(Duration::from_secs(5)).success());
+        assert_eq!(device_packets_since(&stub, from), Vec::<u32>::new());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+/// N3 (the review's `kill_absent`): a device missing from OpenRGB's list
+/// when the successor starts is not forgotten — it is restored when it is
+/// listed again, and the file is removed only after that.
+#[test]
+fn a_device_missing_when_the_successor_starts_is_restored_when_back() {
+    let stub = StubServer::start(StubConfig::default()).unwrap();
+    let dir = temp_dir("absent");
+    let saved = dir.join("led-saved-modes.json");
+    killed_while_driving(&stub, &saved);
+    let full = stub.controllers();
+    stub.set_controllers(vec![full[0].clone()]);
+    let mut b = Worker::spawn(
+        stub.port(),
+        &[
+            "--mode",
+            "spectrum",
+            "--saved-modes",
+            saved.to_str().unwrap(),
+        ],
+    );
+    assert!(wait_until(WAIT, || stub.controllers()[0].active_mode == 2));
+    assert!(wait_until(WAIT, || std::fs::read_to_string(&saved)
+        .is_ok_and(|t| t.matches("\"occurrence\"").count() == 1)));
+    // Rescan finished: the strip is back, still in Direct.
+    let mut back = stub.controllers();
+    back.push(full[1].clone());
+    stub.set_controllers(back);
+    stub.notify_device_list_updated();
+    assert!(
+        wait_until(WAIT, || stub.controllers()[1].active_mode == 2),
+        "strip restored: {:?}",
+        stub.controllers()
+            .iter()
+            .map(|c| c.active_mode)
+            .collect::<Vec<_>>()
+    );
+    assert!(wait_until(WAIT, || !saved.exists()));
+    b.sigterm();
+    assert!(b.wait_exit(Duration::from_secs(5)).success());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// R4 end to end: an audio source flapping like the review's reproducer
+/// (0.6 s bursts, 3 s gaps) costs a bounded number of takeovers. Real
+/// minimum retake (5 s), scaled dwell.
+#[test]
+fn flapping_audio_is_bounded_end_to_end() {
+    let stub = StubServer::start(StubConfig::default()).unwrap();
+    let mut w = Worker::spawn(
+        stub.port(),
+        &["--mode", "spectrum", "--min-retake-ms", "5000"],
+    );
+    w.wait_status("connected", |s| {
+        s.state == State::Active && s.devices.len() == 2
+    });
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(12) {
+        let burst = Instant::now();
+        while burst.elapsed() < Duration::from_millis(600) {
+            w.send(&audio_line(1.0));
+            thread::sleep(Duration::from_millis(30));
+        }
+        thread::sleep(Duration::from_millis(3000));
+    }
+    let secs = t0.elapsed().as_secs_f64();
+    let takes = count(&stub, 0, packet_id::SET_CUSTOM_MODE);
+    eprintln!("flap {secs:.1}s: {takes} takeovers of device 0");
+    // A release comes ≥ 2.5 s after a burst's last frame and the next
+    // takeover ≥ 5 s after that: ≤ 1 + secs / 7. Without hysteresis: one
+    // per burst (4 here).
+    let bound = 1 + (secs / 7.0) as usize;
+    assert!(takes >= 1 && takes <= bound, "{takes} > {bound}");
 }

@@ -118,11 +118,21 @@ Every state has an icon and text:
 | `worker_unavailable` / `not_configured` | information | Not available in this session (`--no-led-worker`) | — |
 | `starting`, `connecting` | spinner | Starting LED sync… / Restarting… / Restoring your lighting… / Looking for OpenRGB… | — |
 | `server_absent` (normal) | information | OpenRGB's SDK server is not running; LED sync is optional; OpenRGB → SDK Server → Start Server, or `openrgb --server`; connects by itself | Check again |
-| `active` / `waiting_for_source` | information | Connected to OpenRGB — waiting for a wallpaper (ambient modes) / waiting for audio (spectrum); devices keep their own lighting until then; M found | — |
+| `active` / `waiting_for_source` | information | Connected to OpenRGB — waiting for a wallpaper (ambient modes) / waiting for audio (spectrum; also shown while nothing is playing — silent audio is not a source); devices keep their own lighting until then; M found | — |
 | `active` | success | Syncing N devices with OpenRGB (N = worker `driven_count`; estimated from the list for an older worker); M found; SDK protocol version | — |
 | `off` / `paused` | pause | Paused while a fullscreen app covers the desktop or the displays are off | — |
 | `off` / none | stop | Mode is Off; devices keep their own lighting | — |
 | `degraded` | warning | LED sync is having trouble: reason in plain words; keeps retrying | Check again |
+
+Giving lighting back (review fixes C1): devices return to the lighting they
+had before LED sync took them over. That needs lighting OpenRGB knows about —
+a non-Direct mode (Static, Rainbow, …) or a loaded OpenRGB profile. A device
+that was only showing its firmware effect while OpenRGB reported Direct with
+no colours (OpenRGB just started, no profile) cannot be handed back to the
+firmware over OpenRGB's SDK: it keeps the last wallpaper colours until the
+user picks lighting in OpenRGB. Devices are not taken over again sooner than
+5 s after being given back, and a source must be present for 1 s first, so a
+flickering source or fullscreen toggling cannot make them blink.
 
 "Check again" calls `led.reprobe`; while the daemon's rate limit runs (and
 for 2 s after an accepted call) the button is disabled, never an error; while

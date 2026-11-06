@@ -527,6 +527,13 @@ pub struct AudioInfo {
     /// An `audio_bands` line arrived within the freshness window (500 ms).
     pub fresh: bool,
     pub bands: Option<u32>,
+    /// Fresh frames are arriving but carry no sound (every band below the
+    /// silence level for the last 500 ms). With `reason:
+    /// "waiting_for_source"` in `spectrum` this tells "nothing is playing"
+    /// from "no audio frames at all" (`fresh: false`). Additive (review
+    /// fixes C1): decodes as `false` from an older worker.
+    #[serde(default)]
+    pub silent: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -819,6 +826,7 @@ mod tests {
             audio: AudioInfo {
                 fresh: false,
                 bands: None,
+                silent: false,
             },
             device_count: devices.len() as u32,
             driven_count: 0,

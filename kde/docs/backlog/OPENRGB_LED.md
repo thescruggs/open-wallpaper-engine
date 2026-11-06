@@ -255,6 +255,66 @@
     pointing at THIRD_PARTY.yml `openrgb-sdk-protocol`). OPEN:
     `docs/PROVENANCE.md`'s ledger table has no OpenRGB row (file outside
     this slice's scope).
+- **Review fixes C1 — done (uncommitted, 2026-11-06), live check pending.**
+  Worker/client slice of the third review (C2 — daemon settings, capture
+  demand, scripts guard, manager, Workshop — follows separately). Each
+  regression test below was confirmed to FAIL with its fix reverted in
+  place (the pre-fix logic restored, everything else unchanged).
+  - N1 silence — CLOSED. A frame whose loudest perceptual band is < 0.05 is
+    silence; `spectrum` takes over only on sound and releases after 3 s of
+    silence (gaps shorter than that keep driving); `ambient+pulse` returns
+    to steady ambient after 3 s of silence instead of the 0.2 floor (it was
+    dimmed to ≈ 20 % — confirmed, fixed). Status: additive `audio.silent`
+    (`fresh:true, silent:true` = nothing playing; `fresh:false` = no
+    frames); reason stays `waiting_for_source`, so no new manager string.
+    Tests `engine::tests::spectrum_silence_releases_instead_of_painting_black`,
+    `ambient_pulse_is_steady_ambient_in_silence`.
+  - N2 stale saved-modes file — CLOSED with a documented limit. The file
+    carries `boot_id`; its mtime is touched every 5 s while it exists; a
+    successor adopts only same-boot entries whose writer was alive within
+    60 s, else forgets the whole file (one line) and leaves the devices
+    alone. Limit (doc): inside the 60 s window brand-new Direct lighting
+    cannot be told from our leftovers. Tests
+    `engine::tests::untrusted_leftovers_never_overwrite_new_direct_lighting`,
+    `saved::tests::provenance_is_judged_by_boot_and_liveness`,
+    `touch_refreshes_mtime_without_rewriting_and_only_while_the_file_exists`,
+    integration `stale_or_foreign_boot_leftovers_leave_new_direct_lighting_alone`.
+  - N3 device missing at restore — CLOSED. `DeviceGone` keeps the entry
+    (in memory, in the file, across a successor); restored at the next tick
+    once listed again in the recorded control mode (forgotten if it comes
+    back in another mode); logged once; absent devices are no longer
+    `controlled`. Limit (doc): missing at a stop with no worker running
+    within 60 s of its return → stays frozen. Tests
+    `engine::tests::a_device_missing_at_release_is_restored_when_it_returns`,
+    `a_device_missing_at_stop_is_restored_by_the_successor`, client
+    `device_missing_at_restore_is_kept_and_restored_when_back`, integration
+    `a_device_missing_when_the_successor_starts_is_restored_when_back`.
+  - R4 hysteresis — CLOSED. Takeover dwell 1 s; ≥ 5 s from a release to the
+    next takeover; a mode change between non-off modes or enabling a device
+    skips it once (off → on, the pause path, does not). Reproducer counts
+    (virtual clock, same scenario): flap 6 → 3 takeovers in 20 s, pause
+    toggling every 3 s 7 → 4. Tests `engine::tests::flapping_source_cycles_are_bounded`,
+    `pause_toggling_is_bounded_by_the_minimum_retake`,
+    `a_user_mode_switch_skips_the_minimum_retake_once`, integration
+    `flapping_audio_is_bounded_end_to_end`, daemon
+    `real_worker_drives_the_stub_pauses_off_and_restores_on_disable` (no
+    retake within 2.5 s of resume).
+  - R5 per-tick encode — CLOSED. Persist only when the remembered set
+    changed (client `saved_revision` + engine epoch); linear encoder (worst
+    case 12 ms release / 470 ms debug, was ≈ 1.2 s release); a tick
+    interrupted by a stop no longer persists (the restore path writes the
+    file), so the stop bound stays 3.35 s. Tests
+    `engine::tests::persist_encodes_only_when_the_set_changes`,
+    `saved::tests::encoding_is_bounded_dropping_direct_colours_first` (time).
+  - R6 all-black Direct — CLOSED as far as the protocol allows (PARTIAL in
+    effect): zeros are never re-sent; such a device is still taken over and
+    after release shows the last wallpaper colours, frozen (no SDK way back
+    to firmware control). Documented in LED_PROTOCOL_V1.md and UX_DESIGN.md.
+    Test `all_black_direct_origin_is_not_repainted_black`.
+  - Hidden worker flags `--takeover-dwell-ms`, `--min-retake-ms`,
+    `--silence-release-ms` (tests only); the worker integration suite runs
+    them scaled, the daemon tests and `smoke-led.sh` run the defaults
+    (smoke 15.9 s → 22 s).
 - **L5 — done (uncommitted, 2026-11-06), live check pending.**
   `scripts/smoke-led.sh` (opt-in `KWE_RUN_LED_SMOKE=1` in `check.sh`), with
   test-only helpers `crates/kwe-daemon/examples/led_smoke_stub.rs` (the
