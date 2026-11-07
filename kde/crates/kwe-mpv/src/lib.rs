@@ -119,6 +119,8 @@ unsafe extern "C" {
         data: *mut c_void,
     ) -> c_int;
     pub fn mpv_command(handle: *mut MpvHandle, args: *const *const c_char) -> c_int;
+    /// Frees memory returned by the API (e.g. `MPV_FORMAT_STRING` property reads).
+    pub fn mpv_free(data: *mut c_void);
     pub fn mpv_wait_event(handle: *mut MpvHandle, timeout: f64) -> *mut mpv_event;
     pub fn mpv_error_string(code: c_int) -> *const c_char;
     pub fn mpv_render_context_create(

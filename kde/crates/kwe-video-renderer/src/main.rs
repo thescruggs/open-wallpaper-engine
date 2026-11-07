@@ -382,6 +382,65 @@ fn set_nonblocking(fd: c_int) -> Result<()> {
 /// (libmpv render.h); everything else is unsupported and rejected by the
 /// caller (backend rejection, exit 73). Returns None for a format or size
 /// mismatch instead of ever publishing garbage.
+fn convert_to_bgra_into(
+    input: &[u8],
+    width: u32,
+    height: u32,
+    stride: usize,
+    format: &str,
+    output: &mut Vec<u8>,
+) -> bool {
+    let (bpp, red, green, blue) = match format {
+        "rgb24" => (3usize, 0usize, 1usize, 2usize),
+        "bgr0" => (4usize, 2usize, 1usize, 0usize),
+        "0bgr" => (4usize, 3usize, 2usize, 1usize),
+        "rgb0" => (4usize, 0usize, 1usize, 2usize),
+        "0rgb" => (4usize, 1usize, 2usize, 3usize),
+        _ => return false,
+    };
+    let width = width as usize;
+    let height = height as usize;
+    let Some(row_bytes) = width.checked_mul(bpp) else {
+        return false;
+    };
+    if stride < row_bytes {
+        return false;
+    }
+    let Some(needed) = stride.checked_mul(height) else {
+        return false;
+    };
+    if input.len() < needed {
+        return false;
+    }
+    let Some(out_bytes) = width.checked_mul(height).and_then(|px| px.checked_mul(4)) else {
+        return false;
+    };
+    // The buffer is reused across frames: no per-frame allocation of a
+    // multi-megabyte Vec (7.4 MB at 2560x720, 60 times a second).
+    output.clear();
+    output.reserve(out_bytes);
+    if format == "bgr0" {
+        // Fast path for the format we always request: the byte layout is
+        // already B,G,R,x — a row copy plus an alpha pass (both vectorise)
+        // instead of a per-pixel 4-byte push.
+        for y in 0..height {
+            output.extend_from_slice(&input[y * stride..y * stride + row_bytes]);
+        }
+        for pixel in output.chunks_exact_mut(4) {
+            pixel[3] = 255;
+        }
+        return true;
+    }
+    for y in 0..height {
+        let row = &input[y * stride..y * stride + row_bytes];
+        for pixel in row.chunks_exact(bpp) {
+            output.extend_from_slice(&[pixel[blue], pixel[green], pixel[red], 255]);
+        }
+    }
+    true
+}
+
+#[cfg(test)]
 fn convert_to_bgra(
     input: &[u8],
     width: u32,
@@ -389,32 +448,8 @@ fn convert_to_bgra(
     stride: usize,
     format: &str,
 ) -> Option<Vec<u8>> {
-    let (bpp, red, green, blue) = match format {
-        "rgb24" => (3usize, 0usize, 1usize, 2usize),
-        "bgr0" => (4usize, 2usize, 1usize, 0usize),
-        "0bgr" => (4usize, 3usize, 2usize, 1usize),
-        "rgb0" => (4usize, 0usize, 1usize, 2usize),
-        "0rgb" => (4usize, 1usize, 2usize, 3usize),
-        _ => return None,
-    };
-    let width = width as usize;
-    let height = height as usize;
-    let row_bytes = width.checked_mul(bpp)?;
-    if stride < row_bytes {
-        return None;
-    }
-    let needed = stride.checked_mul(height)?;
-    if input.len() < needed {
-        return None;
-    }
-    let mut output = Vec::with_capacity(width.checked_mul(height)?.checked_mul(4)?);
-    for y in 0..height {
-        let row = &input[y * stride..y * stride + row_bytes];
-        for pixel in row.chunks_exact(bpp) {
-            output.extend_from_slice(&[pixel[blue], pixel[green], pixel[red], 255]);
-        }
-    }
-    Some(output)
+    let mut output = Vec::new();
+    convert_to_bgra_into(input, width, height, stride, format, &mut output).then_some(output)
 }
 
 // ---------------------------------------------------------------------------
@@ -460,9 +495,28 @@ impl MpvSession {
             ("keep-open", "no"),
             ("idle", "no"),
             ("vo", "libmpv"),
-            ("cache", "yes"),
+            // Content is always a local file: the demuxer cache (`yes`
+            // meant readahead up to demuxer-max-bytes = 150 MiB, so a whole
+            // Workshop mp4 sat in anonymous memory next to the page cache)
+            // buys nothing here; plain readahead-secs pacing is enough.
+            ("cache", "no"),
         ] {
             session.set_option(name, value)?;
+        }
+        // Software-render scaler tuning. mpv's SW render path uses zimg with
+        // lanczos on a CPU-count thread pool by default, which at 1080p →
+        // 2560-wide 60 fps was ~0.7 core across 11 worker threads for a
+        // wallpaper. Best-effort: an mpv build without zimg rejects the
+        // option names and keeps its own defaults.
+        for (name, value) in [
+            ("zimg-scaler", "bilinear"),
+            ("zimg-scaler-chroma", "bilinear"),
+            ("zimg-dither", "no"),
+            ("zimg-threads", "2"),
+        ] {
+            if let Err(error) = session.set_option(name, value) {
+                eprintln!("event=renderer.video.option_ignored option={name} detail={error}");
+            }
         }
         // Global wallpaper-audio setting: `audio=no` selects no audio track
         // at all, so a muted wallpaper builds no audio pipeline (no sink
@@ -537,6 +591,32 @@ impl MpvSession {
             )
         };
         check_mpv(code, &name.to_string_lossy())
+    }
+
+    /// Reads a string property (`None` when unavailable, e.g. before the
+    /// first frame is decoded).
+    fn property_string(&self, name: &str) -> Option<String> {
+        let name = CString::new(name).ok()?;
+        let mut value: *mut c_char = std::ptr::null_mut();
+        // SAFETY: MPV_FORMAT_STRING writes a freshly allocated char* into
+        // `value`, which is released with mpv_free after copying.
+        let code = unsafe {
+            mpv_ffi::mpv_get_property(
+                self.handle,
+                name.as_ptr(),
+                mpv_ffi::MPV_FORMAT_STRING,
+                (&mut value as *mut *mut c_char).cast(),
+            )
+        };
+        if code < 0 || value.is_null() {
+            return None;
+        }
+        // SAFETY: mpv returned a NUL-terminated string that is ours to free.
+        let text = unsafe { std::ffi::CStr::from_ptr(value) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { mpv_ffi::mpv_free(value.cast()) };
+        Some(text)
     }
 
     fn set_property_flag(&mut self, name: &str, value: bool) -> Result<()> {
@@ -793,20 +873,21 @@ enum PublishDecision {
 }
 
 /// Pure keepalive decision: a new frame is published only at the pacing
-/// deadline; past it, a stale frame is re-published (keepalive) so the
-/// supervisor's frame timeout never trips; before the deadline, or with
-/// nothing published yet, wait. An empty frame is never published.
+/// deadline; past it, with no new frame and a keepalive due (something was
+/// published before and the keepalive cadence has elapsed), the sequence is
+/// bumped so the supervisor's frame timeout never trips; otherwise wait. An
+/// empty frame is never published.
 fn next_publish(
     now: Instant,
     deadline: Instant,
     have_new_frame: bool,
-    have_last: bool,
+    keepalive_due: bool,
 ) -> PublishDecision {
     if now < deadline {
         PublishDecision::Wait
     } else if have_new_frame {
         PublishDecision::NewFrame
-    } else if have_last {
+    } else if keepalive_due {
         PublishDecision::Keepalive
     } else {
         PublishDecision::Wait
@@ -920,7 +1001,10 @@ impl VideoWorker {
     fn play_loop(&mut self, session: &mut MpvSession, hwdec: &str) -> Result<Playback> {
         let interval = Duration::from_secs_f64(1.0 / f64::from(self.arguments.fps));
         let mut deadline = Instant::now();
-        let mut last_pixels: Option<Vec<u8>> = None;
+        // Reused conversion buffer (see convert_to_bgra_into).
+        let mut pixels: Vec<u8> = Vec::new();
+        let mut last_publish: Option<Instant> = None;
+        let mut hwdec_logged = false;
         let mut new_frame_queued = false;
         let mut invalid_frames = 0_u64;
         // SW rendering always targets the exact spec size; the stride is
@@ -965,7 +1049,11 @@ impl VideoWorker {
                 return Ok(Playback::Graceful);
             }
             session.drain_events()?;
-            if session.render_new_frame(&mut scratch, stride, format)? {
+            // At most one render per publish interval: a frame already
+            // converted and waiting for the deadline is published as is, so
+            // a 60 fps source paced at 30 fps costs 30 conversions a second,
+            // not 60. mpv drops the frames the loop never asked for.
+            if !new_frame_queued && session.render_new_frame(&mut scratch, stride, format)? {
                 new_frame_queued = true;
             }
             let now = Instant::now();
@@ -981,38 +1069,49 @@ impl VideoWorker {
             } else {
                 interval
             };
-            match next_publish(now, deadline, new_frame_queued, last_pixels.is_some()) {
+            // Keepalives run at the F3 cadence whether or not the render is
+            // paused: a slow decoder or paused media used to re-publish the
+            // identical frame at the wallpaper's fps, and every consumer
+            // then copied and re-uploaded 7 MB of unchanged pixels per bump.
+            let keepalive_due = last_publish
+                .is_some_and(|published| now.duration_since(published) >= RENDER_PAUSE_KEEPALIVE);
+            match next_publish(now, deadline, new_frame_queued, keepalive_due) {
                 PublishDecision::NewFrame => {
                     new_frame_queued = false;
-                    match convert_to_bgra(
+                    let converted = convert_to_bgra_into(
                         &scratch,
                         self.spec.width,
                         self.spec.height,
                         stride,
                         format,
-                    ) {
-                        Some(pixels) if pixels.len() == self.spec.pixel_bytes() => {
-                            // Exact-size check: the conversion is exact by
-                            // construction; a mismatch means a malformed
-                            // frame, which is skipped and counted, never
-                            // published.
-                            self.published = self.writer.publish(&pixels)?;
-                            last_pixels = Some(pixels);
+                        &mut pixels,
+                    );
+                    if converted && pixels.len() == self.spec.pixel_bytes() {
+                        // Exact-size check: the conversion is exact by
+                        // construction; a mismatch means a malformed frame,
+                        // which is skipped and counted, never published.
+                        self.published = self.writer.publish(&pixels)?;
+                        last_publish = Some(now);
+                        if !hwdec_logged {
+                            hwdec_logged = true;
+                            eprintln!(
+                                "event=renderer.video.decoder hwdec_current={}",
+                                session
+                                    .property_string("hwdec-current")
+                                    .unwrap_or_else(|| "unknown".to_string())
+                            );
                         }
-                        Some(_) | None => {
-                            invalid_frames = invalid_frames.saturating_add(1);
-                            diag_invalid_frame(invalid_frames);
-                        }
+                    } else {
+                        invalid_frames = invalid_frames.saturating_add(1);
+                        diag_invalid_frame(invalid_frames);
                     }
                 }
                 PublishDecision::Keepalive => {
-                    // No new frame within one pacing interval (paused video,
-                    // slow decode, loop settle): re-publish the last frame
-                    // with a new sequence. The pixels are identical — the
+                    // No new frame (paused video, slow decode, loop settle):
+                    // bump the sequence over the unchanged slot. The
                     // supervisor only watches sequence progression.
-                    if let Some(pixels) = &last_pixels {
-                        self.published = self.writer.publish(pixels)?;
-                    }
+                    self.published = self.writer.publish_keepalive()?;
+                    last_publish = Some(now);
                 }
                 PublishDecision::Wait => {}
             }
