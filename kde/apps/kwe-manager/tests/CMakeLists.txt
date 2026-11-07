@@ -27,6 +27,7 @@ add_test(NAME kwe-playlist-controller-test COMMAND kwe-playlist-controller-test)
 
 qt_add_executable(kwe-settings-client-test
     settingsclienttest.cpp
+    stubsettingsdaemon.h
     ../src/settingsclient.cpp
     ../src/settingsclient.h
 )
@@ -45,10 +46,13 @@ add_test(NAME kwe-led-sync-client-test COMMAND kwe-led-sync-client-test)
 
 qt_add_executable(kwe-renderer-defaults-test
     rendererdefaultstest.cpp
+    stubsettingsdaemon.h
     ../src/rendererdefaults.cpp
     ../src/rendererdefaults.h
+    ../src/settingsclient.cpp
+    ../src/settingsclient.h
 )
-target_link_libraries(kwe-renderer-defaults-test PRIVATE Qt6::Core Qt6::Test)
+target_link_libraries(kwe-renderer-defaults-test PRIVATE Qt6::Core Qt6::Network Qt6::Test)
 add_test(NAME kwe-renderer-defaults-test COMMAND kwe-renderer-defaults-test)
 
 qt_add_executable(kwe-permissions-client-test

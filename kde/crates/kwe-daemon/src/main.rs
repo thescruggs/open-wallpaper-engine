@@ -46,7 +46,7 @@ use playlist_session::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use settings::LedPatch;
+use settings::{LedPatch, RendererDefaultsPatch};
 use supervisor::{
     ContentSpec, OcclusionWorkerConfig, RendererKind, RendererResourceLimits, ScalingMode,
     StartSpec, SupervisorConfig, SupervisorHandle, SupervisorService, TestFault, WorkerStatus,
@@ -1242,12 +1242,29 @@ fn process_request(
                         if params.audio_output.is_none()
                             && params.pause_when_covered.is_none()
                             && params.pause_when_display_off.is_none()
-                            && params.led.as_ref().is_none_or(LedPatch::is_empty) =>
+                            && params.led.as_ref().is_none_or(LedPatch::is_empty)
+                            && params
+                                .renderer_defaults
+                                .as_ref()
+                                .is_none_or(RendererDefaultsPatch::is_empty) =>
                     {
                         json!({
                             "error": "invalid_params",
-                            "detail": "settings.set needs at least one of audio_output, pause_when_covered, pause_when_display_off, led"
+                            "detail": "settings.set needs at least one of audio_output, pause_when_covered, pause_when_display_off, led, renderer_defaults"
                         })
+                    }
+                    // Renderer-default bounds are checked before anything in
+                    // the request is applied, so a bad patch changes nothing.
+                    Ok(SettingsSetParams {
+                        renderer_defaults: Some(ref defaults),
+                        ..
+                    }) if defaults.validate().is_err() => {
+                        let detail = defaults
+                            .validate()
+                            .err()
+                            .map(|error| error.to_string())
+                            .unwrap_or_default();
+                        json!({"error": "invalid_params", "detail": detail})
                     }
                     // LED bounds are checked before anything in the request
                     // is applied, so a bad patch changes nothing.
@@ -1273,6 +1290,12 @@ fn process_request(
                         }
                         if let Some(led) = params.led.filter(|led| !led.is_empty()) {
                             handle.led_settings_set(led)?;
+                        }
+                        if let Some(defaults) = params
+                            .renderer_defaults
+                            .filter(|defaults| !defaults.is_empty())
+                        {
+                            handle.renderer_defaults_set(defaults)?;
                         }
                         settings_record(handle)
                     }),
@@ -1526,6 +1549,9 @@ struct SettingsSetParams {
     pause_when_display_off: Option<bool>,
     /// OpenRGB L3: a partial `led` record (see `settings::LedPatch`).
     led: Option<LedPatch>,
+    /// Per-kind apply defaults, partial per kind
+    /// (see `settings::RendererDefaultsPatch`).
+    renderer_defaults: Option<RendererDefaultsPatch>,
 }
 
 /// `display.power.report` params (F4): every output the helper knows about
@@ -1554,6 +1580,7 @@ fn settings_record(handle: &SupervisorHandle) -> Result<Value> {
         "pause_when_covered": handle.pause_when_covered_get()?,
         "pause_when_display_off": handle.pause_when_display_off_get()?,
         "led": handle.led_settings_get()?,
+        "renderer_defaults": handle.renderer_defaults_get()?,
     }))
 }
 
@@ -2328,6 +2355,52 @@ mod tests {
         .unwrap();
         assert!(!ok);
         assert_eq!(result["error"], "invalid_params");
+    }
+
+    /// `settings.*.renderer_defaults`: per-kind apply defaults round trip,
+    /// patch one field at a time, and a bad value rejects the whole request.
+    #[test]
+    fn renderer_defaults_round_trip_and_reject_bad_values_without_partial_apply() {
+        let service = supervisor_service();
+        let handle = service.handle();
+        let (ok, result) =
+            process_with_supervisor(r#"{"version":1,"method":"settings.get"}"#, &handle);
+        assert!(ok, "{result}");
+        let built_in = json!({"fps": 30, "scaling": "aspect"});
+        assert_eq!(
+            result["renderer_defaults"],
+            json!({"video": built_in, "scene": built_in, "web": built_in})
+        );
+        let (ok, result) = process_with_supervisor(
+            r#"{"version":1,"method":"settings.set","params":{"renderer_defaults":{"video":{"fps":60},"scene":{"scaling":"stretch"}}}}"#,
+            &handle,
+        );
+        assert!(ok, "{result}");
+        assert_eq!(
+            result["renderer_defaults"]["video"],
+            json!({"fps": 60, "scaling": "aspect"})
+        );
+        assert_eq!(
+            result["renderer_defaults"]["scene"],
+            json!({"fps": 30, "scaling": "stretch"})
+        );
+        assert_eq!(result["renderer_defaults"]["web"], built_in);
+        for bad in [
+            r#"{"version":1,"method":"settings.set","params":{"audio_output":false,"renderer_defaults":{"video":{"fps":0}}}}"#,
+            r#"{"version":1,"method":"settings.set","params":{"audio_output":false,"renderer_defaults":{"video":{"fps":241}}}}"#,
+            r#"{"version":1,"method":"settings.set","params":{"audio_output":false,"renderer_defaults":{"web":{"scaling":"sideways"}}}}"#,
+            r#"{"version":1,"method":"settings.set","params":{"audio_output":false,"renderer_defaults":{"test":{"fps":30}}}}"#,
+            r#"{"version":1,"method":"settings.set","params":{"renderer_defaults":{}}}"#,
+            r#"{"version":1,"method":"settings.set","params":{"renderer_defaults":{"video":{}}}}"#,
+        ] {
+            let (ok, result) = process_with_supervisor(bad, &handle);
+            assert!(!ok, "{bad} -> {result}");
+            assert_eq!(result["error"], "invalid_params", "{bad}");
+        }
+        let (_, result) =
+            process_with_supervisor(r#"{"version":1,"method":"settings.get"}"#, &handle);
+        assert_eq!(result["audio_output"], true, "nothing was applied");
+        assert_eq!(result["renderer_defaults"]["video"]["fps"], 60);
     }
 
     /// OpenRGB L3: `led.status` / `led.reprobe` / `settings.*.led` shapes.
@@ -5636,9 +5709,9 @@ args = parser.parse_args()
                 content: Some(fixture_scene_path_for(&catalog.read().unwrap(), "2")),
                 width: Some(320),
                 height: Some(180),
-                fps: 30,
+                fps: Some(30),
                 retry: false,
-                scaling: ScalingMode::Aspect,
+                scaling: Some(ScalingMode::Aspect),
             })
             .unwrap();
         wait_for_settled(&supervisor, &probe, "2", 1);
@@ -5693,9 +5766,9 @@ args = parser.parse_args()
             content: Some(fixture_scene_path_for(&catalog.read().unwrap(), "2")),
             width: Some(320),
             height: Some(180),
-            fps: 30,
+            fps: Some(30),
             retry: false,
-            scaling: ScalingMode::Aspect,
+            scaling: Some(ScalingMode::Aspect),
         });
         assert!(
             user_apply.is_ok(),

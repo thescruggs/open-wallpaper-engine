@@ -18,6 +18,13 @@ screencast pacing, the scene render loop) and the assignment persists it.
   values never reach the daemon (`frameRateLimitTravelsOnlyWhenNotDefault`).
 - Playlist lane: a playlist advance keeps the output's stored `fps` (like
   `scaling`) instead of resetting to 30.
+  - **Superseded 2026-11-07:** the daemon now owns per-kind defaults
+    (`settings.renderer_defaults`, edited on the manager's Settings page);
+    a playlist advance and any `wallpaper.apply` that omits `fps`/`scaling`
+    use them. The one-off values of a manual Apply no longer pin later
+    playlist entries (a 60 fps Apply used to make every later entry 60 fps
+    while the Settings page said otherwise). The manager's old QSettings
+    values migrate into the daemon record once.
 
 ## Not done / notes
 

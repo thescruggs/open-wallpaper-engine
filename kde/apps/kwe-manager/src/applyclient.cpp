@@ -216,13 +216,13 @@ void ApplyClient::writeRequest() {
             params.insert(QStringLiteral("content"), m_current.content);
         if (m_current.retry)
             params.insert(QStringLiteral("retry"), true);
-        // F1: the daemon defaults to aspect; only a non-default mode needs
-        // the wire field (keeps older daemons' deny_unknown_fields happy
-        // for the default path).
-        if (!m_current.scaling.isEmpty() && m_current.scaling != QStringLiteral("aspect"))
+        // The pickers are explicit choices, so both always travel: an
+        // omitted field now means "use the daemon's per-kind default"
+        // (settings.renderer_defaults), which may differ from what the
+        // user just selected.
+        if (!m_current.scaling.isEmpty())
             params.insert(QStringLiteral("scaling"), m_current.scaling);
-        // F2: only a non-default rate travels (30 is the daemon default).
-        if (m_current.fps > 0 && m_current.fps != 30)
+        if (m_current.fps > 0)
             params.insert(QStringLiteral("fps"), m_current.fps);
         break;
     case Restore:

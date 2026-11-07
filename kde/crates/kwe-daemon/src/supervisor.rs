@@ -31,7 +31,9 @@ use crate::occlusion::{OcclusionDetector, OcclusionDetectorStatus};
 #[cfg(test)]
 use crate::persist::unix_nanos;
 use crate::persist::{atomic_write, ensure_private_dir, unix_seconds};
-use crate::settings::{LedPatch, LedSettings, SettingsStore};
+use crate::settings::{
+    LedPatch, LedSettings, RendererDefaults, RendererDefaultsPatch, SettingsStore,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use kwe_core::{preflight_scene, preflight_video, preflight_web};
 use kwe_frame_protocol::{FrameSnapshot, FrameSpec, ProtocolError, SharedFrameReader};
@@ -794,6 +796,12 @@ enum ControlCommand {
     OcclusionReport(bool, mpsc::Sender<Result<WorkerStatus>>),
     PauseWhenDisplayOffGet(mpsc::Sender<Result<bool>>),
     PauseWhenDisplayOffSet(bool, mpsc::Sender<Result<bool>>),
+    /// Per-kind apply defaults (fps, scaling) owned by the daemon.
+    RendererDefaultsGet(mpsc::Sender<Result<RendererDefaults>>),
+    RendererDefaultsSet(
+        RendererDefaultsPatch,
+        mpsc::Sender<Result<RendererDefaults>>,
+    ),
     /// F4: the helper's (or a test's) verdict — every output powered down.
     DisplayPowerReport(bool, mpsc::Sender<Result<WorkerStatus>>),
     /// OpenRGB L3: LED settings record, live status, "Check again".
@@ -920,6 +928,16 @@ impl SupervisorHandle {
 
     pub fn pause_when_display_off_set(&self, enabled: bool) -> Result<bool> {
         self.request_value(|reply| ControlCommand::PauseWhenDisplayOffSet(enabled, reply))
+    }
+
+    pub fn renderer_defaults_get(&self) -> Result<RendererDefaults> {
+        self.request_value(ControlCommand::RendererDefaultsGet)
+    }
+
+    /// Persists the patched per-kind defaults; the next apply or playlist
+    /// advance uses them (the live renderer is not respawned).
+    pub fn renderer_defaults_set(&self, patch: RendererDefaultsPatch) -> Result<RendererDefaults> {
+        self.request_value(|reply| ControlCommand::RendererDefaultsSet(patch, reply))
     }
 
     /// F4: feed a display power verdict. `asleep` means every output is
@@ -1275,6 +1293,18 @@ impl SupervisorRuntime {
                 }
                 Ok(ControlCommand::PauseWhenDisplayOffSet(enabled, reply)) => {
                     let result = self.set_pause_when_display_off(enabled);
+                    let _ = reply.send(result);
+                }
+                Ok(ControlCommand::RendererDefaultsGet(reply)) => {
+                    let _ = reply.send(Ok(self.settings_store.renderer_defaults().clone()));
+                }
+                Ok(ControlCommand::RendererDefaultsSet(patch, reply)) => {
+                    let result = self
+                        .settings_store
+                        .renderer_defaults()
+                        .patched(&patch)
+                        .and_then(|next| self.settings_store.set_renderer_defaults(next))
+                        .map(|_| self.settings_store.renderer_defaults().clone());
                     let _ = reply.send(result);
                 }
                 Ok(ControlCommand::DisplayPowerReport(asleep, reply)) => {

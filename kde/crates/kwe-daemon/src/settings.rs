@@ -210,6 +210,150 @@ fn validate_led_values(
     Ok(())
 }
 
+/// Per-renderer-kind apply defaults (frame-rate limit and scaling mode).
+/// The daemon owns them so every lane honours the same values: a playlist
+/// advance, a `wallpaper.apply` that omits `fps`/`scaling`, and the
+/// manager's Apply pickers (which only preselect from them). Before this
+/// record the manager kept them in its own QSettings and the playlist
+/// re-used whatever an output was last applied with by hand.
+pub const RENDERER_FPS_MIN: u32 = 1;
+pub const RENDERER_FPS_MAX: u32 = 240;
+pub const RENDERER_SCALING_MODES: [&str; 3] = ["aspect", "fill", "stretch"];
+
+const fn default_renderer_fps() -> u32 {
+    30
+}
+
+fn default_renderer_scaling() -> String {
+    "aspect".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RendererKindDefaults {
+    #[serde(default = "default_renderer_fps")]
+    pub fps: u32,
+    #[serde(default = "default_renderer_scaling")]
+    pub scaling: String,
+}
+
+impl Default for RendererKindDefaults {
+    fn default() -> Self {
+        Self {
+            fps: default_renderer_fps(),
+            scaling: default_renderer_scaling(),
+        }
+    }
+}
+
+impl RendererKindDefaults {
+    pub fn validate(&self) -> Result<()> {
+        validate_renderer_fps(self.fps)?;
+        validate_renderer_scaling(&self.scaling)
+    }
+}
+
+fn validate_renderer_fps(fps: u32) -> Result<()> {
+    if !(RENDERER_FPS_MIN..=RENDERER_FPS_MAX).contains(&fps) {
+        bail!("renderer_defaults fps must be {RENDERER_FPS_MIN}..={RENDERER_FPS_MAX}");
+    }
+    Ok(())
+}
+
+fn validate_renderer_scaling(scaling: &str) -> Result<()> {
+    if !RENDERER_SCALING_MODES.contains(&scaling) {
+        bail!("renderer_defaults scaling must be one of aspect, fill, stretch");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RendererDefaults {
+    #[serde(default)]
+    pub video: RendererKindDefaults,
+    #[serde(default)]
+    pub scene: RendererKindDefaults,
+    #[serde(default)]
+    pub web: RendererKindDefaults,
+}
+
+impl RendererDefaults {
+    pub fn validate(&self) -> Result<()> {
+        self.video.validate()?;
+        self.scene.validate()?;
+        self.web.validate()
+    }
+
+    /// The record for a renderer kind by its wire name (`video`, `scene`,
+    /// `web`); other kinds (the test renderer) have no user default.
+    pub fn for_kind(&self, kind: &str) -> Option<&RendererKindDefaults> {
+        match kind {
+            "video" => Some(&self.video),
+            "scene" => Some(&self.scene),
+            "web" => Some(&self.web),
+            _ => None,
+        }
+    }
+
+    /// Applies a validated patch; omitted fields keep their values.
+    pub fn patched(&self, patch: &RendererDefaultsPatch) -> Result<Self> {
+        patch.validate()?;
+        let mut next = self.clone();
+        for (current, change) in [
+            (&mut next.video, &patch.video),
+            (&mut next.scene, &patch.scene),
+            (&mut next.web, &patch.web),
+        ] {
+            let Some(change) = change else { continue };
+            if let Some(fps) = change.fps {
+                current.fps = fps;
+            }
+            if let Some(scaling) = &change.scaling {
+                current.scaling = scaling.clone();
+            }
+        }
+        next.validate()?;
+        Ok(next)
+    }
+}
+
+/// `settings.set {renderer_defaults}`: a partial record per kind. Unknown
+/// fields are rejected so a typo cannot silently change nothing.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RendererKindPatch {
+    pub fps: Option<u32>,
+    pub scaling: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RendererDefaultsPatch {
+    pub video: Option<RendererKindPatch>,
+    pub scene: Option<RendererKindPatch>,
+    pub web: Option<RendererKindPatch>,
+}
+
+impl RendererDefaultsPatch {
+    pub fn is_empty(&self) -> bool {
+        [&self.video, &self.scene, &self.web].iter().all(|kind| {
+            kind.as_ref()
+                .is_none_or(|k| k.fps.is_none() && k.scaling.is_none())
+        })
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        for kind in [&self.video, &self.scene, &self.web].into_iter().flatten() {
+            if let Some(fps) = kind.fps {
+                validate_renderer_fps(fps)?;
+            }
+            if let Some(scaling) = &kind.scaling {
+                validate_renderer_scaling(scaling)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedSettings {
@@ -227,6 +371,11 @@ struct PersistedSettings {
     /// record: see `LedField`.
     #[serde(default)]
     led: LedField,
+    /// Additive: files written before the record existed load with the
+    /// built-in defaults (30 fps, aspect). An out-of-range record is reset
+    /// to the defaults at load (logged), never quarantining the other knobs.
+    #[serde(default)]
+    renderer_defaults: RendererDefaults,
 }
 
 /// The persisted `led` record, isolated so a bad value cannot quarantine the
@@ -344,6 +493,7 @@ impl Default for PersistedSettings {
             pause_when_covered: false,
             pause_when_display_off: false,
             led: LedField::default(),
+            renderer_defaults: RendererDefaults::default(),
         }
     }
 }
@@ -451,6 +601,24 @@ impl SettingsStore {
         Ok(true)
     }
 
+    pub fn renderer_defaults(&self) -> &RendererDefaults {
+        &self.state.renderer_defaults
+    }
+
+    /// Persists a validated renderer-defaults record atomically. Returns
+    /// whether it changed.
+    pub fn set_renderer_defaults(&mut self, defaults: RendererDefaults) -> Result<bool> {
+        defaults.validate()?;
+        if self.state.renderer_defaults == defaults {
+            return Ok(false);
+        }
+        let mut next = self.state.clone();
+        next.renderer_defaults = defaults;
+        self.save(&next)?;
+        self.state = next;
+        Ok(true)
+    }
+
     fn save(&self, state: &PersistedSettings) -> Result<()> {
         let bytes = serde_json::to_vec_pretty(state)?;
         if bytes.len() as u64 > MAX_SETTINGS_BYTES {
@@ -491,7 +659,11 @@ impl SettingsStore {
             return PersistedSettings::default();
         }
         match serde_json::from_slice::<PersistedSettings>(&bytes) {
-            Ok(state) if state.schema_version == 1 => {
+            Ok(mut state) if state.schema_version == 1 => {
+                if let Err(error) = state.renderer_defaults.validate() {
+                    eprintln!("event=settings.renderer_defaults_reset detail={error}");
+                    state.renderer_defaults = RendererDefaults::default();
+                }
                 if let Some(reason) = &state.led.reset_reason {
                     // Only `led` is repaired (field-wise, `enabled` never
                     // forced on); the other knobs load as stored and
@@ -598,6 +770,76 @@ mod tests {
         let legacy = SettingsStore::open(&directory).unwrap();
         assert!(legacy.pause_when_covered());
         assert!(!legacy.pause_when_display_off());
+    }
+
+    #[test]
+    fn renderer_defaults_round_trip_patch_and_reset_out_of_range_records() {
+        let root = temporary_directory("renderer-defaults");
+        let mut store = SettingsStore::open(&root).unwrap();
+        assert_eq!(*store.renderer_defaults(), RendererDefaults::default());
+        assert_eq!(store.renderer_defaults().video.fps, 30);
+        assert_eq!(store.renderer_defaults().scene.scaling, "aspect");
+
+        let patch: RendererDefaultsPatch =
+            serde_json::from_str(r#"{"video":{"fps":60},"scene":{"scaling":"stretch"}}"#).unwrap();
+        assert!(!patch.is_empty());
+        let next = store.renderer_defaults().patched(&patch).unwrap();
+        assert!(store.set_renderer_defaults(next.clone()).unwrap());
+        assert!(!store.set_renderer_defaults(next).unwrap(), "unchanged");
+        let reloaded = SettingsStore::open(&root).unwrap();
+        assert_eq!(reloaded.renderer_defaults().video.fps, 60);
+        assert_eq!(reloaded.renderer_defaults().video.scaling, "aspect");
+        assert_eq!(reloaded.renderer_defaults().scene.fps, 30);
+        assert_eq!(reloaded.renderer_defaults().scene.scaling, "stretch");
+        assert_eq!(
+            reloaded.renderer_defaults().for_kind("web").unwrap().fps,
+            30
+        );
+        assert!(reloaded.renderer_defaults().for_kind("test").is_none());
+
+        // Bounds: fps 0/241 and an unknown scaling mode are refused by the
+        // patch, by the record, and by the store.
+        for bad in [
+            r#"{"video":{"fps":0}}"#,
+            r#"{"video":{"fps":241}}"#,
+            r#"{"web":{"scaling":"sideways"}}"#,
+            r#"{"web":{"bogus":1}}"#,
+        ] {
+            let parsed = serde_json::from_str::<RendererDefaultsPatch>(bad);
+            if let Ok(patch) = parsed {
+                assert!(patch.validate().is_err(), "{bad}");
+                assert!(
+                    reloaded.renderer_defaults().patched(&patch).is_err(),
+                    "{bad}"
+                );
+            }
+        }
+        assert!(
+            serde_json::from_str::<RendererDefaultsPatch>("{}")
+                .unwrap()
+                .is_empty()
+        );
+
+        // Legacy file (no record) loads the defaults; an out-of-range
+        // stored record resets to them without touching the other knobs.
+        let legacy = temporary_directory("renderer-defaults-legacy");
+        std::fs::write(
+            legacy.join(SETTINGS_FILE),
+            br#"{"schema_version":1,"audio_output":false}"#,
+        )
+        .unwrap();
+        let store = SettingsStore::open(&legacy).unwrap();
+        assert_eq!(*store.renderer_defaults(), RendererDefaults::default());
+        assert!(!store.audio_output());
+        let broken = temporary_directory("renderer-defaults-broken");
+        std::fs::write(
+            broken.join(SETTINGS_FILE),
+            br#"{"schema_version":1,"audio_output":false,"renderer_defaults":{"video":{"fps":999,"scaling":"aspect"}}}"#,
+        )
+        .unwrap();
+        let store = SettingsStore::open(&broken).unwrap();
+        assert_eq!(*store.renderer_defaults(), RendererDefaults::default());
+        assert!(!store.audio_output());
     }
 
     #[test]

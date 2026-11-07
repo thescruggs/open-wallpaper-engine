@@ -1,74 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "../src/settingsclient.h"
+#include "stubsettingsdaemon.h"
 
-#include <QJsonDocument>
 #include <QJsonObject>
-#include <QLocalServer>
-#include <QLocalSocket>
 #include <QTemporaryDir>
 #include <QtTest>
-
-// Minimal daemon stand-in answering the settings.* wire protocol.
-class StubDaemon final : public QObject {
-    Q_OBJECT
-public:
-    StubDaemon() {
-        connect(&m_server, &QLocalServer::newConnection, this, &StubDaemon::onConnection);
-    }
-    bool listen(const QString &path) { return m_server.listen(path); }
-    bool audioOutput = true;
-    bool pauseWhenCovered = false;
-    bool pauseWhenDisplayOff = false;
-    int sets = 0;
-    QJsonObject lastSetParams;
-    bool failNext = false;
-
-private:
-    QLocalServer m_server;
-
-    void onConnection() {
-        auto *socket = m_server.nextPendingConnection();
-        connect(socket, &QLocalSocket::readyRead, this, [this, socket] {
-            const auto newline = socket->peek(64 * 1024).indexOf('\n');
-            if (newline < 0)
-                return;
-            const auto request = QJsonDocument::fromJson(socket->read(newline + 1)).object();
-            const auto method = request.value(QStringLiteral("method")).toString();
-            QJsonObject result;
-            bool ok = true;
-            if (failNext) {
-                failNext = false;
-                ok = false;
-                result.insert(QStringLiteral("error"), QStringLiteral("permissions_failed"));
-            } else if (method == QStringLiteral("settings.get")) {
-                result.insert(QStringLiteral("audio_output"), audioOutput);
-                result.insert(QStringLiteral("pause_when_covered"), pauseWhenCovered);
-                result.insert(QStringLiteral("pause_when_display_off"), pauseWhenDisplayOff);
-            } else if (method == QStringLiteral("settings.set")) {
-                ++sets;
-                lastSetParams = request.value(QStringLiteral("params")).toObject();
-                if (lastSetParams.contains(QStringLiteral("audio_output")))
-                    audioOutput = lastSetParams.value(QStringLiteral("audio_output")).toBool();
-                if (lastSetParams.contains(QStringLiteral("pause_when_covered")))
-                    pauseWhenCovered =
-                        lastSetParams.value(QStringLiteral("pause_when_covered")).toBool();
-                if (lastSetParams.contains(QStringLiteral("pause_when_display_off")))
-                    pauseWhenDisplayOff =
-                        lastSetParams.value(QStringLiteral("pause_when_display_off")).toBool();
-                result.insert(QStringLiteral("audio_output"), audioOutput);
-                result.insert(QStringLiteral("pause_when_covered"), pauseWhenCovered);
-                result.insert(QStringLiteral("pause_when_display_off"), pauseWhenDisplayOff);
-            }
-            socket->write(QJsonDocument(QJsonObject{
-                              {QStringLiteral("version"), 1},
-                              {QStringLiteral("id"), request.value(QStringLiteral("id"))},
-                              {QStringLiteral("ok"), ok},
-                              {QStringLiteral("result"), result},
-                          }).toJson(QJsonDocument::Compact) + '\n');
-            socket->flush();
-        });
-    }
-};
 
 class SettingsClientTest final : public QObject {
     Q_OBJECT
@@ -80,13 +16,47 @@ private slots:
         QVERIFY(m_daemon.listen(m_socketPath));
     }
 
-    void init() {
-        m_daemon.audioOutput = true;
-        m_daemon.pauseWhenCovered = false;
-        m_daemon.pauseWhenDisplayOff = false;
-        m_daemon.sets = 0;
-        m_daemon.failNext = false;
-        m_daemon.lastSetParams = {};
+    void init() { m_daemon.reset(); }
+
+    void rendererDefaultsLoadAndPatchOneKindAtATime() {
+        m_daemon.rendererDefaults.insert(QStringLiteral("video"),
+                                         StubSettingsDaemon::kind(60, QStringLiteral("stretch")));
+        SettingsClient client(m_socketPath);
+        QVERIFY(client.rendererDefaultsAreBuiltIn());
+        QTRY_VERIFY(client.loaded());
+        QCOMPARE(client.rendererFps(QStringLiteral("video")), 60);
+        QCOMPARE(client.rendererScaling(QStringLiteral("video")), QStringLiteral("stretch"));
+        QCOMPARE(client.rendererFps(QStringLiteral("scene")), 30);
+        QCOMPARE(client.rendererScaling(QStringLiteral("web")), QStringLiteral("aspect"));
+        QVERIFY(!client.rendererDefaultsAreBuiltIn());
+        // Unknown kinds read as the built-ins and are never written.
+        QCOMPARE(client.rendererFps(QStringLiteral("toaster")), 30);
+        client.setRendererFps(QStringLiteral("toaster"), 15);
+        client.setRendererFps(QStringLiteral("scene"), 0);
+        client.setRendererFps(QStringLiteral("scene"), 241);
+        client.setRendererScaling(QStringLiteral("scene"), QStringLiteral("sideways"));
+        QCOMPARE(m_daemon.sets, 0);
+
+        client.setRendererFps(QStringLiteral("scene"), 15);
+        // Optimistic immediately, authoritative after the round trip; the
+        // patch names only the kind and field that changed.
+        QCOMPARE(client.rendererFps(QStringLiteral("scene")), 15);
+        QTRY_COMPARE(m_daemon.sets, 1);
+        QTRY_VERIFY(!client.busy());
+        QCOMPARE(m_daemon.lastSetParams.keys(), QStringList{QStringLiteral("renderer_defaults")});
+        const auto patch = m_daemon.lastSetParams.value(QStringLiteral("renderer_defaults")).toObject();
+        QCOMPARE(patch.keys(), QStringList{QStringLiteral("scene")});
+        QCOMPARE(patch.value(QStringLiteral("scene")).toObject().keys(), QStringList{QStringLiteral("fps")});
+        QCOMPARE(m_daemon.rendererDefaults.value(QStringLiteral("scene")).toObject().value(QStringLiteral("fps")).toInt(), 15);
+        QCOMPARE(m_daemon.rendererDefaults.value(QStringLiteral("video")).toObject().value(QStringLiteral("fps")).toInt(), 60);
+
+        client.setRendererScaling(QStringLiteral("web"), QStringLiteral("fill"));
+        QTRY_COMPARE(m_daemon.sets, 2);
+        QTRY_VERIFY(!client.busy());
+        QCOMPARE(client.rendererScaling(QStringLiteral("web")), QStringLiteral("fill"));
+        QCOMPARE(m_daemon.rendererDefaults.value(QStringLiteral("web")).toObject().value(QStringLiteral("scaling")).toString(),
+                 QStringLiteral("fill"));
+        QVERIFY(client.errorMessage().isEmpty());
     }
 
     void pauseWhenDisplayOffPatchesOnlyItsOwnField() {
@@ -153,7 +123,7 @@ private slots:
 
 private:
     QTemporaryDir m_root;
-    StubDaemon m_daemon;
+    StubSettingsDaemon m_daemon;
     QString m_socketPath;
 };
 

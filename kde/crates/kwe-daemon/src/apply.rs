@@ -1423,11 +1423,15 @@ pub struct ApplyWallpaperParams {
     pub width: Option<u32>,
     #[serde(default)]
     pub height: Option<u32>,
-    #[serde(default = "default_apply_fps")]
-    pub fps: u32,
-    /// F1: `aspect` (default) | `fill` | `stretch`; persisted per output.
+    /// Frame-rate limit. Omitted: the daemon's per-kind renderer default
+    /// (`settings.renderer_defaults`), which the manager's Settings page
+    /// edits; before that record existed the fallback was a fixed 30.
     #[serde(default)]
-    pub scaling: ScalingMode,
+    pub fps: Option<u32>,
+    /// F1: `aspect` | `fill` | `stretch`; persisted per output. Omitted:
+    /// the per-kind renderer default, like `fps`.
+    #[serde(default)]
+    pub scaling: Option<ScalingMode>,
     /// Clear this identity's quarantine record before starting (B4): the
     /// user saw `apply_quarantined` with the reason and chose to try
     /// anyway. Routes through the supervisor's `Retry` command — the same
@@ -1791,6 +1795,21 @@ impl ApplyHandle {
         Ok(json!({ "outputs": &cache.entries }))
     }
 
+    /// The daemon-wide apply defaults for a renderer kind (settings record
+    /// `renderer_defaults`): frame-rate limit and scaling mode. The test
+    /// kind has no user default and gets the built-ins.
+    fn renderer_defaults_for(&self, kind: RendererKind) -> Result<(u32, ScalingMode), ApplyError> {
+        let defaults = self.supervisor.renderer_defaults_get().map_err(|error| {
+            ApplyError::Transaction(format!("renderer defaults unavailable: {error}"))
+        })?;
+        let Some(record) = defaults.for_kind(kind.as_str()) else {
+            return Ok((default_apply_fps(), ScalingMode::default()));
+        };
+        let scaling = serde_json::from_value::<ScalingMode>(Value::String(record.scaling.clone()))
+            .unwrap_or_default();
+        Ok((record.fps, scaling))
+    }
+
     /// Fresh probe of the live outputs; the apply transaction and restore
     /// always re-probe so desktop indices cannot go stale mid-decision.
     pub(crate) fn enumerate_fresh(&self) -> Result<Vec<OutputInfo>, ApplyError> {
@@ -1820,6 +1839,18 @@ impl ApplyHandle {
         // 1. Validate the request into a supervisor StartSpec (single
         // validation point; content preflight runs here).
         let mut spec = build_apply_spec(&params, self.scene_assets_dir.as_deref())?;
+        // Omitted fps/scaling take the daemon's per-kind defaults (the
+        // Settings page values), so a CLI or scripted apply behaves like
+        // the manager's preselected pickers.
+        if params.fps.is_none() || params.scaling.is_none() {
+            let (fps, scaling) = self.renderer_defaults_for(params.kind)?;
+            if params.fps.is_none() {
+                spec.fps = fps;
+            }
+            if params.scaling.is_none() {
+                spec.scaling = scaling;
+            }
+        }
 
         // 2. Catalog lookup: the id must be a usable local item of the
         // requested kind.
@@ -2465,18 +2496,14 @@ impl PlaylistApplyLane for ApplyHandle {
             gate_notes = outcome.notes;
         }
 
-        spec.scaling = old_assignment
-            .as_ref()
-            .map(|assignment| assignment.scaling)
-            .unwrap_or_default();
-        // F2: the output's chosen frame-rate limit survives playlist advances.
-        if let Some(fps) = old_assignment
-            .as_ref()
-            .map(|assignment| assignment.fps)
-            .filter(|fps| (1..=240).contains(fps))
-        {
-            spec.fps = fps;
-        }
+        // Frame-rate limit and scaling come from the daemon's per-kind
+        // renderer defaults (the manager's Settings page). Until this, a
+        // playlist advance re-used whatever the output was last applied with
+        // by hand (F1/F2 inheritance), so a one-off 60 fps Apply pinned
+        // every later entry to 60 and the Settings defaults never applied.
+        let (fps, scaling) = self.renderer_defaults_for(kind)?;
+        spec.fps = fps;
+        spec.scaling = scaling;
         let result = self.complete_apply(
             &spec,
             &content,
@@ -2565,12 +2592,12 @@ fn build_apply_spec(
             content_hash: "pending".into(),
             width: params.width.unwrap_or(default_apply_width()),
             height: params.height.unwrap_or(default_apply_height()),
-            fps: params.fps,
+            fps: params.fps.unwrap_or(default_apply_fps()),
             kind: params.kind,
             content: None,
             test_fault: None,
             stderr_lines: None,
-            scaling: params.scaling,
+            scaling: params.scaling.unwrap_or_default(),
             capability_limitations: Vec::new(),
         });
     };
@@ -2591,12 +2618,12 @@ fn build_apply_spec(
         content_hash: "pending".into(),
         width: params.width.unwrap_or(default_apply_width()),
         height: params.height.unwrap_or(default_apply_height()),
-        fps: params.fps,
+        fps: params.fps.unwrap_or(default_apply_fps()),
         kind: params.kind,
         content: Some(content),
         test_fault: None,
         stderr_lines: None,
-        scaling: params.scaling,
+        scaling: params.scaling.unwrap_or_default(),
         capability_limitations: Vec::new(),
     }
     .into_validated(assets_dir)

@@ -1,57 +1,64 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "rendererdefaults.h"
 
+#include "settingsclient.h"
+
 #include <QSettings>
-#include <QStringList>
 
 namespace {
-constexpr int DefaultFps = 30;
-// Mirrors the daemon's wallpaper.apply bounds (supervisor spec: 1..=240).
-constexpr int MinFps = 1;
-constexpr int MaxFps = 240;
-const QString DefaultScaling = QStringLiteral("aspect");
+// Where releases before the daemon-owned record kept the values.
+const QString LegacyGroup = QStringLiteral("renderer-defaults");
 
-bool isRendererKind(const QString &kind) {
-    return kind == QStringLiteral("scene") || kind == QStringLiteral("video")
-        || kind == QStringLiteral("web");
-}
-
-bool isScaling(const QString &value) {
-    return value == QStringLiteral("aspect") || value == QStringLiteral("fill")
-        || value == QStringLiteral("stretch");
-}
-
-QString key(const QString &kind, const char *field) {
-    return QStringLiteral("renderer-defaults/%1/%2").arg(kind, QLatin1String(field));
+QString legacyKey(const QString &kind, const char *field) {
+    return QStringLiteral("%1/%2/%3").arg(LegacyGroup, kind, QLatin1String(field));
 }
 }
 
-RendererDefaults::RendererDefaults(QObject *parent) : QObject(parent) {}
+RendererDefaults::RendererDefaults(SettingsClient *client, QObject *parent)
+    : QObject(parent), m_client(client) {
+    connect(m_client, &SettingsClient::settingsChanged, this, [this] {
+        ++m_revision;
+        emit changed();
+        if (m_client->loaded())
+            migrateLegacySettings();
+    });
+}
 
 int RendererDefaults::fps(const QString &kind) const {
-    if (!isRendererKind(kind))
-        return DefaultFps;
-    const int value = QSettings().value(key(kind, "fps"), DefaultFps).toInt();
-    return (value >= MinFps && value <= MaxFps) ? value : DefaultFps;
+    return m_client->rendererFps(kind);
 }
 
 QString RendererDefaults::scaling(const QString &kind) const {
-    if (!isRendererKind(kind))
-        return DefaultScaling;
-    const auto value = QSettings().value(key(kind, "scaling"), DefaultScaling).toString();
-    return isScaling(value) ? value : DefaultScaling;
+    return m_client->rendererScaling(kind);
 }
 
 void RendererDefaults::setFps(const QString &kind, int value) {
-    if (!isRendererKind(kind) || value < MinFps || value > MaxFps)
-        return;
-    QSettings().setValue(key(kind, "fps"), value);
-    emit changed();
+    m_client->setRendererFps(kind, value);
 }
 
 void RendererDefaults::setScaling(const QString &kind, const QString &value) {
-    if (!isRendererKind(kind) || !isScaling(value))
+    m_client->setRendererScaling(kind, value);
+}
+
+void RendererDefaults::migrateLegacySettings() {
+    if (m_migrated)
         return;
-    QSettings().setValue(key(kind, "scaling"), value);
-    emit changed();
+    m_migrated = true;
+    QSettings settings;
+    if (!settings.childGroups().contains(LegacyGroup))
+        return;
+    // Only a daemon that still holds the built-ins takes the legacy values:
+    // a record the user already edited (or another client migrated) wins.
+    if (m_client->rendererDefaultsAreBuiltIn()) {
+        for (const auto &kind : {QStringLiteral("scene"), QStringLiteral("video"), QStringLiteral("web")}) {
+            const auto fps = settings.value(legacyKey(kind, "fps"));
+            if (fps.isValid())
+                m_client->setRendererFps(kind, fps.toInt());
+            const auto scaling = settings.value(legacyKey(kind, "scaling")).toString();
+            if (!scaling.isEmpty())
+                m_client->setRendererScaling(kind, scaling);
+        }
+    }
+    settings.remove(LegacyGroup);
+    settings.sync();
 }

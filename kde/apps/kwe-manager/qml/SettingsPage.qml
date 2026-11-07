@@ -127,7 +127,7 @@ Kirigami.ScrollablePage {
 
         Controls.Label {
             Layout.fillWidth: true
-            text: qsTr("These defaults preselect the scaling and frame-rate controls when you apply a wallpaper of each type. Displays keep the settings they were last applied with; playlists reuse each display's last applied settings.")
+            text: qsTr("Playlists apply every wallpaper of each type with these settings, and they preselect the scaling and frame-rate controls when you apply a wallpaper yourself. Lower frame rates use less CPU and GPU.")
             wrapMode: Text.Wrap
             opacity: 0.8
         }
@@ -145,23 +145,38 @@ Kirigami.ScrollablePage {
 
                 contentItem: Kirigami.FormLayout {
                     Controls.ComboBox {
+                        id: scalingBox
+
                         Kirigami.FormData.label: qsTr("Scaling:")
                         textRole: "text"
                         valueRole: "value"
+                        enabled: settingsClient.loaded
                         model: [
                             { text: qsTr("Aspect (fit, letterbox)"), value: "aspect" },
                             { text: qsTr("Fill (crop to cover)"), value: "fill" },
                             { text: qsTr("Stretch (ignore aspect)"), value: "stretch" }
                         ]
                         Accessible.name: qsTr("Default scaling mode for %1 wallpapers").arg(kindBox.modelData.kind)
-                        Component.onCompleted: currentIndex =
-                            indexOfValue(rendererDefaults.scaling(kindBox.modelData.kind))
+                        // The daemon record arrives after construction and can
+                        // change underneath (another client, migration), so the
+                        // selection is re-synced on every change.
+                        function sync() {
+                            currentIndex = indexOfValue(rendererDefaults.scaling(kindBox.modelData.kind));
+                        }
+                        Component.onCompleted: sync()
+                        Connections {
+                            target: rendererDefaults
+                            function onChanged() { scalingBox.sync(); }
+                        }
                         onActivated: rendererDefaults.setScaling(kindBox.modelData.kind, currentValue)
                     }
                     Controls.ComboBox {
+                        id: fpsBox
+
                         Kirigami.FormData.label: qsTr("Frame rate limit:")
                         textRole: "text"
                         valueRole: "value"
+                        enabled: settingsClient.loaded
                         model: [
                             { text: qsTr("15 fps"), value: 15 },
                             { text: qsTr("24 fps"), value: 24 },
@@ -170,9 +185,14 @@ Kirigami.ScrollablePage {
                         ]
                         Accessible.name: qsTr("Default frame rate limit for %1 wallpapers").arg(kindBox.modelData.kind)
                         Accessible.description: qsTr("Lower values use less CPU and GPU")
-                        Component.onCompleted: {
+                        function sync() {
                             const index = indexOfValue(rendererDefaults.fps(kindBox.modelData.kind));
                             currentIndex = index >= 0 ? index : indexOfValue(30);
+                        }
+                        Component.onCompleted: sync()
+                        Connections {
+                            target: rendererDefaults
+                            function onChanged() { fpsBox.sync(); }
                         }
                         onActivated: rendererDefaults.setFps(kindBox.modelData.kind, currentValue)
                     }

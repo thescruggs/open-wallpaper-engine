@@ -129,9 +129,10 @@ Kirigami.ScrollablePage {
         }
     }
 
-    // Preselect the Apply controls from the Settings page's per-renderer
-    // defaults. Only on selection change: a value the user picked for THIS
-    // wallpaper is never overwritten while it stays selected.
+    // Preselect the Apply controls from the per-renderer defaults (daemon
+    // settings, edited on the Settings page). On selection change and when
+    // the defaults themselves change: a value the user picked for THIS
+    // wallpaper is otherwise never overwritten while it stays selected.
     function seedApplyDefaults() {
         if (!detailPage.applyableKind)
             return;
@@ -142,6 +143,14 @@ Kirigami.ScrollablePage {
         const fpsIndex = fpsPicker.indexOfValue(rendererDefaults.fps(kind));
         if (fpsIndex >= 0)
             fpsPicker.currentIndex = fpsIndex;
+    }
+
+    Connections {
+        target: rendererDefaults
+        function onChanged() {
+            if (!applyClient.busy)
+                detailPage.seedApplyDefaults();
+        }
     }
 
     Connections {

@@ -123,11 +123,12 @@ int main(int argc, char *argv[]) {
     // (relaunching once if the loaded record differs).
     WebPreview webPreview(&permissionsClient);
     PlaylistController playlistController(socketPath);
-    // Per-renderer-kind apply defaults (Settings page); they preselect the
-    // details pane's Apply controls, the daemon still owns per-output state.
-    RendererDefaults rendererDefaults;
-    // Daemon-global settings (settings.get/set): the wallpaper-audio switch.
+    // Daemon-global settings (settings.get/set): the wallpaper-audio switch,
+    // the pause policies and the per-renderer-kind apply defaults.
     SettingsClient settingsClient(socketPath);
+    // Per-renderer-kind apply defaults (Settings page) as QML sees them;
+    // backed by the daemon record so playlists and applies honour them too.
+    RendererDefaults rendererDefaults(&settingsClient);
     // OpenRGB L4: LED sync state (led.status, polled only while the Settings
     // page is visible), "Check again" (led.reprobe) and the led settings.
     LedSyncClient ledSync(socketPath);

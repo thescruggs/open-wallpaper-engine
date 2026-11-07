@@ -532,13 +532,15 @@ private slots:
     }
 
     void scalingModeTravelsOnlyWhenNotDefault() {
-        // F1: the default apply carries no `scaling`; fill/stretch do; the
-        // retry replays the mode that failed.
+        // F1: the picked mode always travels, aspect included (an omitted
+        // `scaling` would mean the daemon's per-kind default, which may not
+        // be aspect); the retry replays the mode that failed.
         ApplyClient client(m_socketPath);
         client.applyWallpaper(QStringLiteral("DP-1"), QStringLiteral("1"), QStringLiteral("video"),
                               QUrl::fromLocalFile(QStringLiteral("/x.mp4")));
         QTRY_VERIFY_WITH_TIMEOUT(client.state() == ApplyClient::Applied, 5000);
-        QVERIFY(!m_daemon.receivedParams.first().contains(QStringLiteral("scaling")));
+        QCOMPARE(m_daemon.receivedParams.first().value(QStringLiteral("scaling")).toString(),
+                 QStringLiteral("aspect"));
         m_daemon.failByMethod.insert(QStringLiteral("wallpaper.apply"),
                                      {QStringLiteral("apply_failed"), QStringLiteral("boom")});
         client.applyWallpaper(QStringLiteral("DP-1"), QStringLiteral("1"), QStringLiteral("video"),
@@ -563,14 +565,15 @@ private slots:
     }
 
     void frameRateLimitTravelsOnlyWhenNotDefault() {
-        // F2: 30 (the daemon default) is omitted; 15 travels; the retry
+        // F2: an explicit 30 travels (an omitted fps means the daemon's
+        // per-kind default, which may not be 30); 15 travels; the retry
         // replays it; out-of-range never reaches the wire.
         ApplyClient client(m_socketPath);
         client.applyWallpaper(QStringLiteral("DP-1"), QStringLiteral("1"), QStringLiteral("video"),
                               QUrl::fromLocalFile(QStringLiteral("/x.mp4")),
                               QStringLiteral("aspect"), 30);
         QTRY_VERIFY_WITH_TIMEOUT(client.state() == ApplyClient::Applied, 5000);
-        QVERIFY(!m_daemon.receivedParams.first().contains(QStringLiteral("fps")));
+        QCOMPARE(m_daemon.receivedParams.first().value(QStringLiteral("fps")).toInt(), 30);
         m_daemon.failByMethod.insert(QStringLiteral("wallpaper.apply"),
                                      {QStringLiteral("apply_failed"), QStringLiteral("boom")});
         client.applyWallpaper(QStringLiteral("DP-1"), QStringLiteral("1"), QStringLiteral("video"),

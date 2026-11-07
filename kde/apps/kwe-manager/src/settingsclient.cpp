@@ -5,6 +5,8 @@
 #include <QJsonDocument>
 #include <QJsonParseError>
 
+#include <algorithm>
+
 namespace {
 constexpr int InitialRetryMilliseconds = 5000;
 constexpr int MaximumRetryMilliseconds = 30000;
@@ -14,6 +16,8 @@ constexpr qsizetype MaxQueuedOperations = 8;
 
 SettingsClient::SettingsClient(QString socketPath, QObject *parent)
     : QObject(parent), m_socketPath(std::move(socketPath)) {
+    for (const auto &kind : {QStringLiteral("scene"), QStringLiteral("video"), QStringLiteral("web")})
+        m_rendererDefaults.insert(kind, KindDefaults{});
     connect(&m_socket, &QLocalSocket::connected, this, &SettingsClient::writeRequest);
     connect(&m_socket, &QLocalSocket::readyRead, this, &SettingsClient::consumeResponse);
     connect(&m_socket, &QLocalSocket::errorOccurred, this, [this](QLocalSocket::LocalSocketError) {
@@ -61,6 +65,76 @@ void SettingsClient::setPauseWhenDisplayOff(bool enabled) {
     }
     send(Pending{QStringLiteral("settings.set"),
                  QJsonObject{{QStringLiteral("pause_when_display_off"), enabled}}, true});
+}
+
+bool SettingsClient::isRendererKind(const QString &kind) {
+    return kind == QStringLiteral("scene") || kind == QStringLiteral("video")
+        || kind == QStringLiteral("web");
+}
+
+bool SettingsClient::isRendererScaling(const QString &scaling) {
+    return scaling == QStringLiteral("aspect") || scaling == QStringLiteral("fill")
+        || scaling == QStringLiteral("stretch");
+}
+
+int SettingsClient::rendererFps(const QString &kind) const {
+    return m_rendererDefaults.value(kind).fps;
+}
+
+QString SettingsClient::rendererScaling(const QString &kind) const {
+    return m_rendererDefaults.value(kind).scaling;
+}
+
+bool SettingsClient::rendererDefaultsAreBuiltIn() const {
+    return std::all_of(m_rendererDefaults.cbegin(), m_rendererDefaults.cend(),
+                       [](const KindDefaults &defaults) { return defaults == KindDefaults{}; });
+}
+
+void SettingsClient::setRendererFps(const QString &kind, int fps) {
+    if (!isRendererKind(kind) || fps < MinRendererFps || fps > MaxRendererFps)
+        return;
+    if (m_rendererDefaults[kind].fps != fps || !m_loaded) {
+        m_rendererDefaults[kind].fps = fps;
+        emit settingsChanged();
+    }
+    sendRendererDefault(kind, QJsonObject{{QStringLiteral("fps"), fps}});
+}
+
+void SettingsClient::setRendererScaling(const QString &kind, const QString &scaling) {
+    if (!isRendererKind(kind) || !isRendererScaling(scaling))
+        return;
+    if (m_rendererDefaults[kind].scaling != scaling || !m_loaded) {
+        m_rendererDefaults[kind].scaling = scaling;
+        emit settingsChanged();
+    }
+    sendRendererDefault(kind, QJsonObject{{QStringLiteral("scaling"), scaling}});
+}
+
+void SettingsClient::sendRendererDefault(const QString &kind, const QJsonObject &patch) {
+    send(Pending{QStringLiteral("settings.set"),
+                 QJsonObject{{QStringLiteral("renderer_defaults"), QJsonObject{{kind, patch}}}},
+                 true});
+}
+
+bool SettingsClient::applyRendererDefaults(const QJsonObject &record) {
+    bool changed = false;
+    for (auto it = m_rendererDefaults.begin(); it != m_rendererDefaults.end(); ++it) {
+        const auto kind = record.value(it.key()).toObject();
+        if (kind.isEmpty())
+            continue;
+        KindDefaults next = it.value();
+        const int fps = kind.value(QStringLiteral("fps")).toInt(next.fps);
+        if (fps >= MinRendererFps && fps <= MaxRendererFps)
+            next.fps = fps;
+        const auto scaling = kind.value(QStringLiteral("scaling")).toString(next.scaling);
+        if (isRendererScaling(scaling))
+            next.scaling = scaling;
+        if (!(next == it.value())) {
+            it.value() = next;
+            changed = true;
+        }
+    }
+    return changed;
 }
 
 void SettingsClient::send(Pending pending) {
@@ -135,8 +209,10 @@ void SettingsClient::applyResult(const QJsonObject &result) {
         result.value(QStringLiteral("pause_when_covered")).toBool(m_pauseWhenCovered);
     const bool pauseDisplayOff = result.value(QStringLiteral("pause_when_display_off"))
                                      .toBool(m_pauseWhenDisplayOff);
+    const bool rendererChanged =
+        applyRendererDefaults(result.value(QStringLiteral("renderer_defaults")).toObject());
     const bool changed = !m_loaded || enabled != m_audioOutput || pause != m_pauseWhenCovered ||
-                         pauseDisplayOff != m_pauseWhenDisplayOff;
+                         pauseDisplayOff != m_pauseWhenDisplayOff || rendererChanged;
     m_loaded = true;
     m_audioOutput = enabled;
     m_pauseWhenCovered = pause;
