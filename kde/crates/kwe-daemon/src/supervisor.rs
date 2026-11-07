@@ -65,7 +65,12 @@ const EXIT_BACKEND_REJECT: i32 = 73;
 const EXIT_NO_DRAWABLE_CONTENT: i32 = 74;
 const MAX_STATE_BYTES: u64 = 1024 * 1024;
 const MAX_SUPERVISED_MAPPING_BYTES: u64 = 128 * 1024 * 1024;
-const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
+/// How often the live renderer's frame is re-persisted as the last-good
+/// still. Each save copies the frame, encodes a PPM and fsyncs it to the
+/// state directory on the supervisor thread (several MB; at 30 s this was
+/// ~16 GB/day of writes for a fallback image), so it is deliberately rare:
+/// promotion and display ack always persist regardless of this interval.
+const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(300);
 const MAX_ACK_BUFFER_BYTES: usize = 1024;
 const MAX_ACK_READ_BYTES_PER_TICK: usize = 4096;
 /// Bounded diagnostics: 64 complete lines or 16 KiB, whichever binds first.
@@ -1750,6 +1755,8 @@ impl SupervisorRuntime {
             Ok(channels) => channels,
             Err(error) => {
                 terminate_and_reap(&mut child, self.config.stop_grace);
+                // The renderer may already have created its frame file.
+                let _ = fs::remove_file(&frame_path);
                 cleanup_renderer_home(&home_dir);
                 return Err(error);
             }
@@ -2003,14 +2010,19 @@ impl SupervisorRuntime {
             .and_then(|worker| inspect_worker(worker, &self.config));
         if let Some(observation) = active_observation {
             match observation {
-                WorkerObservation::Progress(snapshot) => {
+                WorkerObservation::Progress => {
                     let should_save = self.retired.is_none()
                         && self.active.as_ref().is_some_and(|worker| {
                             worker.last_snapshot_saved.is_none_or(|saved| {
                                 Instant::now().duration_since(saved) >= SNAPSHOT_INTERVAL
                             })
                         });
-                    if should_save {
+                    // The pixel copy is paid only here, not on every tick;
+                    // a torn read (Busy) simply retries on the next tick.
+                    let snapshot = should_save
+                        .then(|| self.active.as_ref().and_then(worker_frame_snapshot))
+                        .flatten();
+                    if let Some(snapshot) = snapshot {
                         if let Some(worker) = self.active.as_mut() {
                             worker.last_snapshot_saved = Some(Instant::now());
                         }
@@ -2034,14 +2046,20 @@ impl SupervisorRuntime {
             .and_then(|worker| inspect_worker(worker, &self.config));
         if let Some(observation) = candidate_observation {
             match observation {
-                WorkerObservation::Progress(snapshot) => {
+                WorkerObservation::Progress => {
                     let ready = self.candidate.as_ref().is_some_and(|worker| {
                         worker.sequence >= 3
                             && Instant::now().duration_since(worker.started)
                                 >= self.config.canary_duration
                     });
                     if ready {
-                        self.promote_candidate(snapshot);
+                        // Promotion needs the pixels (last-good still); a torn
+                        // read waits for the next progress tick.
+                        if let Some(snapshot) =
+                            self.candidate.as_ref().and_then(worker_frame_snapshot)
+                        {
+                            self.promote_candidate(snapshot);
+                        }
                     } else if self.active.is_some() {
                         self.phase = WorkerPhase::Canary;
                     }
@@ -2439,8 +2457,19 @@ impl SupervisorRuntime {
 }
 
 enum WorkerObservation {
-    Progress(FrameSnapshot),
+    /// The frame sequence advanced since the last tick (header-only read).
+    Progress,
     Failure(FailureKind, String),
+}
+
+/// Full pixel copy of the worker's current frame, for the few call sites
+/// that consume pixels (promotion, the periodic last-good still). `None`
+/// when the reader is not open yet or the read tore.
+fn worker_frame_snapshot(worker: &ActiveWorker) -> Option<FrameSnapshot> {
+    worker
+        .reader
+        .as_ref()
+        .and_then(|reader| reader.snapshot().ok())
 }
 
 fn inspect_worker(
@@ -2508,11 +2537,13 @@ fn inspect_worker(
         }
     }
     if let Some(reader) = &worker.reader {
-        match reader.snapshot() {
-            Ok(snapshot) if snapshot.sequence > worker.sequence => {
-                worker.sequence = snapshot.sequence;
+        // Header-only read: the full snapshot copies the whole slot
+        // (7-15 MB) and was being thrown away 25 times a second.
+        match reader.peek() {
+            Ok(header) if header.sequence > worker.sequence => {
+                worker.sequence = header.sequence;
                 worker.last_progress = now;
-                return Some(WorkerObservation::Progress(snapshot));
+                return Some(WorkerObservation::Progress);
             }
             Ok(_) | Err(ProtocolError::Busy) => {}
             Err(error) if worker.sequence == 0 => {
@@ -2761,6 +2792,12 @@ fn env_allowlist_with_runtime(
             "XDG_RUNTIME_DIR".to_string(),
             runtime.to_string_lossy().into_owned(),
         ));
+    }
+    // libmpv's hwdec probe enumerates every Vulkan ICD; the loader then
+    // initialises lavapipe (libLLVM, ~26 MB RSS plus a thread pool) in a
+    // worker that only ever wants the GPU's driver. Mask the software ICD.
+    if kind == RendererKind::Video {
+        entries.push(("VK_LOADER_DRIVERS_DISABLE".to_string(), "*lvp*".to_string()));
     }
     entries
 }
@@ -3336,16 +3373,23 @@ mod tests {
                 "the test kind must never inherit XDG_RUNTIME_DIR"
             );
         }
-        assert_eq!(
-            env_allowlist_with_runtime(
-                RendererKind::Video,
-                home,
-                false,
-                Some("/run/user/1000".into())
-            ),
-            expected_base,
+        let video_muted = env_allowlist_with_runtime(
+            RendererKind::Video,
+            home,
+            false,
+            Some("/run/user/1000".into()),
+        );
+        assert!(
+            !video_muted
+                .iter()
+                .any(|(name, _)| name == "XDG_RUNTIME_DIR"),
             "a muted video worker must not inherit XDG_RUNTIME_DIR"
         );
+        assert!(
+            video_muted.contains(&("VK_LOADER_DRIVERS_DISABLE".to_string(), "*lvp*".to_string())),
+            "video workers mask the lavapipe ICD"
+        );
+        assert!(video_muted.starts_with(&expected_base));
         let video_loud = env_allowlist_with_runtime(
             RendererKind::Video,
             home,

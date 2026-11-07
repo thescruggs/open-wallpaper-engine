@@ -117,6 +117,15 @@ pub struct FrameSnapshot {
     pub pixels: Vec<u8>,
 }
 
+/// A consistent read of the frame header alone: what `snapshot` reports
+/// minus the pixel copy. Liveness polling only needs this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameHeader {
+    pub spec: FrameSpec,
+    pub sequence: u64,
+    pub producer_state: ProducerState,
+}
+
 #[derive(Debug, Error)]
 pub enum ProtocolError {
     #[error("frame dimensions {width}x{height} are outside 1..={MAX_DIMENSION}")]
@@ -208,6 +217,32 @@ impl SharedFrameWriter {
         Ok(even / 2)
     }
 
+    /// Advances the sequence without touching either slot: a liveness
+    /// keepalive for a producer whose picture has not changed (paused media,
+    /// decoder slower than the pacing rate). Readers observe a new sequence
+    /// over the unchanged active slot; a snapshot that straddles the bump
+    /// retries exactly as for `publish`.
+    pub fn publish_keepalive(&mut self) -> Result<u64, ProtocolError> {
+        let starting = generation_atomic(&self.mapping).load(Ordering::Acquire);
+        if starting == 0 {
+            return Err(ProtocolError::InvalidHeader(
+                "keepalive before the first published frame",
+            ));
+        }
+        let odd = if starting.is_multiple_of(2) {
+            starting.wrapping_add(1)
+        } else {
+            starting.wrapping_add(2)
+        };
+        generation_atomic(&self.mapping).store(odd, Ordering::Release);
+        fence(Ordering::SeqCst);
+        state_atomic(&self.mapping).store(ProducerState::Running as u32, Ordering::Relaxed);
+        fence(Ordering::Release);
+        let even = odd.wrapping_add(1);
+        generation_atomic(&self.mapping).store(even, Ordering::Release);
+        Ok(even / 2)
+    }
+
     pub fn set_state(&self, state: ProducerState) {
         state_atomic(&self.mapping).store(state as u32, Ordering::Release);
     }
@@ -261,6 +296,34 @@ impl SharedFrameReader {
     }
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Header-only seqlock read (no pixel copy). Supervisors poll this on
+    /// every tick; a full `snapshot` costs a copy of the whole slot
+    /// (7-15 MB at desktop sizes) and is only worth paying when the pixels
+    /// are actually consumed.
+    pub fn peek(&self) -> Result<FrameHeader, ProtocolError> {
+        for _ in 0..MAX_SNAPSHOT_ATTEMPTS {
+            let before = generation_atomic(&self.mapping).load(Ordering::Acquire);
+            if !before.is_multiple_of(2) {
+                std::hint::spin_loop();
+                continue;
+            }
+            let spec = validate_header(&self.mapping)?;
+            let state_raw = state_atomic(&self.mapping).load(Ordering::Relaxed);
+            let producer_state = ProducerState::from_raw(state_raw)
+                .ok_or(ProtocolError::InvalidHeader("unknown producer state"))?;
+            fence(Ordering::Acquire);
+            let after = generation_atomic(&self.mapping).load(Ordering::Acquire);
+            if before == after && after.is_multiple_of(2) {
+                return Ok(FrameHeader {
+                    spec,
+                    sequence: after / 2,
+                    producer_state,
+                });
+            }
+        }
+        Err(ProtocolError::Busy)
     }
 
     pub fn snapshot(&self) -> Result<FrameSnapshot, ProtocolError> {
@@ -469,6 +532,53 @@ mod tests {
         assert_eq!(snapshot.sequence, 1);
         assert_eq!(snapshot.producer_state, ProducerState::Running);
         assert_eq!(snapshot.pixels, pixels);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn keepalive_bumps_sequence_over_the_same_pixels() {
+        let path = unique_path("keepalive");
+        let spec = FrameSpec::new(8, 4).unwrap();
+        let mut writer = SharedFrameWriter::create(&path, spec).unwrap();
+        assert!(
+            writer.publish_keepalive().is_err(),
+            "nothing published yet: a keepalive would advertise an empty slot"
+        );
+        let pixels = vec![0x42; spec.pixel_bytes()];
+        assert_eq!(writer.publish(&pixels).unwrap(), 1);
+        writer.set_state(ProducerState::Stopping);
+        assert_eq!(writer.publish_keepalive().unwrap(), 2);
+        let reader = SharedFrameReader::open(&path).unwrap();
+        let snapshot = reader.snapshot().unwrap();
+        assert_eq!(snapshot.sequence, 2);
+        assert_eq!(snapshot.producer_state, ProducerState::Running);
+        assert_eq!(snapshot.pixels, pixels);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn peek_tracks_sequence_and_state_without_pixels() {
+        let path = unique_path("peek");
+        let spec = FrameSpec::new(8, 4).unwrap();
+        let mut writer = SharedFrameWriter::create(&path, spec).unwrap();
+        let reader = SharedFrameReader::open(&path).unwrap();
+        let idle = reader.peek().unwrap();
+        assert_eq!(idle.sequence, 0);
+        assert_eq!(idle.spec, spec);
+        let pixels = vec![0x11; spec.pixel_bytes()];
+        writer.publish(&pixels).unwrap();
+        writer.publish(&pixels).unwrap();
+        let header = reader.peek().unwrap();
+        assert_eq!(header.sequence, 2);
+        assert_eq!(header.producer_state, ProducerState::Running);
+        writer.set_state(ProducerState::Stopping);
+        assert_eq!(
+            reader.peek().unwrap().producer_state,
+            ProducerState::Stopping
+        );
+        // The header read agrees with the full snapshot it stands in for.
+        let snapshot = reader.snapshot().unwrap();
+        assert_eq!(snapshot.sequence, reader.peek().unwrap().sequence);
         fs::remove_file(path).unwrap();
     }
 

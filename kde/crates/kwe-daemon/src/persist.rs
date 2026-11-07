@@ -52,9 +52,16 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
         .mode(0o600)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .open(&temporary)?;
-    file.write_all(contents)?;
-    file.sync_all()?;
-    fs::rename(&temporary, path)?;
+    let written = file
+        .write_all(contents)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| fs::rename(&temporary, path));
+    if let Err(error) = written {
+        // Never leave a unique temp file behind (ENOSPC/EIO every 30 s would
+        // otherwise accumulate them).
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
     File::open(parent)?.sync_all()?;
     Ok(())
 }
