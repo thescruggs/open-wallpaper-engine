@@ -13,7 +13,7 @@
 # checkout (kde/packaging/ under the repository root), the source is the
 # local git repository at its current committed HEAD, so `makepkg -si`
 # needs no network access for the repo itself. Anywhere else (AUR builders,
-# CI) the published GitHub fork (branch kde-owe-backend) is used instead.
+# CI) the published GitHub fork (branch main) is used instead.
 #
 # The lito builder is bootstrapped from its official release archive when it
 # is not already on PATH; set LITO_BIN to use a specific binary.
@@ -21,7 +21,7 @@
 if [[ -z "${KWE_FORCE_AUR_SOURCE:-}" && -f "../../lito.toml" ]]; then
     _source="git+file://$(cd ../.. && pwd -P)#commit=$(git -C ../.. rev-parse --short HEAD)"
 else
-    _source="git+https://github.com/thescruggs/open-wallpaper-engine.git#branch=kde-owe-backend"
+    _source="git+https://github.com/thescruggs/open-wallpaper-engine.git#branch=main"
 fi
 source=("open-wallpaper-engine::${_source}")
 sha256sums=('SKIP')

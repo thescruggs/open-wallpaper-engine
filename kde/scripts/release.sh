@@ -9,7 +9,7 @@
 #
 # Usage: scripts/release.sh [--aur] [--dry-run]
 #
-# Requires a clean tree on kde-owe-backend, the built archive in
+# Requires a clean tree on main, the built archive in
 # kde/packaging/, gh (authenticated), and for --aur an SSH key registered
 # with the AUR account.
 set -euo pipefail
@@ -75,7 +75,7 @@ if ! git diff --quiet -- "$aur_pkgbuild"; then
 fi
 
 run git tag -a "$tag" -m "KDE Wallpaper Engine ${pkgver}-${pkgrel}"
-run git push "$remote" HEAD:kde-owe-backend "$tag"
+run git push "$remote" HEAD:main "$tag"
 run gh release create "$tag" "$archive" \
     --repo "$repo" \
     --title "KDE Wallpaper Engine ${pkgver}-${pkgrel}" \

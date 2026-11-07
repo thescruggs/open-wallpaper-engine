@@ -59,7 +59,7 @@ cp -- "$archive" "$stage/"
 if ! gh release view "$repo_tag" --repo "$repo" >/dev/null 2>&1; then
     run gh release create "$repo_tag" \
         --repo "$repo" \
-        --target kde-owe-backend \
+        --target main \
         --title "pacman repository [${repo_name}]" \
         --prerelease \
         --notes "Rolling pacman repository; see kde/scripts/publish-repo.sh for the pacman.conf entry."
