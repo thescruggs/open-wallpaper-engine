@@ -14,6 +14,7 @@ import QtQuick
 import QtQuick.Effects
 import Qt.labs.folderlistmodel
 
+import org.kde.coreaddons as KCoreAddons
 import org.kde.plasma.private.keyboardindicator as KeyboardIndicator
 import org.kde.plasma.private.sessions
 
@@ -25,7 +26,9 @@ Item {
     readonly property color danger: cfg("danger", "#ff3355")
     readonly property string mono: cfg("font", "Hack")
     readonly property real unit: Math.max(12, Math.min(width / 110, height / 48))
-    readonly property string user: kscreenlocker_userName
+    // kscreenlocker_userName is the account's full name ("Aaron Scruggs");
+    // show the login name like the SDDM theme does, falling back to it.
+    readonly property string user: kuser.loginName || kscreenlocker_userName
     // The greeter exposes no host name; reuse kwe-sddm-sync's marker.
     readonly property string host: cfg("hostname", "") || poolHost || "localhost"
     property string poolHost: ""
@@ -38,6 +41,8 @@ Item {
     property date lockedAt: new Date()
     property bool powerFocused: false
     readonly property bool blockFade: passwordField.text.length > 0 || powerFocused
+
+    KCoreAddons.KUser { id: kuser }
 
     function cfg(key, fallback) {
         const value = config[key];
