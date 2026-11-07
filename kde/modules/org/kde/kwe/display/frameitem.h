@@ -5,10 +5,12 @@
 #include <QFile>
 #include <QHoverEvent>
 #include <QImage>
-#include <QQuickPaintedItem>
+#include <QQuickItem>
 #include <QString>
 #include <QTimer>
 #include <qqmlintegration.h>
+
+#include <array>
 
 /// F1 (docs/backlog/WALLPAPER_SCALING_MODES.md): where an `image`-sized
 /// frame lands inside an `item`-sized surface under `mode` ("aspect": fit +
@@ -19,7 +21,15 @@
 QRectF kweFrameDestination(const QSizeF &image, const QSizeF &item,
                            const QString &mode);
 
-class FrameItem : public QQuickPaintedItem {
+/// Displays validated frames from the renderer's seqlock frame file.
+///
+/// The item is a plain scene-graph texture node, not a QQuickPaintedItem: the
+/// copied frame is uploaded once per new sequence as a BGRA8 texture and the
+/// GPU does the scaling/cropping. The previous QPainter path rasterised,
+/// format-converted (on Qt's global thread pool) and uploaded a device-pixel
+/// sized surface for every frame, which cost about a CPU core in plasmashell
+/// at 5120x1440.
+class FrameItem : public QQuickItem {
   Q_OBJECT
   QML_NAMED_ELEMENT(FrameSurface)
   Q_PROPERTY(QString frameFile READ frameFile WRITE setFrameFile NOTIFY
@@ -52,9 +62,12 @@ public:
   QString scaling() const { return m_scaling; }
   void setScaling(const QString &scaling);
   Q_INVOKABLE bool openFrameFile(const QString &path);
-  void paint(QPainter *painter) override;
 
 protected:
+  QSGNode *updatePaintNode(QSGNode *oldNode,
+                           UpdatePaintNodeData *data) override;
+  void geometryChange(const QRectF &newGeometry,
+                      const QRectF &oldGeometry) override;
   void hoverEnterEvent(QHoverEvent *event) override;
   void hoverMoveEvent(QHoverEvent *event) override;
   void hoverLeaveEvent(QHoverEvent *event) override;
@@ -89,6 +102,7 @@ private:
   void leavePointer();
   bool loadGeneration(quint64 *generation) const;
   bool load32(qsizetype offset, quint32 *value) const;
+  QImage &acquireFrameBuffer(const QSize &size);
 
   QString m_frameFile;
   QString m_scaling = QStringLiteral("aspect");
@@ -96,6 +110,12 @@ private:
   qsizetype m_fileBytes = 0;
   Layout m_layout;
   QImage m_image;
+  /// Reusable frame buffers. A slot is only rewritten when nothing else
+  /// (the scene-graph texture upload) still references it, so the 30 Hz copy
+  /// does not allocate a fresh multi-megabyte buffer per frame.
+  std::array<QImage, 3> m_frameRing;
+  int m_ringIndex = 0;
+  bool m_textureDirty = false;
   QTimer m_pollTimer;
   QTimer m_reopenTimer;
   QElapsedTimer m_frameAge;

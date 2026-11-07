@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "frameitem.h"
 
-#include <QPainter>
+#include <QQuickWindow>
+#include <QSGSimpleRectNode>
+#include <QSGSimpleTextureNode>
+#include <QSGTexture>
 #include <QtEndian>
 
 #include <array>
@@ -46,8 +49,10 @@ quint64 read64(const uchar *bytes, qsizetype offset) {
 }
 } // namespace
 
-FrameItem::FrameItem(QQuickItem *parent) : QQuickPaintedItem(parent) {
-  setAntialiasing(false);
+FrameItem::FrameItem(QQuickItem *parent) : QQuickItem(parent) {
+  setFlag(ItemHasContents, true);
+  // Fill mode overflows the item on one axis; the item bounds are the crop.
+  setClip(true);
   setAcceptHoverEvents(true);
   setAcceptedMouseButtons(Qt::NoButton);
   setAcceptTouchEvents(false);
@@ -300,8 +305,8 @@ void FrameItem::pollFrame() {
     return;
   }
 
-  QImage candidate(int(m_layout.width), int(m_layout.height),
-                   QImage::Format_ARGB32_Premultiplied);
+  QImage &candidate =
+      acquireFrameBuffer(QSize(int(m_layout.width), int(m_layout.height)));
   if (candidate.isNull() || candidate.bytesPerLine() != int(m_layout.stride) ||
       !readExact(qsizetype(sourceOffset), candidate.bits(),
                  qsizetype(m_layout.slotBytes))) {
@@ -320,7 +325,9 @@ void FrameItem::pollFrame() {
 
   const bool hadFrame = hasFrame();
   const QSize oldSize = frameSize();
-  m_image = std::move(candidate);
+  m_image = candidate;
+  m_ringIndex = (m_ringIndex + 1) % int(m_frameRing.size());
+  m_textureDirty = true;
   m_sequence = after / 2;
   m_receivedSequence = true;
   m_frameAge.restart();
@@ -348,14 +355,64 @@ void FrameItem::setStatus(Status status, const QString &error) {
     emit errorMessageChanged();
 }
 
-void FrameItem::paint(QPainter *painter) {
-  painter->fillRect(boundingRect(), Qt::black);
-  if (m_image.isNull())
-    return;
-  painter->setRenderHint(QPainter::SmoothPixmapTransform, true);
-  // Fill overflows the item on one axis; the item bounds are the crop.
-  painter->setClipRect(boundingRect());
-  painter->drawImage(imageDestination(), m_image);
+QImage &FrameItem::acquireFrameBuffer(const QSize &size) {
+  QImage &slot = m_frameRing[size_t(m_ringIndex)];
+  // isDetached() is false while the scene graph still holds the slot for a
+  // pending texture upload (or while it is the frame on screen); writing into
+  // it then would either tear the upload or force a hidden deep copy.
+  if (slot.isNull() || slot.size() != size ||
+      slot.format() != QImage::Format_ARGB32_Premultiplied ||
+      !slot.isDetached()) {
+    slot = QImage(size, QImage::Format_ARGB32_Premultiplied);
+  }
+  return slot;
+}
+
+QSGNode *FrameItem::updatePaintNode(QSGNode *oldNode, UpdatePaintNodeData *) {
+  auto *background = static_cast<QSGSimpleRectNode *>(oldNode);
+  if (m_image.isNull() || width() <= 0 || height() <= 0 || !window()) {
+    delete background;
+    return nullptr;
+  }
+  QSGSimpleTextureNode *frame = nullptr;
+  if (background == nullptr) {
+    background = new QSGSimpleRectNode;
+    background->setColor(Qt::black);
+    frame = new QSGSimpleTextureNode;
+    frame->setOwnsTexture(true);
+    frame->setFiltering(QSGTexture::Linear);
+    background->appendChildNode(frame);
+    m_textureDirty = true;
+  } else {
+    frame = static_cast<QSGSimpleTextureNode *>(background->firstChild());
+  }
+  background->setRect(boundingRect());
+
+  if (m_textureDirty) {
+    // Frames are premultiplied BGRA. Compositing premultiplied colour over
+    // black equals the colour itself, so the texture can be drawn opaque
+    // (no blending) over the black node and still match the old
+    // fill-black-then-SourceOver output for translucent web frames.
+    QSGTexture *texture = window()->createTextureFromImage(
+        m_image, QQuickWindow::TextureIsOpaque);
+    if (texture != nullptr) {
+      frame->setTexture(texture);
+      m_textureDirty = false;
+    }
+  }
+  if (frame->texture() == nullptr) {
+    delete background;
+    return nullptr;
+  }
+  frame->setRect(imageDestination());
+  return background;
+}
+
+void FrameItem::geometryChange(const QRectF &newGeometry,
+                               const QRectF &oldGeometry) {
+  QQuickItem::geometryChange(newGeometry, oldGeometry);
+  if (newGeometry.size() != oldGeometry.size())
+    update();
 }
 
 void FrameItem::setScaling(const QString &scaling) {
