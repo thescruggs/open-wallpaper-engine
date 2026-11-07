@@ -1970,10 +1970,24 @@ impl ApplyHandle {
     /// output on the bus, else `OutputMissing` (nothing is applied). The
     /// resolution runs on every apply attempt, so an output that returns
     /// to the bus is picked up without a daemon restart.
+    #[cfg(test)]
     pub(crate) fn resolve_playlist_output(
         &self,
         output: Option<&str>,
         playlist_entries: &BTreeSet<String>,
+    ) -> Result<String, ApplyError> {
+        let outputs = self.enumerate_fresh()?;
+        self.resolve_playlist_output_from(output, playlist_entries, &outputs)
+    }
+
+    /// `resolve_playlist_output` against an enumeration the caller already
+    /// holds, so the apply transaction probes the bus once (each probe is a
+    /// `kscreen-doctor` plus a `qdbus` child) instead of twice per advance.
+    fn resolve_playlist_output_from(
+        &self,
+        output: Option<&str>,
+        playlist_entries: &BTreeSet<String>,
+        outputs: &[OutputInfo],
     ) -> Result<String, ApplyError> {
         if let Some(output) = output {
             validate_identity_part("output", output)
@@ -1997,7 +2011,6 @@ impl ApplyHandle {
                 .find(|(_, assignment)| playlist_entries.contains(&assignment.wallpaper_id))
                 .map(|(name, _)| name.clone())
         };
-        let outputs = self.enumerate_fresh()?;
         if let Some(stored) = stored
             && outputs.iter().any(|info| info.name == stored)
         {
@@ -2369,7 +2382,12 @@ impl PlaylistApplyLane for ApplyHandle {
                 status.requested_wallpaper_id.as_deref().unwrap_or("none")
             )));
         }
-        let resolved_output = self.resolve_playlist_output(output.as_deref(), playlist_entries)?;
+        // Fresh enumeration; shared by the output resolution below and the
+        // desktop lookup after the catalog checks (the resolved output must
+        // be live and have a desktop — same rule as wallpaper.apply).
+        let outputs = self.enumerate_fresh()?;
+        let resolved_output =
+            self.resolve_playlist_output_from(output.as_deref(), playlist_entries, &outputs)?;
 
         // Catalog lookup: the single validation point shared with
         // wallpaper.apply. A playlist entry is always applied as the
@@ -2404,9 +2422,6 @@ impl PlaylistApplyLane for ApplyHandle {
         .map_err(|error| ApplyError::Invalid(error.to_string()))?;
         spec.content_hash = content_hash_for(&item, &content);
 
-        // Fresh enumeration; the resolved output must be live and have a
-        // desktop (same rule as wallpaper.apply).
-        let outputs = self.enumerate_fresh()?;
         let output_info = outputs
             .iter()
             .find(|info| info.name == resolved_output)

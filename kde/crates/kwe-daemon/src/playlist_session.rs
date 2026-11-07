@@ -39,7 +39,10 @@ use crate::{
 
 const COMMAND_CAPACITY: usize = 16;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
-const QUARANTINE_QUERY_TIMEOUT: Duration = Duration::from_millis(250);
+/// Must cover a renderer stop on the supervisor thread (SIGTERM grace,
+/// default 500 ms, plus home-dir removal): at 250 ms every playlist ack
+/// logged a spurious `quarantine_query_failed`.
+const QUARANTINE_QUERY_TIMEOUT: Duration = Duration::from_millis(1000);
 /// How often a `Waiting` decision is re-persisted (transitions persist
 /// immediately).
 const WAITING_PERSIST_INTERVAL: Duration = Duration::from_secs(30);
@@ -850,7 +853,6 @@ impl SessionRuntime {
     }
 
     fn tick_session(&mut self) {
-        self.refresh_quarantine();
         // Fold any completed apply transaction from the worker FIRST
         // (moved here in SR-1c2, see `maybe_apply`'s doc comment) so BOTH
         // the `unavailable` set below (gate-refused/quarantined ids) and
@@ -861,6 +863,9 @@ impl SessionRuntime {
         let Some(playlist_id) = self.active.clone() else {
             return;
         };
+        // Only an active playlist consumes the quarantine set; without one
+        // this was two supervisor round-trips a second for nothing.
+        self.refresh_quarantine();
         let Some(playlist) = self.playlists.iter().find(|p| p.id == playlist_id).cloned() else {
             self.active = None;
             self.last_decision = None;
