@@ -45,7 +45,12 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 LimitNOFILE=1024
 LimitCORE=0
-MemoryHigh=768M
+# Soft cap. Sized for a playlist switch: the outgoing and the canary renderer
+# coexist for the canary window, and one libmpv video renderer at a 2560-wide
+# canvas is ~430 MB RSS, so 768M was crossed on EVERY advance (observed
+# cgroup peak 785 MB, swap peak 184 MB) and the kernel throttled the whole
+# service with reclaim until the old renderer was reaped.
+MemoryHigh=1536M
 # The daemon plus audio worker and a Chromium-based web renderer need more
 # than the alpha's single test renderer budget; MemoryHigh stays as a soft
 # cap so OOM policy continues to prefer killing the renderer.
